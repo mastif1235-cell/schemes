@@ -18,7 +18,11 @@
       const b64 = parts.join('').trim();
       const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
       const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-      const html = await new Response(stream).text();
+      let html = await new Response(stream).text();
+      html = html.replace(
+        "const queue = (await getAll('sync_queue')).filter(q=>q.status==='pending' && q.entity==='photo');",
+        "const queue = (await getAll('sync_queue')).filter(q=>(q.status==='pending' || q.status==='failed') && q.entity==='photo');"
+      );
       document.open();
       document.write(html);
       document.close();
