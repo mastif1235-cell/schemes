@@ -1,0 +1,14 @@
+{
+  "name": "Блокнот-скан",
+  "short_name": "Блокнот",
+  "description": "Цифровая копия рабочего блокнота: фото разворотов, поиск, теги",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#EDE6D3",
+  "theme_color": "#B96A1F",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
