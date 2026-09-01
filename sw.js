@@ -1,4 +1,4 @@
-const CACHE = 'blocknot-shell-v2';
+const CACHE = 'blocknot-shell-v3';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt'
