@@ -40,8 +40,33 @@
     return {blob:thumbnail, fallback:!!thumbnail, source:thumbnail ? 'thumbnail' : null};
   };
 
+  async function photoDimensions(blob) {
+    if (typeof ImageDecoder === 'undefined' || !blob.type || typeof blob.stream !== 'function') return null;
+    let decoder = null;
+    try {
+      if (!await ImageDecoder.isTypeSupported(blob.type)) return null;
+      decoder = new ImageDecoder({data:blob.stream(), type:blob.type});
+      await decoder.tracks.ready;
+      const track = decoder.tracks.selectedTrack;
+      return track ? {width:track.displayWidth || track.codedWidth, height:track.displayHeight || track.codedHeight} : null;
+    } catch (_) {
+      return null;
+    } finally {
+      if (decoder) decoder.close();
+    }
+  }
+
   window.v341RotatePhotoBlob = async function (blob, degrees) {
-    const bitmap = await createImageBitmap(blob, {imageOrientation:'from-image'});
+    const dimensions = await photoDimensions(blob);
+    const maxSide = 3200;
+    const options = {imageOrientation:'from-image'};
+    if (dimensions && Math.max(dimensions.width, dimensions.height) > maxSide) {
+      const factor = maxSide / Math.max(dimensions.width, dimensions.height);
+      options.resizeWidth = Math.max(1, Math.round(dimensions.width * factor));
+      options.resizeHeight = Math.max(1, Math.round(dimensions.height * factor));
+      options.resizeQuality = 'high';
+    }
+    const bitmap = await createImageBitmap(blob, options);
     const canvas = document.createElement('canvas');
     try {
       const quarterTurn = Math.abs(degrees) % 180 === 90;
