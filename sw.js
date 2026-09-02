@@ -1,9 +1,9 @@
-// Блокнот-скан v3.2.0 — integrated app shell
-const CACHE = 'blocknot-shell-v10';
+// Блокнот-скан v3.2.1 — integrated app shell
+const CACHE = 'blocknot-shell-v11';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
-  './v3-enhancements.txt'
+  './v3-enhancements.txt', './v3-fixes.js'
 ];
 
 self.addEventListener('install', (e) => {
