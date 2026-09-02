@@ -31,25 +31,30 @@
 
       const originalVersion = 'Блокнот-скан · прототип';
       try {
-        let r = await fetch('./v3-enhancements.txt?v=3.2.1', {cache:'no-store'});
+        let r = await fetch('./v3-enhancements.txt?v=3.2.2', {cache:'no-store'});
         if (!r.ok) r = await fetch('./v3-enhancements.txt', {cache:'reload'});
         if (!r.ok) throw new Error(`v3-enhancements.txt: HTTP ${r.status}`);
         const v3 = await unpackBase64Gzip(await r.text());
 
-        let fixResp = await fetch('./v3-fixes.js?v=3.2.1', {cache:'no-store'});
+        let fixResp = await fetch('./v3-fixes.js?v=3.2.2', {cache:'no-store'});
         if (!fixResp.ok) fixResp = await fetch('./v3-fixes.js', {cache:'reload'});
         if (!fixResp.ok) throw new Error(`v3-fixes.js: HTTP ${fixResp.status}`);
         const fixes = await fixResp.text();
 
-        let hotfixResp = await fetch('./v3-hotfix.js?v=3.2.1', {cache:'no-store'});
+        let hotfixResp = await fetch('./v3-hotfix.js?v=3.2.2', {cache:'no-store'});
         if (!hotfixResp.ok) hotfixResp = await fetch('./v3-hotfix.js', {cache:'reload'});
         if (!hotfixResp.ok) throw new Error(`v3-hotfix.js: HTTP ${hotfixResp.status}`);
         const hotfix = await hotfixResp.text();
 
+        let collabResp = await fetch('./v3-collab.js?v=3.2.2', {cache:'no-store'});
+        if (!collabResp.ok) collabResp = await fetch('./v3-collab.js', {cache:'reload'});
+        if (!collabResp.ok) throw new Error(`v3-collab.js: HTTP ${collabResp.status}`);
+        const collab = await collabResp.text();
+
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
-        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + marker);
-        html = html.replace(originalVersion, 'Блокнот-скан · v3.2.1 · Рабочие схемы');
+        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + marker);
+        html = html.replace(originalVersion, 'Блокнот-скан · v3.2.2 · Рабочие схемы');
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
         html = html.replace(originalVersion, `Блокнот-скан · v3 ERROR · ${msg}`);
