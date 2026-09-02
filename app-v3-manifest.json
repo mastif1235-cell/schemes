@@ -1,5 +1,5 @@
 {
-  "version": "3.4.0",
+  "version": "3.4.1",
   "files": [
     {
       "path": "chunk1.txt",
@@ -43,7 +43,7 @@
     },
     {
       "path": "v3-ui.js",
-      "sha256": "5c70f1734748a0a6110b4b33625487eaf6ae1821b6c7b1e971a2133cb002a77e"
+      "sha256": "26339fa34a28deeb764bdf7a368aa7e4a25e0e58ce4ff5dbf32a12c185d993d1"
     }
   ]
 }

@@ -1,6 +1,6 @@
-// Блокнот-скан v3.4.0 — atomic offline application shell.
+// Блокнот-скан v3.4.1 — atomic offline application shell.
 const CACHE_PREFIX = 'blocknot-shell-';
-const CACHE = CACHE_PREFIX + 'v340-stable';
+const CACHE = CACHE_PREFIX + 'v341-stable';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './app-v3-manifest.json',

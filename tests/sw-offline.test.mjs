@@ -18,7 +18,7 @@ function createWorker({failInstall = false, offline = true} = {}) {
   };
   const caches = {
     open: async () => cache,
-    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'unrelated-cache'],
+    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'unrelated-cache'],
     delete: async key => { deleted.push(key); return true; },
     match: async request => {
       const key = typeof request === 'string' ? request : new URL(request.url).pathname.split('/').pop();
@@ -84,7 +84,7 @@ assert.doesNotMatch(indexSource, /location\.replace\s*\(/);
 {
   const worker = createWorker();
   await dispatchWait(worker.handlers.activate);
-  assert.deepEqual(worker.deleted, ['blocknot-shell-v30', 'blocknot-shell-v340']);
+  assert.deepEqual(worker.deleted, ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable']);
 }
 
 console.log('sw-offline: PASS');

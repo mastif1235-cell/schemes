@@ -21,7 +21,7 @@ assert.match(ui, /grid-template-columns:1fr/);
 assert.ok(ui.indexOf('number === query') < ui.indexOf('number.startsWith(query)'));
 assert.ok(ui.indexOf('number.startsWith(query)') < ui.indexOf('text.includes(query)'));
 assert.match(ui, /dataset\.notebookId = notebook\.id/);
-assert.match(ui, /Блокнот-скан · v3\.4\.0 · Stable/);
+assert.match(ui, /Блокнот-скан · v3\.4\.1 · Stable/);
 assert.doesNotMatch(ui, /v3\.4\.0 RC/);
 
 const photos = read('v3-photos.js');

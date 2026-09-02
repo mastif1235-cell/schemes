@@ -9,7 +9,7 @@
   <div id="boot" style="font-family:system-ui;padding:24px">Запуск приложения…</div>
   <script>
     (async () => {
-      const APP_VERSION = '3.4.0';
+      const APP_VERSION = '3.4.1';
 
       async function unpackBase64Gzip(text) {
         const b64 = text.trim();
@@ -68,7 +68,7 @@
       if (!html.includes(marker)) throw new Error('INIT marker not found');
       const versionBridge = 'window.__BLOCKNOT_APP_VERSION__ = ' + JSON.stringify(APP_VERSION) + ';\n\n';
       html = html.replace(marker, versionBridge + runtimeParts.join('\n\n') + '\n\n' + marker);
-      html = html.replace('Блокнот-скан · прототип', 'Блокнот-скан · v3.4.0 · Stable');
+      html = html.replace('Блокнот-скан · прототип', 'Блокнот-скан · v3.4.1 · Stable');
 
       document.open();
       document.write(html);

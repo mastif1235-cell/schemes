@@ -11,7 +11,7 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, 'app-v3-manifest.jso
 const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
 const index = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
 
-assert.equal(manifest.version, '3.4.0');
+assert.equal(manifest.version, '3.4.1');
 assert.ok(manifest.files.length > 0);
 for (const entry of manifest.files) {
   const content = fs.readFileSync(path.join(root, entry.path), 'utf8').replace(/\r\n?/g, '\n');
