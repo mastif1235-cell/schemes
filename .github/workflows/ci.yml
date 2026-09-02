@@ -1,0 +1,29 @@
+name: Validate runtime
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check generated artifacts
+        run: npm run check:generated
+      - name: Syntax
+        shell: bash
+        run: |
+          node --check sw.js
+          node --check v3-enhancements.js
+          for file in v3-*.js; do node --check "$file"; done
+      - name: Regression tests
+        run: npm test
