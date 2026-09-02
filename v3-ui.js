@@ -255,7 +255,7 @@
       syncButton.insertAdjacentElement('afterend', invite);
     }
     const footer = [...screenEl.querySelectorAll('div')].find(element => /Блокнот-скан\s*·/.test(element.textContent || '') && element.children.length === 0);
-    if (footer) footer.textContent = 'Блокнот-скан · v3.4.0 RC';
+    if (footer) footer.textContent = 'Блокнот-скан · v3.4.0 · Stable';
     screenEl.querySelectorAll('.settings-row').forEach(row => row.classList.add('v340-settings-card'));
   };
 })();

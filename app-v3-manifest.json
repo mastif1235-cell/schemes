@@ -19,31 +19,31 @@
     },
     {
       "path": "v3-enhancements.txt",
-      "sha256": "064ccc64578b9f58461b6fdd3cc2b243159b61daaa3677b7be32097ea822f0fe"
+      "sha256": "140f33ded6d1f2a74dd9c2471cf7a6c46c7dc4a0bb07558b93f4a5023e466566"
     },
     {
       "path": "v3-sync.js",
-      "sha256": "002d8d0146d3154db20ed2bdebef43aa520ab15e2c4004c55e28d59409fe139b"
+      "sha256": "fd3691e0d9a2cbe2905363b78994948966a88d149558575cea650a8c556163ee"
     },
     {
       "path": "v3-core.js",
-      "sha256": "e4da833e72354a44661dbc444348ae94b8757a02ab19999e8e7dc54d7a716504"
+      "sha256": "694587bddff36d5b5238bc8788f228fde09d4400601cef0111420e3dfde41fe6"
     },
     {
       "path": "v3-photos.js",
-      "sha256": "50f6e953aaf67506b89ec481352d453e0a16d23101cdd0de6fbc3fc507c94bfb"
+      "sha256": "b7924130f65952e2a689a451ed80880d1fb6382c213aededdd8e9295873dd371"
     },
     {
       "path": "v3-camera.js",
-      "sha256": "40cc70aca8b3ed634cf65e4d02fbc631d1ecf8f9f7944b96ec7915ec88dd1584"
+      "sha256": "cec106584d75282fba62772328a5de52c80803355b2ae674e8d0ed13b1d64644"
     },
     {
       "path": "v3-history.js",
-      "sha256": "14eda50b784b8d934adba9dea95cef0394c55dfdfdda7dd4da56c2bfce46ec68"
+      "sha256": "8459c7c0153a617ed050fd886a38c241016996d39c78d51912c2ea4f36a1c92e"
     },
     {
       "path": "v3-ui.js",
-      "sha256": "a17d16886378f13dfc90e6ab87a1fad1c4a2b606a282d8ee71e9526f6209a324"
+      "sha256": "1795c9448a4825c1bb3381a0b54fc857b516af70df2874b22ee9cd79e544402f"
     }
   ]
 }
