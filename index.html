@@ -31,7 +31,7 @@
 
       const originalVersion = 'Блокнот-скан · прототип';
       try {
-        let r = await fetch('./v3-enhancements.txt?v=3.1.1', {cache:'no-store'});
+        let r = await fetch('./v3-enhancements.txt?v=3.1.2', {cache:'no-store'});
         if (!r.ok) {
           r = await fetch('./v3-enhancements.txt', {cache:'reload'});
         }
@@ -40,7 +40,7 @@
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
         html = html.replace(marker, v3 + '\n\n' + marker);
-        html = html.replace(originalVersion, 'Блокнот-скан · v3.1.1 · Рабочие схемы');
+        html = html.replace(originalVersion, 'Блокнот-скан · v3.1.2 · Рабочие схемы');
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
         html = html.replace(originalVersion, `Блокнот-скан · v3 ERROR · ${msg}`);
