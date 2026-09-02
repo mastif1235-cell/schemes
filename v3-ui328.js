@@ -1,5 +1,5 @@
-/* Blocknot Scan v3.2.8: mobile layout cleanup for notebook search, history and invite settings. */
-/* Production UI patch: search above Add spread, History promoted, invite moved to Settings. */
+/* Blocknot Scan v3.3.0: mobile layout cleanup for notebook search, history and invite settings. */
+/* Search above Add spread, History promoted, invite strictly inside Settings, version always visible in Settings. */
 
 function v328FindButton(re) {
   return [...document.querySelectorAll('button,a')].find(el => re.test((el.textContent || '').replace(/\s+/g,' ').trim()));
@@ -27,7 +27,6 @@ function v328PlaceNotebookSearch() {
   const parent = addHost.parentElement;
   if (!parent) return;
 
-  /* User-requested order: search first, then Add spread. */
   if (box.parentElement !== parent || box.nextElementSibling !== addHost) {
     parent.insertBefore(box, addHost);
   }
@@ -67,24 +66,70 @@ function v328PlaceHistoryAndHideInvite() {
   }
 }
 
+function v328SettingsHost() {
+  if (!screenEl) return null;
+  return screenEl;
+}
+
+function v328CleanupSettingsOnlyUi() {
+  if (v328IsSettingsScreen()) return;
+  const invite = document.getElementById('v328SettingsInviteBtn');
+  if (invite) invite.remove();
+  const version = document.getElementById('v330SettingsVersion');
+  if (version) version.remove();
+}
+
 function v328AddInviteToSettings() {
   if (!v328IsSettingsScreen()) return;
-  if (document.getElementById('v328SettingsInviteBtn')) return;
+  const host = v328SettingsHost();
+  if (!host) return;
 
-  const all = [...document.querySelectorAll('h1,h2,h3,h4,strong,b,div,p,span')];
+  let btn = document.getElementById('v328SettingsInviteBtn');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.id = 'v328SettingsInviteBtn';
+    btn.className = 'btn-secondary';
+    btn.textContent = '🔗 Ввести код приглашения';
+    btn.style.cssText = 'width:100%;margin:12px 0;box-sizing:border-box;';
+    btn.onclick = () => {
+      if (typeof v322OpenRedeemInvite === 'function') v322OpenRedeemInvite();
+      else toast('Функция приглашения временно недоступна');
+    };
+  }
+
+  const all = [...host.querySelectorAll('h1,h2,h3,h4,strong,b,div,p,span')];
   const section = all.find(el => /команда и синхронизация|команда та синхронізація/i.test((el.textContent || '').trim()));
-  const btn = document.createElement('button');
-  btn.id = 'v328SettingsInviteBtn';
-  btn.className = 'btn-secondary';
-  btn.textContent = '🔗 Ввести код приглашения';
-  btn.style.cssText = 'width:100%;margin:12px 0;box-sizing:border-box;';
-  btn.onclick = () => {
-    if (typeof v322OpenRedeemInvite === 'function') v322OpenRedeemInvite();
-    else toast('Функция приглашения временно недоступна');
-  };
+  if (section) {
+    const sectionParent = section.parentElement || host;
+    if (btn.parentElement !== sectionParent || btn.previousElementSibling !== section) {
+      section.insertAdjacentElement('afterend', btn);
+    }
+  } else if (!host.contains(btn)) {
+    host.insertBefore(btn, host.firstElementChild || null);
+  }
+}
 
-  if (section) section.insertAdjacentElement('afterend', btn);
-  else if (screenEl) screenEl.insertBefore(btn, screenEl.firstElementChild || null);
+function v330PinSettingsVersion() {
+  if (!v328IsSettingsScreen()) return;
+  const host = v328SettingsHost();
+  if (!host) return;
+
+  /* Hide old prototype/version/footer strings inside Settings so there is one canonical version line. */
+  for (const el of [...host.querySelectorAll('div,p,small,span')]) {
+    const text = (el.textContent || '').trim();
+    if (/^Блокнот-скан\s*·/i.test(text) && el.id !== 'v330SettingsVersion') {
+      el.style.display = 'none';
+    }
+  }
+
+  let version = document.getElementById('v330SettingsVersion');
+  if (!version) {
+    version = document.createElement('div');
+    version.id = 'v330SettingsVersion';
+    version.style.cssText = 'margin:22px 0 92px;padding:0 2px;text-align:center;color:var(--ink-soft);font-size:13px;line-height:1.4;';
+  }
+  version.textContent = 'Блокнот-скан · v3.3.0';
+  if (version.parentElement !== host || version !== host.lastElementChild) host.appendChild(version);
 }
 
 let v328Scheduled = false;
@@ -94,11 +139,13 @@ function v328ApplyLayout() {
   requestAnimationFrame(() => {
     v328Scheduled = false;
     try {
+      v328CleanupSettingsOnlyUi();
       v328PlaceNotebookSearch();
       v328PlaceHistoryAndHideInvite();
       v328AddInviteToSettings();
+      v330PinSettingsVersion();
     } catch (e) {
-      console.warn('v3.2.8 layout', e);
+      console.warn('v3.3.0 layout', e);
     }
   });
 }
