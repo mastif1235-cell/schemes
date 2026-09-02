@@ -9,7 +9,7 @@
   <div id="boot" style="font-family:system-ui;padding:24px">Запуск приложения…</div>
   <script>
     (async () => {
-      const APP_VERSION = '3.2.4';
+      const APP_VERSION = '3.2.5';
 
       async function unpackBase64Gzip(text) {
         const b64 = text.trim();
@@ -62,10 +62,11 @@
         const hotfix = await fetchTextWithOfflineFallback('./v3-hotfix.js');
         const collab = await fetchTextWithOfflineFallback('./v3-collab.js');
         const ux = await fetchTextWithOfflineFallback('./v3-ux323.js');
+        const auditfix = await fetchTextWithOfflineFallback('./v3-auditfix.js');
 
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
-        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + ux + '\n\n' + marker);
+        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + ux + '\n\n' + auditfix + '\n\n' + marker);
         html = html.replace(originalVersion, `Блокнот-скан · v${APP_VERSION} · Рабочие схемы`);
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
