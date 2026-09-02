@@ -27,6 +27,12 @@ assert.doesNotMatch(ui, /v3\.4\.0 RC/);
 
 const photos = read('v3-photos.js');
 assert.ok(photos.indexOf("photo.id + '_orig'") < photos.indexOf('apiBlob('));
+for (const state of ['local', 'pending', 'syncing', 'synced', 'error']) {
+  assert.match(photos, new RegExp(`state:'${state}'`));
+}
+assert.doesNotMatch(photos, /state:'(?:failed|uploading|telegram)'/);
+assert.match(photos, /queueStatus === 'done'[\s\S]*?state:'synced'[\s\S]*?state:'error'/);
+assert.match(photos, /if \(queueStatus\) return \{state:'error'/);
 assert.ok(photos.indexOf('apiBlob(') < photos.indexOf('const thumbnail = allowThumbnail'));
 assert.doesNotMatch(photos, /JSON\.stringify\([^)]*queue/);
 assert.match(photos, /event\.state\.blocknotViewer === historyToken/);

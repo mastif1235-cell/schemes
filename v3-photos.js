@@ -6,11 +6,25 @@
 
   window.v340GetPhotoSyncState = function (photo, queue) {
     const item = photoQueueItem(photo, queue);
-    if ((item && item.status === 'failed') || photo.upload_status === 'upload_failed') return {state:'failed', label:'⚠ ошибка'};
-    if ((item && item.status === 'syncing') || photo.upload_status === 'uploading') return {state:'uploading', label:'↻ загрузка'};
-    if ((item && item.status === 'pending') || photo.upload_status === 'local_pending') return {state:'pending', label:'⏳ ожидает'};
-    if (photo.telegram_file_id || photo.storage_object_id || photo.server_id) return {state:'telegram', label:'☁ Telegram'};
-    return {state:'local', label:'📱 локально'};
+    const queueStatus = item && item.status;
+    const uploadStatus = photo && photo.upload_status;
+    const hasRemoteCopy = !!(photo && (photo.telegram_file_id || photo.storage_object_id || photo.server_id));
+    if (queueStatus === 'failed' || queueStatus === 'conflict' || uploadStatus === 'upload_failed') {
+      return {state:'error', label:'⚠ ошибка'};
+    }
+    if (queueStatus === 'syncing' || uploadStatus === 'uploading') return {state:'syncing', label:'↻ синхронизация'};
+    if (queueStatus === 'pending' || queueStatus === 'deferred' || uploadStatus === 'local_pending') {
+      return {state:'pending', label:'⏳ ожидает'};
+    }
+    if (queueStatus === 'done') {
+      return (uploadStatus === 'synced' || hasRemoteCopy)
+        ? {state:'synced', label:'☁ синхронизировано'}
+        : {state:'error', label:'⚠ неизвестный статус'};
+    }
+    if (queueStatus) return {state:'error', label:'⚠ неизвестный статус'};
+    if (uploadStatus === 'synced' || hasRemoteCopy) return {state:'synced', label:'☁ синхронизировано'};
+    if (!uploadStatus || uploadStatus === 'local') return {state:'local', label:'📱 локально'};
+    return {state:'error', label:'⚠ неизвестный статус'};
   };
 
   async function localOriginal(photo) {
