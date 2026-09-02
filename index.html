@@ -9,7 +9,7 @@
   <div id="boot" style="font-family:system-ui;padding:24px">Запуск приложения…</div>
   <script>
     (async () => {
-      const APP_VERSION = '3.3.1';
+      const APP_VERSION = '3.3.2';
 
       async function unpackBase64Gzip(text) {
         const b64 = text.trim();
@@ -68,10 +68,11 @@
         const ui328 = await fetchTextWithOfflineFallback('./v3-ui328.js');
         const history329 = await fetchTextWithOfflineFallback('./v3-history329.js');
         const viewer331 = await fetchTextWithOfflineFallback('./v3-viewer331.js');
+        const member332 = await fetchTextWithOfflineFallback('./v3-member332.js');
 
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
-        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + ux + '\n\n' + auditfix + '\n\n' + polish + '\n\n' + crop + '\n\n' + ui328 + '\n\n' + history329 + '\n\n' + viewer331 + '\n\n' + marker);
+        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + ux + '\n\n' + auditfix + '\n\n' + polish + '\n\n' + crop + '\n\n' + ui328 + '\n\n' + history329 + '\n\n' + viewer331 + '\n\n' + member332 + '\n\n' + marker);
         html = html.replace(originalVersion, `Блокнот-скан · v${APP_VERSION} · Рабочие схемы`);
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
