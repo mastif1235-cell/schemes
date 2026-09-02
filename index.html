@@ -11,24 +11,6 @@
     (async () => {
       const APP_VERSION = '3.3.9';
 
-      if ('serviceWorker' in navigator) {
-        const refreshKey = 'blocknot_sw_refresh_' + APP_VERSION;
-        if (!sessionStorage.getItem(refreshKey) && navigator.serviceWorker.controller) {
-          try {
-            const regs = await navigator.serviceWorker.getRegistrations();
-            await Promise.all(regs.map(r => r.unregister()));
-            sessionStorage.setItem(refreshKey, '1');
-            const u = new URL(location.href);
-            u.searchParams.set('appv', APP_VERSION);
-            u.searchParams.set('_refresh', Date.now().toString());
-            location.replace(u.toString());
-            return;
-          } catch (e) {
-            console.warn('Не удалось обновить Service Worker автоматически', e);
-          }
-        }
-      }
-
       async function unpackBase64Gzip(text) {
         const b64 = text.trim();
         const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
