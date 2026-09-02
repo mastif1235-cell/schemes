@@ -1,3 +1,4 @@
+// Блокнот-скан v3.0.0 — app shell
 const CACHE = 'blocknot-shell-v4';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
