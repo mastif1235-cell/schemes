@@ -15,13 +15,17 @@ const manifest = {
   version:'3.4.0',
   files:runtimeFiles.map(file => ({
     path:file,
-    sha256:crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
+    sha256:crypto.createHash('sha256')
+      .update(fs.readFileSync(path.join(root, file), 'utf8').replace(/\r\n?/g, '\n'))
+      .digest('hex')
   }))
 };
 const output = JSON.stringify(manifest, null, 2) + '\n';
 
 if (process.argv.includes('--check')) {
-  const current = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
+  const current = fs.existsSync(outputPath)
+    ? fs.readFileSync(outputPath, 'utf8').replace(/\r\n?/g, '\n')
+    : '';
   if (current !== output) {
     console.error('app-v3-manifest.json is stale');
     process.exit(1);
