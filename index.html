@@ -28,20 +28,17 @@
         "const queue = (await getAll('sync_queue')).filter(q=>q.status==='pending' && q.entity==='photo');",
         "const queue = (await getAll('sync_queue')).filter(q=>(q.status==='pending' || q.status==='failed') && q.entity==='photo');"
       );
-
-      // Visible marker comes from index.html itself, not from the optional v3 layer.
-      // If this text appears, GitHub Pages is definitely serving the new shell.
-      html = html.replace('Блокнот-скан · прототип', 'Блокнот-скан · загрузчик v3.0.2');
+      html = html.replace('Блокнот-скан · прототип', 'Блокнот-скан · загрузчик v3.0.3');
 
       try {
-        const v3Response = await fetch('./v3-enhancements.txt?v=3.0.2', {cache:'no-store'});
-        if (!v3Response.ok) throw new Error(`v3-enhancements.txt: HTTP ${v3Response.status}`);
-        const v3 = await unpackBase64Gzip(await v3Response.text());
-        const safeSource = JSON.stringify(v3).replace(/<\/script/gi, '<\\/script');
-        const v3Tag = '<script>window.__BLOCKNOT_V3_BOOTSTRAP__="3.0.2";window.__BLOCKNOT_V3_SOURCE__=' + safeSource + ';try{(0,eval)(window.__BLOCKNOT_V3_SOURCE__);window.__BLOCKNOT_V3_STATUS__="loaded";}catch(err){window.__BLOCKNOT_V3_STATUS__="runtime-error: "+String(err);console.error("Блокнот-скан v3 runtime error",err);}\n<' + '/script>';
-        html = html.replace('</body>', v3Tag + '</body>');
+        const r = await fetch('./v3-enhancements.txt?v=3.0.3', {cache:'no-store'});
+        if (!r.ok) throw new Error(`v3-enhancements.txt: HTTP ${r.status}`);
+        const v3 = await unpackBase64Gzip(await r.text());
+        const marker = '// ===================== INIT =====================';
+        if (!html.includes(marker)) throw new Error('INIT marker not found');
+        html = html.replace(marker, v3 + '\n\n' + marker);
       } catch (err) {
-        console.error('Блокнот-скан v3: дополнения не загрузились, остаётся стабильная v2', err);
+        console.error('Блокнот-скан v3: дополнения не встроились, остаётся стабильная v2', err);
       }
 
       document.open();
