@@ -1,4 +1,5 @@
 /* Blocknot Scan v3.2.8: mobile layout cleanup for notebook search, history and invite settings. */
+/* Production UI patch: search above Add spread, History promoted, invite moved to Settings. */
 
 function v328FindButton(re) {
   return [...document.querySelectorAll('button,a')].find(el => re.test((el.textContent || '').replace(/\s+/g,' ').trim()));
