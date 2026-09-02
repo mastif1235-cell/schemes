@@ -41,9 +41,14 @@
         if (!fixResp.ok) throw new Error(`v3-fixes.js: HTTP ${fixResp.status}`);
         const fixes = await fixResp.text();
 
+        let hotfixResp = await fetch('./v3-hotfix.js?v=3.2.1', {cache:'no-store'});
+        if (!hotfixResp.ok) hotfixResp = await fetch('./v3-hotfix.js', {cache:'reload'});
+        if (!hotfixResp.ok) throw new Error(`v3-hotfix.js: HTTP ${hotfixResp.status}`);
+        const hotfix = await hotfixResp.text();
+
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
-        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + marker);
+        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + marker);
         html = html.replace(originalVersion, 'Блокнот-скан · v3.2.1 · Рабочие схемы');
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
