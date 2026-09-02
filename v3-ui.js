@@ -157,24 +157,26 @@
     return text.includes(query) || number.includes(query) ? 2 : 99;
   }
 
-  async function renderSpreadList(host, spreads, query) {
-    host.innerHTML = '';
+  async function renderSpreadList(host, spreads, query, isCurrent) {
+    const stillCurrent = typeof isCurrent === 'function' ? isCurrent : () => true;
     const q = normalize(query || '').trim();
     const ranked = spreads.map((spread, index) => ({spread, index, rank:q ? rankSpread(spread, q) : 0}))
       .filter(row => row.rank < 99)
       .sort((a, b) => a.rank - b.rank || Number(a.spread.number) - Number(b.spread.number) || a.index - b.index);
     if (!ranked.length) {
-      host.innerHTML = '<div class="empty-state"><div class="big">🔎</div>Ничего не найдено</div>';
+      if (stillCurrent()) host.innerHTML = '<div class="empty-state"><div class="big">🔎</div>Ничего не найдено</div>';
       return;
     }
     const queue = await getAll('sync_queue');
+    if (!stillCurrent()) return;
     const grid = document.createElement('div'); grid.className = 'spread-grid';
     for (const row of ranked) {
       const card = await spreadCard(row.spread, () => window.v340OpenSpread(row.spread));
       await decorateSpreadCard(card, row.spread, queue);
+      if (!stillCurrent()) return;
       grid.appendChild(card);
     }
-    host.appendChild(grid);
+    if (stillCurrent()) host.replaceChildren(grid);
   }
 
   renderSpreads = async function () {
@@ -190,9 +192,17 @@
     const add = document.createElement('button'); add.className = 'btn-primary'; add.textContent = '+ Добавить разворот';
     add.onclick = () => openAddSpreadFlow(notebook.id); wrap.appendChild(add);
     const results = document.createElement('div'); wrap.appendChild(results); screenEl.appendChild(wrap);
+    let searchRevision = 0;
     if (!spreads.length) results.innerHTML = '<div class="empty-state"><div class="big">📄</div>В этом блокноте пока нет разворотов.</div>';
-    else await renderSpreadList(results, spreads, '');
-    wrap.querySelector('#v340NotebookSearch').addEventListener('input', event => renderSpreadList(results, spreads, event.target.value));
+    else {
+      const revision = ++searchRevision;
+      await renderSpreadList(results, spreads, '', () => revision === searchRevision);
+    }
+    wrap.querySelector('#v340NotebookSearch').addEventListener('input', event => {
+      const revision = ++searchRevision;
+      renderSpreadList(results, spreads, event.target.value, () => revision === searchRevision)
+        .catch(error => console.warn('Notebook search could not be rendered', error));
+    });
   };
 
   renderSearch = async function () {
@@ -204,17 +214,20 @@
     const buttons = [...wrap.querySelectorAll('[data-scope]')];
     const input = wrap.querySelector('input');
     const results = wrap.querySelector('.v340-results');
+    let searchRevision = 0;
     const run = async () => {
+      const revision = ++searchRevision;
       buttons.forEach(button => button.classList.toggle('active', button.dataset.scope === scope));
       const query = input.value.trim();
-      if (!query) { results.innerHTML = ''; return; }
+      if (!query) { if (revision === searchRevision) results.innerHTML = ''; return; }
       let spreads = (await getAll('spreads')).filter(row => !row.deleted_at);
       if (scope === 'current' && route.notebookId) spreads = spreads.filter(row => row.notebook_id === route.notebookId);
-      await renderSpreadList(results, spreads, query);
+      await renderSpreadList(results, spreads, query, () => revision === searchRevision);
     };
-    buttons.forEach(button => button.onclick = () => { scope = button.dataset.scope; run(); });
-    input.addEventListener('input', run);
-    run();
+    const safeRun = () => run().catch(error => console.warn('Search could not be rendered', error));
+    buttons.forEach(button => button.onclick = () => { scope = button.dataset.scope; safeRun(); });
+    input.addEventListener('input', safeRun);
+    safeRun();
   };
 
   renderFavorites = async function () {
