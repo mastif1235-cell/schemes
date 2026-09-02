@@ -12,7 +12,7 @@ const runtimeFiles = [
 ];
 
 const manifest = {
-  version:'3.4.0-rc.1',
+  version:'3.4.0',
   files:runtimeFiles.map(file => ({
     path:file,
     sha256:crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
