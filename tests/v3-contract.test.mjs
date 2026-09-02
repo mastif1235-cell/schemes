@@ -29,6 +29,10 @@ assert.ok(photos.indexOf("photo.id + '_orig'") < photos.indexOf('apiBlob('));
 assert.ok(photos.indexOf('apiBlob(') < photos.indexOf('const thumbnail = allowThumbnail'));
 assert.doesNotMatch(photos, /JSON\.stringify\([^)]*queue/);
 assert.match(photos, /event\.state\.blocknotViewer === historyToken/);
+assert.doesNotMatch(photos, /swipeX|swipeY|Math\.abs\(dx\) > 70/);
+assert.match(photos, /v341-nav-zone/);
+assert.match(photos, /press\.moved && gesture\.scale <= 1\.001/);
+assert.match(photos, /v341-zoomed/);
 
 const history = read('v3-history.js');
 assert.match(history, /История этого устройства/);

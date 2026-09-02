@@ -105,7 +105,7 @@
         <button class="icon-btn" data-action="edit" aria-label="Редактировать">✎</button></div>
         <div class="viewer-stage" data-stage>
           ${currentUrl ? `<img data-image src="${currentUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}
-          ${spreads.length > 1 ? '<button class="viewer-nav prev" data-action="prev">‹</button><button class="viewer-nav next" data-action="next">›</button>' : ''}
+          ${spreads.length > 1 ? '<button class="viewer-nav prev v341-nav-zone" data-nav="prev" aria-label="Предыдущее фото">←</button><button class="viewer-nav next v341-nav-zone" data-nav="next" aria-label="Следующее фото">→</button>' : ''}
         </div>
         <div class="v340-zoom-controls"><button data-action="minus">−</button><button data-action="reset">100%</button><button data-action="plus">+</button><button data-action="download">⬇</button></div>
         ${spread.conflict ? '<div class="warn-box v340-conflict">⚠ Конфликт версий<div class="btn-row"><button class="btn-secondary" data-action="server">Версия сервера</button><button class="btn-primary" data-action="mine">Сохранить мою</button></div></div>' : ''}
@@ -122,7 +122,7 @@
       const image = overlay.querySelector('[data-image]');
       const resetButton = overlay.querySelector('[data-action="reset"]');
       const gesture = {scale:1, x:0, y:0, pointers:new Map(), startScale:1, startDistance:0,
-        panAnchorX:0, panAnchorY:0, swipeX:0, swipeY:0, moved:false, lastTap:0};
+        panAnchorX:0, panAnchorY:0, tapStartX:0, tapStartY:0, moved:false, lastTap:0};
 
       function bounds() {
         if (!image || !stage) return {x:0, y:0};
@@ -142,18 +142,20 @@
         gesture.y = Math.max(-limit.y, Math.min(limit.y, gesture.y));
         image.style.transform = `translate(${gesture.x}px,${gesture.y}px) scale(${gesture.scale})`;
         resetButton.textContent = Math.round(gesture.scale * 100) + '%';
+        stage.classList.toggle('v341-zoomed', gesture.scale > 1.001);
       }
 
       function setScale(value) { gesture.scale = Math.max(1, Math.min(6, value)); apply(); }
       if (stage && image) {
         stage.addEventListener('pointerdown', event => {
+          if (event.target.closest('[data-nav]')) return;
           stage.setPointerCapture(event.pointerId);
           gesture.pointers.set(event.pointerId, {x:event.clientX, y:event.clientY});
           gesture.moved = false;
           if (gesture.pointers.size === 1) {
             gesture.panAnchorX = event.clientX - gesture.x;
             gesture.panAnchorY = event.clientY - gesture.y;
-            gesture.swipeX = event.clientX; gesture.swipeY = event.clientY;
+            gesture.tapStartX = event.clientX; gesture.tapStartY = event.clientY;
           } else if (gesture.pointers.size === 2) {
             const points = [...gesture.pointers.values()];
             gesture.startDistance = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
@@ -162,8 +164,7 @@
         });
         stage.addEventListener('pointermove', event => {
           if (!gesture.pointers.has(event.pointerId)) return;
-          const previous = gesture.pointers.get(event.pointerId);
-          if (Math.hypot(event.clientX - previous.x, event.clientY - previous.y) > 2) gesture.moved = true;
+          if (Math.hypot(event.clientX - gesture.tapStartX, event.clientY - gesture.tapStartY) > 8) gesture.moved = true;
           gesture.pointers.set(event.pointerId, {x:event.clientX, y:event.clientY});
           if (gesture.pointers.size === 2) {
             const points = [...gesture.pointers.values()];
@@ -177,18 +178,13 @@
         });
         const endPointer = event => {
           const wasSingle = gesture.pointers.size === 1;
-          const dx = event.clientX - gesture.swipeX, dy = event.clientY - gesture.swipeY;
           gesture.pointers.delete(event.pointerId);
           if (gesture.pointers.size === 1) {
             const remaining = [...gesture.pointers.values()][0];
             gesture.panAnchorX = remaining.x - gesture.x;
             gesture.panAnchorY = remaining.y - gesture.y;
           }
-          if (wasSingle && gesture.scale === 1 && Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.25) {
-            index = dx < 0 ? (index + 1) % spreads.length : (index - 1 + spreads.length) % spreads.length;
-            draw(); return;
-          }
-          if (wasSingle && !gesture.moved && Math.abs(dx) < 8 && Math.abs(dy) < 8) {
+          if (wasSingle && !gesture.moved) {
             const now = Date.now();
             if (now - gesture.lastTap < 320) setScale(gesture.scale === 1 ? 2.5 : 1);
             gesture.lastTap = now;
@@ -196,6 +192,37 @@
         };
         stage.addEventListener('pointerup', endPointer);
         stage.addEventListener('pointercancel', event => gesture.pointers.delete(event.pointerId));
+
+        for (const nav of stage.querySelectorAll('[data-nav]')) {
+          let press = null;
+          nav.addEventListener('pointerdown', event => {
+            event.stopPropagation();
+            press = {id:event.pointerId, x:event.clientX, y:event.clientY, moved:false};
+            nav.setPointerCapture(event.pointerId);
+          });
+          nav.addEventListener('pointermove', event => {
+            event.stopPropagation();
+            if (press && press.id === event.pointerId && Math.hypot(event.clientX - press.x, event.clientY - press.y) > 10) press.moved = true;
+          });
+          nav.addEventListener('pointerup', event => {
+            event.stopPropagation();
+            if (!press || press.id !== event.pointerId) return;
+            const activate = !press.moved && gesture.scale <= 1.001;
+            press = null;
+            if (activate) {
+              index = nav.dataset.nav === 'prev' ? (index - 1 + spreads.length) % spreads.length : (index + 1) % spreads.length;
+              draw();
+            }
+          });
+          nav.addEventListener('pointercancel', event => { event.stopPropagation(); press = null; });
+          nav.addEventListener('click', event => {
+            event.preventDefault(); event.stopPropagation();
+            if (event.detail === 0 && gesture.scale <= 1.001) {
+              index = nav.dataset.nav === 'prev' ? (index - 1 + spreads.length) % spreads.length : (index + 1) % spreads.length;
+              draw();
+            }
+          });
+        }
       }
 
       overlay.onclick = async event => {
@@ -203,8 +230,6 @@
         if (!button || button.disabled) return;
         const action = button.dataset.action;
         if (action === 'close') closeViewer();
-        else if (action === 'prev') { index = (index - 1 + spreads.length) % spreads.length; draw(); }
-        else if (action === 'next') { index = (index + 1) % spreads.length; draw(); }
         else if (action === 'minus') setScale(gesture.scale - .5);
         else if (action === 'plus') setScale(gesture.scale + .5);
         else if (action === 'reset') setScale(1);
@@ -254,6 +279,6 @@
   };
 
   const extraStyle = document.createElement('style');
-  extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img{will-change:transform;transform-origin:center}`;
+  extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img{will-change:transform;transform-origin:center}.v341-nav-zone{position:absolute;top:12%;bottom:12%;height:auto;width:min(24vw,128px);z-index:3;border:0;background:transparent;color:#ffffff99;font-size:2rem;touch-action:none}.v341-nav-zone.prev{left:0;text-align:left;padding-left:14px}.v341-nav-zone.next{right:0;text-align:right;padding-right:14px}.viewer-stage.v341-zoomed .v341-nav-zone{pointer-events:none;opacity:0}`;
   document.head.appendChild(extraStyle);
 })();
