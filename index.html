@@ -9,7 +9,27 @@
   <div id="boot" style="font-family:system-ui;padding:24px">Запуск приложения…</div>
   <script>
     (async () => {
-      const APP_VERSION = '3.3.5';
+      const APP_VERSION = '3.3.6';
+
+      /* One-time safe refresh: removes only the stale Service Worker registration.
+         IndexedDB, localStorage, auth/session and user data are NOT cleared. */
+      if ('serviceWorker' in navigator) {
+        const refreshKey = 'blocknot_sw_refresh_' + APP_VERSION;
+        if (!sessionStorage.getItem(refreshKey) && navigator.serviceWorker.controller) {
+          try {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(regs.map(r => r.unregister()));
+            sessionStorage.setItem(refreshKey, '1');
+            const u = new URL(location.href);
+            u.searchParams.set('appv', APP_VERSION);
+            u.searchParams.set('_refresh', Date.now().toString());
+            location.replace(u.toString());
+            return;
+          } catch (e) {
+            console.warn('Не удалось обновить Service Worker автоматически', e);
+          }
+        }
+      }
 
       async function unpackBase64Gzip(text) {
         const b64 = text.trim();
@@ -28,7 +48,7 @@
           firstError = e;
         }
         try {
-          const fallback = await fetch(path, {cache:'default'});
+          const fallback = await fetch(path, {cache:'reload'});
           if (fallback.ok) return await fallback.text();
           throw new Error(`${path}: HTTP ${fallback.status}`);
         } catch (fallbackError) {
@@ -39,11 +59,11 @@
       const names = ['chunk1.txt','chunk2.txt','chunk3.txt','chunk4.txt'];
       const parts = await Promise.all(names.map(async name => {
         try {
-          const r = await fetch(name, {cache:'no-store'});
+          const r = await fetch(`${name}?v=${encodeURIComponent(APP_VERSION)}`, {cache:'no-store'});
           if (!r.ok) throw new Error(`${name}: HTTP ${r.status}`);
           return r.text();
         } catch (networkError) {
-          const cached = await fetch(name, {cache:'default'});
+          const cached = await fetch(name, {cache:'reload'});
           if (!cached.ok) throw networkError;
           return cached.text();
         }
