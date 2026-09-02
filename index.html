@@ -31,16 +31,20 @@
 
       const originalVersion = 'Блокнот-скан · прототип';
       try {
-        let r = await fetch('./v3-enhancements.txt?v=3.2.0', {cache:'no-store'});
-        if (!r.ok) {
-          r = await fetch('./v3-enhancements.txt', {cache:'reload'});
-        }
+        let r = await fetch('./v3-enhancements.txt?v=3.2.1', {cache:'no-store'});
+        if (!r.ok) r = await fetch('./v3-enhancements.txt', {cache:'reload'});
         if (!r.ok) throw new Error(`v3-enhancements.txt: HTTP ${r.status}`);
         const v3 = await unpackBase64Gzip(await r.text());
+
+        let fixResp = await fetch('./v3-fixes.js?v=3.2.1', {cache:'no-store'});
+        if (!fixResp.ok) fixResp = await fetch('./v3-fixes.js', {cache:'reload'});
+        if (!fixResp.ok) throw new Error(`v3-fixes.js: HTTP ${fixResp.status}`);
+        const fixes = await fixResp.text();
+
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
-        html = html.replace(marker, v3 + '\n\n' + marker);
-        html = html.replace(originalVersion, 'Блокнот-скан · v3.2.0 · Рабочие схемы');
+        html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + marker);
+        html = html.replace(originalVersion, 'Блокнот-скан · v3.2.1 · Рабочие схемы');
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
         html = html.replace(originalVersion, `Блокнот-скан · v3 ERROR · ${msg}`);
