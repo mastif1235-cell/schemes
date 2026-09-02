@@ -42,7 +42,8 @@
     .v340-caption{color:var(--text-muted);font-size:.82rem;line-height:1.4;margin:0 0 var(--space-3);}
     .v340-action-list{display:grid;gap:var(--space-2);}
     .v340-cover-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:var(--space-2);}
-    .v340-cover-choice{min-height:170px;border:1px solid var(--border);border-radius:var(--radius-md);background-size:cover;background-position:center;}
+    .v340-cover-choice{min-height:170px;padding:0;overflow:hidden;border:1px solid var(--border);border-radius:var(--radius-md);}
+    .v340-cover-choice img{display:block;width:100%;height:170px;object-fit:cover;}
     .v340-notebook-cover{position:absolute;right:14px;top:50%;transform:translateY(-50%);width:52px;height:72px;object-fit:cover;border-radius:8px;border:1px solid var(--border);}
     .v340-photo-state{position:absolute;left:6px;bottom:6px;padding:3px 7px;border-radius:999px;background:#000b;color:#fff;font-size:.68rem;z-index:3;}
     .v340-settings-card{padding:var(--space-3);margin-bottom:var(--space-2);}

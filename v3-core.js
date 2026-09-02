@@ -217,24 +217,31 @@
     if (!choices.length) { toast('В разворотах пока нет локальных фото'); return; }
     if (parentClose) parentClose();
     const {close, el} = openSheet(`<div class="sheet-handle"></div><h2>Фото из разворотов</h2><div class="v340-cover-grid"></div>`);
-    const urls = [];
-    const cleanup = () => urls.splice(0).forEach(url => URL.revokeObjectURL(url));
     for (const choice of choices) {
-      const url = URL.createObjectURL(choice.blob); urls.push(url);
       const button = document.createElement('button');
       button.className = 'v340-cover-choice';
-      button.style.backgroundImage = `url(${url})`;
       button.setAttribute('aria-label', `Разворот ${choice.spread.number}`);
+      const image = document.createElement('img');
+      const url = URL.createObjectURL(choice.blob);
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        try { URL.revokeObjectURL(url); }
+        catch (error) { console.warn('Cover preview URL could not be released', error); }
+      };
+      image.addEventListener('load', release, {once:true});
+      image.addEventListener('error', release, {once:true});
+      image.src = url; image.alt = '';
+      button.appendChild(image);
+      setTimeout(release, 30000);
       button.onclick = async () => {
         await put('blobs', {id:COVER_PREFIX + notebook.id, blob:choice.blob});
         setCoverRemoved(notebook.id, false);
-        cleanup(); close(); render(); toast('Обложка сохранена на этом устройстве');
+        release(); close(); render(); toast('Обложка сохранена на этом устройстве');
       };
       el.querySelector('.v340-cover-grid').appendChild(button);
     }
-    el.closest('.sheet-backdrop').addEventListener('click', event => {
-      if (event.target === el.closest('.sheet-backdrop')) cleanup();
-    }, {once:true});
   };
 
   openNotebookCover = async function (notebook) {

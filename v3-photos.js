@@ -155,6 +155,7 @@
       const photo = spread.current_photo_id ? await get('photos', spread.current_photo_id) : null;
       const queue = await getAll('sync_queue');
       const resolved = photo ? await window.v340ResolvePhotoBlob(photo, true) : {blob:null, fallback:false};
+      if (closed) return;
       if (resolved.blob) currentUrl = URL.createObjectURL(resolved.blob);
       const links = await getAllByIndex('spread_tags', 'spread_id', spread.id);
       const tags = (await Promise.all(links.map(link => get('tags', link.tag_id)))).filter(Boolean);
@@ -333,7 +334,8 @@
           const url = URL.createObjectURL(download.blob);
           const anchor = document.createElement('a'); anchor.href = url;
           anchor.download = `spread_${spread.number}_${download.fallback ? 'preview' : 'original'}.jpg`;
-          anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+          try { anchor.click(); }
+          finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
         } else if (action === 'telegram' && photo && photo.telegram_link) window.open(photo.telegram_link, '_blank');
         else if (action === 'delete') {
           confirmAction('Удалить этот разворот?', async () => {

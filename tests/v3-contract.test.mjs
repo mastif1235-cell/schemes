@@ -33,6 +33,8 @@ for (const state of ['local', 'pending', 'syncing', 'synced', 'error']) {
 assert.doesNotMatch(photos, /state:'(?:failed|uploading|telegram)'/);
 assert.match(photos, /queueStatus === 'done'[\s\S]*?state:'synced'[\s\S]*?state:'error'/);
 assert.match(photos, /if \(queueStatus\) return \{state:'error'/);
+assert.match(photos, /if \(closed\) return;[\s\S]*?URL\.createObjectURL\(resolved\.blob\)/);
+assert.match(photos, /finally \{ setTimeout\(\(\) => URL\.revokeObjectURL\(url\), 1000\); \}/);
 assert.ok(photos.indexOf('apiBlob(') < photos.indexOf('const thumbnail = allowThumbnail'));
 assert.doesNotMatch(photos, /JSON\.stringify\([^)]*queue/);
 assert.match(photos, /event\.state\.blocknotViewer === historyToken/);
@@ -75,6 +77,8 @@ assert.match(core, /isCoverRemoved\(notebook\.id\)/);
 assert.doesNotMatch(core, /COVER_PREFIX \+ notebook\.title/);
 assert.match(core, /window\.v340PruneRecents = pruneRecents/);
 assert.match(core, /Recent spreads could not be saved/);
+assert.match(core, /image\.addEventListener\('load', release/);
+assert.match(core, /setTimeout\(release, 30000\)/);
 assert.match(ui, /getAll\('user_favorites'\)/);
 assert.match(ui, /Stale favorite reference could not be removed/);
 assert.match(ui, /window\.v340PruneRecents\(\)/);
