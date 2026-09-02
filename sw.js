@@ -1,5 +1,5 @@
-// Блокнот-скан v3.3.5 — integrated app shell
-const CACHE = 'blocknot-shell-v26';
+// Блокнот-скан v3.3.6 — integrated app shell
+const CACHE = 'blocknot-shell-v27';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
@@ -24,12 +24,21 @@ self.addEventListener('fetch', (e) => {
 
   if (e.request.mode === 'navigate' || url.pathname.endsWith('/index.html')) {
     e.respondWith(
-      fetch(e.request).then(resp => {
+      fetch(e.request, {cache:'no-store'}).then(resp => {
         const copy = resp.clone();
         caches.open(CACHE).then(c => c.put('./index.html', copy));
         return resp;
       }).catch(() => caches.match('./index.html'))
     );
+    return;
+  }
+
+  /* Versioned requests always prefer network, so a previous SW cannot pin old JS forever. */
+  if (url.searchParams.has('v') || url.searchParams.has('appv') || url.searchParams.has('_refresh')) {
+    e.respondWith(fetch(e.request, {cache:'no-store'}).catch(() => {
+      const clean = new Request(url.origin + url.pathname, {credentials:'same-origin'});
+      return caches.match(clean).then(r => r || caches.match(e.request));
+    }));
     return;
   }
 
