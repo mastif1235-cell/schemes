@@ -1,7 +1,8 @@
-const CACHE = 'blocknot-shell-v3';
+const CACHE = 'blocknot-shell-v4';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
-  './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt'
+  './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
+  './v3-loader.js', './v3-enhancements.txt'
 ];
 
 self.addEventListener('install', (e) => {
