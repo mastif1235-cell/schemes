@@ -10,6 +10,18 @@
   const baseOpenDB = openDB;
   const baseOpenNotebookEditor = openNotebookEditorV2 || openNotebookEditor;
 
+  function isCoverRemoved(notebookId) {
+    try { return localStorage.getItem(COVER_REMOVED_PREFIX + notebookId) === '1'; }
+    catch (error) { console.warn('Cannot read local cover state', notebookId, error); return false; }
+  }
+
+  function setCoverRemoved(notebookId, removed) {
+    try {
+      if (removed) localStorage.setItem(COVER_REMOVED_PREFIX + notebookId, '1');
+      else localStorage.removeItem(COVER_REMOVED_PREFIX + notebookId);
+    } catch (error) { console.warn('Cannot update local cover state', notebookId, error); }
+  }
+
   if (typeof v3Observer !== 'undefined') v3Observer.disconnect();
   if (typeof v3DecorateTimer !== 'undefined') clearTimeout(v3DecorateTimer);
   if (typeof v323Observer !== 'undefined') v323Observer.disconnect();
@@ -182,7 +194,7 @@
     if (!notebook || !file) return;
     const blob = await cropCover(file);
     await put('blobs', {id:COVER_PREFIX + notebook.id, blob});
-    localStorage.removeItem(COVER_REMOVED_PREFIX + notebook.id);
+    setCoverRemoved(notebook.id, false);
     toast('Обложка сохранена на этом устройстве');
     BlocknotV3.emit('cover-change', notebook.id);
     render();
@@ -209,7 +221,7 @@
       button.setAttribute('aria-label', `Разворот ${choice.spread.number}`);
       button.onclick = async () => {
         await put('blobs', {id:COVER_PREFIX + notebook.id, blob:choice.blob});
-        localStorage.removeItem(COVER_REMOVED_PREFIX + notebook.id);
+        setCoverRemoved(notebook.id, false);
         cleanup(); close(); render(); toast('Обложка сохранена на этом устройстве');
       };
       el.querySelector('.v340-cover-grid').appendChild(button);
@@ -239,14 +251,14 @@
         await chooseCoverFromSpreads(notebook, close);
       } else if (button.dataset.action === 'remove') {
         await del('blobs', COVER_PREFIX + notebook.id);
-        localStorage.setItem(COVER_REMOVED_PREFIX + notebook.id, '1');
+        setCoverRemoved(notebook.id, true);
         close(); render(); toast('Обложка удалена с этого устройства');
       }
     };
   };
 
   getNotebookCoverUrl = async function (notebook) {
-    if (!notebook || localStorage.getItem(COVER_REMOVED_PREFIX + notebook.id)) return null;
+    if (!notebook || isCoverRemoved(notebook.id)) return null;
     const local = await get('blobs', COVER_PREFIX + notebook.id);
     if (local && local.blob) return URL.createObjectURL(local.blob);
     if (notebook.cover_photo_id) {

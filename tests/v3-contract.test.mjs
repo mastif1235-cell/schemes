@@ -63,6 +63,9 @@ assert.match(camera, /imageOrientation:'from-image'/);
 const core = read('v3-core.js');
 assert.match(core, /notebook_cover_/);
 assert.match(core, /Обложка хранится только на этом устройстве/);
+assert.match(core, /COVER_PREFIX \+ notebook\.id/);
+assert.match(core, /isCoverRemoved\(notebook\.id\)/);
+assert.doesNotMatch(core, /COVER_PREFIX \+ notebook\.title/);
 assert.doesNotMatch(core, /\[\[BNSCOVER:/);
 
 console.log('v3-contract: PASS');
