@@ -84,7 +84,7 @@ assert.doesNotMatch(indexSource, /location\.replace\s*\(/);
 {
   const worker = createWorker();
   await dispatchWait(worker.handlers.activate);
-  assert.deepEqual(worker.deleted, ['blocknot-shell-v30']);
+  assert.deepEqual(worker.deleted, ['blocknot-shell-v30', 'blocknot-shell-v340']);
 }
 
 console.log('sw-offline: PASS');
