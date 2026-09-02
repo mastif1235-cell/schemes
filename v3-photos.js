@@ -63,7 +63,8 @@
       await decoder.tracks.ready;
       const track = decoder.tracks.selectedTrack;
       return track ? {width:track.displayWidth || track.codedWidth, height:track.displayHeight || track.codedHeight} : null;
-    } catch (_) {
+    } catch (error) {
+      console.warn('Image metadata could not be decoded; using bitmap dimensions', error);
       return null;
     } finally {
       if (decoder) decoder.close();
@@ -121,7 +122,8 @@
 
     function revokeCurrentUrl() {
       if (!currentUrl) return;
-      try { URL.revokeObjectURL(currentUrl); } catch (_) {}
+      try { URL.revokeObjectURL(currentUrl); }
+      catch (error) { console.warn('Viewer object URL could not be released', error); }
       currentUrl = null;
     }
 
@@ -140,7 +142,7 @@
     try {
       history.pushState({blocknotViewer:historyToken}, '');
       window.addEventListener('popstate', onPopState);
-    } catch (_) {}
+    } catch (error) { console.warn('Viewer history state could not be created', error); }
 
     function closeViewer() {
       if (history.state && history.state.blocknotViewer === historyToken) history.back();

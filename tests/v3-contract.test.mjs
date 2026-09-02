@@ -13,6 +13,7 @@ assert.deepEqual(paths.slice(-consolidated.length), consolidated);
 for (const file of consolidated) {
   const source = read(file);
   assert.doesNotMatch(source, /new\s+MutationObserver|setInterval\s*\(/, `${file} must remain event-driven`);
+  assert.doesNotMatch(source, /catch\s*\(_\)\s*\{\s*\}/, `${file} must not hide errors in empty catches`);
 }
 
 const ui = read('v3-ui.js');

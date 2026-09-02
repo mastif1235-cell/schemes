@@ -31,11 +31,11 @@
     },
     {
       "path": "v3-photos.js",
-      "sha256": "a63b48341ae2a85dd4509730739802e078431b5555291aa477c3922df2e02fc7"
+      "sha256": "60d58614dddde10d8281cd5bdb269b476dfb63edd718f617ba352aa5ce7ab81c"
     },
     {
       "path": "v3-camera.js",
-      "sha256": "a73898c6c40c13cc50719965f338129179b92eeef32946aa35f082ed956ef219"
+      "sha256": "9183004228ee9d5c8d7a718a58698bf5a29e0ae9eedf87b42fab720275b67881"
     },
     {
       "path": "v3-history.js",
@@ -43,7 +43,7 @@
     },
     {
       "path": "v3-ui.js",
-      "sha256": "ec3423801c4dab48d4fd764526fe265c940a4b077c5c5499f1c42bf6d2b1d646"
+      "sha256": "36b759fa5277dcc987cb6c04e7bbcadde7f4a920cdbadf6136181396525a01d3"
     }
   ]
 }

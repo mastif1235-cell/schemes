@@ -168,7 +168,8 @@
       function onPopState() { finish({action:'cancel'}, true); }
       function onResize() { sizeCanvas(); renderPreview(); }
       window.addEventListener('resize', onResize);
-      try { history.pushState({blocknotCrop:token}, ''); window.addEventListener('popstate', onPopState); } catch (_) {}
+      try { history.pushState({blocknotCrop:token}, ''); window.addEventListener('popstate', onPopState); }
+      catch (error) { console.warn('Crop history state could not be created', error); }
       backdrop.addEventListener('click', event => { if (event.target === backdrop) finish({action:'cancel'}); });
 
       canvas.addEventListener('pointerdown', event => {

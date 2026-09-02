@@ -59,7 +59,10 @@
   function releaseImageUrl(img) {
     if (!img || !String(img.src || '').startsWith('blob:')) return;
     const url = img.src;
-    const release = () => { try { URL.revokeObjectURL(url); } catch (_) {} };
+    const release = () => {
+      try { URL.revokeObjectURL(url); }
+      catch (error) { console.warn('Image object URL could not be released', error); }
+    };
     if (img.complete) release();
     else { img.addEventListener('load', release, {once:true}); img.addEventListener('error', release, {once:true}); }
   }
