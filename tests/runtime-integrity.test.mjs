@@ -27,6 +27,8 @@ assert.doesNotMatch(index, /const fixes = await fetchTextWithOfflineFallback/);
 const chunks = ['chunk1.txt', 'chunk2.txt', 'chunk3.txt', 'chunk4.txt'];
 const base64 = chunks.map(file => fs.readFileSync(path.join(root, file), 'utf8')).join('').trim();
 let html = zlib.gunzipSync(Buffer.from(base64, 'base64')).toString('utf8');
+assert.match(html, /if\(prevPhoto\)\{ prevPhoto\.is_current=false; await put\('photos', prevPhoto\); \}/);
+assert.match(html, /await put\('blobs', \{id: photoId\+'_orig', blob:file\}\)/);
 const runtime = [];
 for (const entry of manifest.files) {
   if (chunks.includes(entry.path)) continue;

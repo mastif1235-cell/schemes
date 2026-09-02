@@ -40,6 +40,28 @@
     return {blob:thumbnail, fallback:!!thumbnail, source:thumbnail ? 'thumbnail' : null};
   };
 
+  window.v341RotatePhotoBlob = async function (blob, degrees) {
+    const bitmap = await createImageBitmap(blob, {imageOrientation:'from-image'});
+    const canvas = document.createElement('canvas');
+    try {
+      const quarterTurn = Math.abs(degrees) % 180 === 90;
+      canvas.width = quarterTurn ? bitmap.height : bitmap.width;
+      canvas.height = quarterTurn ? bitmap.width : bitmap.height;
+      const context = canvas.getContext('2d', {alpha:false});
+      context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height);
+      context.translate(canvas.width / 2, canvas.height / 2);
+      context.rotate(degrees * Math.PI / 180);
+      context.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+      const type = blob.type === 'image/png' ? 'image/png' : 'image/jpeg';
+      return await new Promise((resolve, reject) => canvas.toBlob(
+        value => value ? resolve(value) : reject(new Error('rotate failed')), type, type === 'image/jpeg' ? .92 : undefined
+      ));
+    } finally {
+      canvas.width = canvas.height = 0;
+      if (bitmap.close) bitmap.close();
+    }
+  };
+
   v3LocalPhotoBlob = async photo => (await v340ResolvePhotoBlob(photo, true)).blob;
   v3FetchOriginalBlob = async photo => (await v340ResolvePhotoBlob(photo, true)).blob;
 
@@ -107,7 +129,7 @@
           ${currentUrl ? `<img data-image src="${currentUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}
           ${spreads.length > 1 ? '<button class="viewer-nav prev v341-nav-zone" data-nav="prev" aria-label="Предыдущее фото">←</button><button class="viewer-nav next v341-nav-zone" data-nav="next" aria-label="Следующее фото">→</button>' : ''}
         </div>
-        <div class="v340-zoom-controls"><button data-action="minus">−</button><button data-action="reset">100%</button><button data-action="plus">+</button><button data-action="download">⬇</button></div>
+        <div class="v340-zoom-controls"><button data-action="minus">−</button><button data-action="reset">100%</button><button data-action="plus">+</button><button data-action="rotate-left" aria-label="Повернуть влево на 90 градусов">↺ 90°</button><button data-action="rotate-right" aria-label="Повернуть вправо на 90 градусов">↻ 90°</button><button data-action="download">⬇</button></div>
         ${spread.conflict ? '<div class="warn-box v340-conflict">⚠ Конфликт версий<div class="btn-row"><button class="btn-secondary" data-action="server">Версия сервера</button><button class="btn-primary" data-action="mine">Сохранить мою</button></div></div>' : ''}
         <div class="viewer-bottom"><div class="t">${esc(spread.title || 'Без названия')}</div>
           ${photoState ? `<div class="v340-viewer-state">${photoState.label}${resolved.fallback ? ' · показана миниатюра' : ''}</div>` : ''}
@@ -233,6 +255,27 @@
         else if (action === 'minus') setScale(gesture.scale - .5);
         else if (action === 'plus') setScale(gesture.scale + .5);
         else if (action === 'reset') setScale(1);
+        else if (action === 'rotate-left' || action === 'rotate-right') {
+          if (!photo) return;
+          const original = await window.v340ResolvePhotoBlob(photo, false);
+          if (!original.blob) { toast('Оригинал недоступен — поворот не выполнен'); return; }
+          const rotateButtons = overlay.querySelectorAll('[data-action="rotate-left"],[data-action="rotate-right"]');
+          rotateButtons.forEach(item => { item.disabled = true; });
+          try {
+            const degrees = action === 'rotate-left' ? -90 : 90;
+            const rotated = await window.v341RotatePhotoBlob(original.blob, degrees);
+            const extension = rotated.type === 'image/png' ? 'png' : 'jpg';
+            const file = new File([rotated], `spread_${spread.number}_rotated.${extension}`, {type:rotated.type, lastModified:Date.now()});
+            // attachPhoto creates a new normal photo revision and leaves the previous original intact.
+            await attachPhoto(spread, file);
+            toast('Поворот сохранён новой версией фото');
+            draw();
+          } catch (error) {
+            console.error('Photo rotation failed', error);
+            rotateButtons.forEach(item => { item.disabled = false; });
+            toast('Не удалось повернуть фото');
+          }
+        }
         else if (action === 'favorite') {
           spread.favorite = !spread.favorite; await put('spreads', spread);
           if (spread.favorite) await put('user_favorites', {spread_id:spread.id}); else await del('user_favorites', spread.id);

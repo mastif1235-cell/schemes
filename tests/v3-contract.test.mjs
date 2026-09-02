@@ -33,6 +33,12 @@ assert.doesNotMatch(photos, /swipeX|swipeY|Math\.abs\(dx\) > 70/);
 assert.match(photos, /v341-nav-zone/);
 assert.match(photos, /press\.moved && gesture\.scale <= 1\.001/);
 assert.match(photos, /v341-zoomed/);
+assert.match(photos, /createImageBitmap\(blob, \{imageOrientation:'from-image'\}\)/);
+assert.match(photos, /previous original intact/);
+assert.match(photos, /Поворот сохранён новой версией фото/);
+assert.match(photos, /attachPhoto\(spread, file\)/);
+assert.match(photos, /data-action="rotate-left"/);
+assert.match(photos, /data-action="rotate-right"/);
 
 const history = read('v3-history.js');
 assert.match(history, /История этого устройства/);
@@ -45,6 +51,9 @@ assert.match(camera, /bitmap\.close/);
 assert.match(camera, /pointercancel/);
 assert.match(camera, /blocknotCrop/);
 assert.match(camera, /rgba\(0,0,0,\.58\)/);
+assert.match(camera, /data-action="rotate-left"/);
+assert.match(camera, /data-action="rotate-right"/);
+assert.match(camera, /imageOrientation:'from-image'/);
 
 const core = read('v3-core.js');
 assert.match(core, /notebook_cover_/);

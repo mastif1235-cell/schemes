@@ -67,7 +67,7 @@
       sheet.innerHTML = `<div class="sheet-handle"></div><h2>Подготовить страницу</h2>
         <p class="v340-caption">Двигайте фото одним пальцем, масштабируйте двумя или кнопками.</p>
         <canvas class="v340-crop-canvas"></canvas>
-        <div class="v340-crop-tools"><button data-action="minus">−</button><button data-action="reset">100%</button><button data-action="plus">+</button><button data-action="rotate">↻</button></div>
+        <div class="v340-crop-tools"><button data-action="minus">−</button><button data-action="reset">100%</button><button data-action="plus">+</button><button data-action="rotate-left" aria-label="Повернуть влево на 90 градусов">↺ 90°</button><button data-action="rotate-right" aria-label="Повернуть вправо на 90 градусов">↻ 90°</button></div>
         <div class="btn-row"><button class="btn-secondary" data-action="retake">Повторить</button><button class="btn-primary" data-action="use">Использовать</button></div>
         <button class="btn-ghost" data-action="cancel" style="width:100%;margin-top:8px">Отмена</button>`;
       backdrop.appendChild(sheet); document.getElementById('modalRoot').appendChild(backdrop);
@@ -209,7 +209,8 @@
         if (button.dataset.action === 'minus') state.zoom = Math.max(1, state.zoom - .2);
         else if (button.dataset.action === 'plus') state.zoom = Math.min(5, state.zoom + .2);
         else if (button.dataset.action === 'reset') { state.zoom = 1; state.panX = state.panY = 0; }
-        else if (button.dataset.action === 'rotate') { state.rotation = (state.rotation + 90) % 360; state.zoom = 1; state.panX = state.panY = 0; }
+        else if (button.dataset.action === 'rotate-left') { state.rotation = (state.rotation + 270) % 360; state.zoom = 1; state.panX = state.panY = 0; }
+        else if (button.dataset.action === 'rotate-right') { state.rotation = (state.rotation + 90) % 360; state.zoom = 1; state.panX = state.panY = 0; }
         else if (button.dataset.action === 'retake') { finish({action:'retake'}); return; }
         else if (button.dataset.action === 'cancel') { finish({action:'cancel'}); return; }
         else if (button.dataset.action === 'use') {
