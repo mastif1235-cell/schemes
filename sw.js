@@ -1,5 +1,5 @@
-// Блокнот-скан v3.2.9 — integrated app shell
-const CACHE = 'blocknot-shell-v20';
+// Блокнот-скан v3.3.0 — integrated app shell
+const CACHE = 'blocknot-shell-v21';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
