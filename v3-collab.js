@@ -1,97 +1,72 @@
-/* Blocknot Scan v3.2.2: invite-code UI + synced notebook cover thumbnail. */
-const V322_COVER_RE = /\n?\[\[BNSCOVER:([A-Za-z0-9+/=]+)\]\]\s*$/;
+/* Blocknot Scan v3.2.4: invite-code UI + safe local notebook covers.
+   Important: cover image data must never be transported inside notebook.description. */
+const V322_COVER_RE = /\s*\[\[BNSCOVER:([A-Za-z0-9+/=]+)\]\]\s*/g;
 
 function v322StripCoverMarker(description) {
-  return String(description || '').replace(V322_COVER_RE, '').trimEnd();
+  return String(description || '').replace(V322_COVER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
 }
-function v322CoverBase64(description) {
-  const m = String(description || '').match(V322_COVER_RE);
-  return m ? m[1] : '';
+function v322CoverBase64() { return ''; }
+
+function v322CleanNotebookObject(nb) {
+  if (!nb) return false;
+  const before = String(nb.description || '');
+  const after = v322StripCoverMarker(before);
+  if (before === after) return false;
+  nb.description = after;
+  nb.updated_at = nowISO();
+  return true;
 }
-function v322Base64ToBlob(b64) {
-  const bin = atob(b64), bytes = new Uint8Array(bin.length);
-  for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
-  return new Blob([bytes], {type:'image/jpeg'});
-}
-async function v322TinyCoverBase64(blob) {
-  const bm = await createImageBitmap(blob);
-  const w = 104, h = 146, ratio = w/h;
-  let sx=0, sy=0, sw=bm.width, sh=bm.height;
-  if (sw/sh > ratio) { sw = Math.round(sh*ratio); sx = Math.round((bm.width-sw)/2); }
-  else { sh = Math.round(sw/ratio); sy = Math.round((bm.height-sh)/2); }
-  const c = document.createElement('canvas'); c.width=w; c.height=h;
-  c.getContext('2d').drawImage(bm,sx,sy,sw,sh,0,0,w,h);
-  if (bm.close) bm.close();
-  const out = await new Promise((res,rej)=>c.toBlob(b=>b?res(b):rej(new Error('cover thumb failed')),'image/jpeg',0.68));
-  const buf = new Uint8Array(await out.arrayBuffer());
-  let bin=''; for (const b of buf) bin += String.fromCharCode(b);
-  return btoa(bin);
-}
-async function v322CoverBlobFromNotebook(nb) {
-  if (!nb) return null;
-  if (nb.cover_blob_id) {
-    const rec = await get('blobs', nb.cover_blob_id);
-    if (rec && rec.blob) return rec.blob;
-  }
-  if (nb.cover_photo_id) {
-    for (const key of [nb.cover_photo_id+'_thumb', nb.cover_photo_id+'_full', nb.cover_photo_id+'_original']) {
-      const rec = await get('blobs', key);
-      if (rec && rec.blob) return rec.blob;
-    }
-  }
-  return null;
-}
-async function v322PatchRemoteCover(nb, remove=false) {
-  if (!nb || !nb.server_id || !isAuthed()) return;
+
+/*
+ * One safe migration path only:
+ * - remove legacy [[BNSCOVER:...]] transport markers from local notebook data;
+ * - let the app's normal notebook sync queue push the cleaned description;
+ * - never issue a second direct notebook PATCH from cover UI.
+ */
+let v322CoverMigrationRunning = false;
+async function v322MigrateLegacyCoverMarkers() {
+  if (v322CoverMigrationRunning) return;
+  v322CoverMigrationRunning = true;
   try {
-    const currentResp = await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}`);
-    const remote = currentResp && currentResp.notebook;
-    if (!remote) return;
-    const clean = v322StripCoverMarker(remote.description || '');
-    let description = clean;
-    if (!remove) {
-      const blob = await v322CoverBlobFromNotebook(nb);
-      if (!blob) return;
-      const b64 = await v322TinyCoverBase64(blob);
-      description = clean + `${clean ? '\n' : ''}[[BNSCOVER:${b64}]]`;
+    const notebooks = await getAll('notebooks');
+    for (const nb of notebooks) {
+      if (!v322CleanNotebookObject(nb)) continue;
+      await put('notebooks', nb);
+      if (isAuthed() && typeof queueEntityChange === 'function') {
+        try { queueEntityChange('notebook', nb.id); } catch (_) {}
+      }
     }
-    const patched = await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}`, {
-      method:'PATCH',
-      body:JSON.stringify({revision:remote.revision, description})
-    });
-    if (patched && patched.notebook) nb.revision = patched.notebook.revision;
   } catch (e) {
-    console.warn('cover sync failed', e);
-    toast('Обложка сохранена локально, синхронизация повторится позже');
+    console.warn('legacy cover marker cleanup failed', e);
+  } finally {
+    v322CoverMigrationRunning = false;
   }
 }
 
+/* Legacy compatibility stubs. No remote image transport through description. */
+async function v322PatchRemoteCover() { return; }
+
+/* Keep cover selection/removal on the existing single notebook sync path.
+   External cover blobs remain local until a dedicated backend cover contract exists. */
 const v322SaveExternalCoverBase = saveExternalCover;
-saveExternalCover = async function(nb,file) {
-  await v322SaveExternalCoverBase(nb,file);
-  await v322PatchRemoteCover(nb,false);
+saveExternalCover = async function(nb, file) {
+  if (nb) v322CleanNotebookObject(nb);
+  return v322SaveExternalCoverBase(nb, file);
 };
 const v322ChooseCoverFromSpreadsBase = chooseCoverFromSpreads;
-chooseCoverFromSpreads = async function(nb,parentClose) {
-  const r = await v322ChooseCoverFromSpreadsBase(nb,parentClose);
-  const grid = document.getElementById('nbCoverGrid');
-  if (grid) grid.addEventListener('click', () => setTimeout(()=>v322PatchRemoteCover(nb,false),350), {once:true});
-  return r;
+chooseCoverFromSpreads = async function(nb, parentClose) {
+  if (nb) v322CleanNotebookObject(nb);
+  return v322ChooseCoverFromSpreadsBase(nb, parentClose);
 };
 const v322OpenNotebookCoverBase = openNotebookCover;
 openNotebookCover = async function(nb) {
-  const r = await v322OpenNotebookCoverBase(nb);
-  const rm = document.getElementById('coverRemove');
-  if (rm) rm.addEventListener('click', () => setTimeout(()=>v322PatchRemoteCover(nb,true),350), {once:true});
-  return r;
+  if (nb) v322CleanNotebookObject(nb);
+  return v322OpenNotebookCoverBase(nb);
 };
 const v322GetNotebookCoverUrlBase = getNotebookCoverUrl;
 getNotebookCoverUrl = async function(nb) {
-  const local = await v322GetNotebookCoverUrlBase(nb);
-  if (local) return local;
-  const b64 = v322CoverBase64(nb && nb.description);
-  if (!b64) return null;
-  try { return URL.createObjectURL(v322Base64ToBlob(b64)); } catch (_) { return null; }
+  if (nb) v322CleanNotebookObject(nb);
+  return v322GetNotebookCoverUrlBase(nb);
 };
 
 function v322ErrorText(err) {
@@ -126,8 +101,23 @@ async function v322OpenRedeemInvite() {
 }
 
 async function v322DecorateNotebookTop() {
-  if (!screenEl || !isAuthed()) return;
-  const heading = [...screenEl.querySelectorAll('h1,h2,h3')].find(h => /мои блокноты|мої блокноти/i.test(h.textContent || ''));
+  if (!screenEl) return;
+
+  /* Defensive UI cleanup for any stale DOM rendered before migration. */
+  const cards = [...screenEl.querySelectorAll('.notebook-card')];
+  for (const card of cards) {
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.nodeValue && node.nodeValue.includes('[[BNSCOVER:')) {
+        node.nodeValue = v322StripCoverMarker(node.nodeValue);
+      }
+    }
+  }
+
+  if (!isAuthed()) return;
+  /* Header is outside screenEl in the base app, so search the document. */
+  const heading = [...document.querySelectorAll('h1,h2,h3')].find(h => /мои блокноты|мої блокноти/i.test(h.textContent || ''));
   if (!heading) return;
   if (!document.getElementById('v322RedeemInviteBtn')) {
     const btn = document.createElement('button');
@@ -138,18 +128,14 @@ async function v322DecorateNotebookTop() {
     const hist = document.getElementById('v321GlobalHistoryBtn');
     (hist || heading).insertAdjacentElement('afterend', btn);
   }
-  /* Hide the transport marker if the base UI prints notebook descriptions. */
-  const cards = [...screenEl.querySelectorAll('.notebook-card')];
-  for (const card of cards) {
-    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      if (node.nodeValue && node.nodeValue.includes('[[BNSCOVER:')) node.nodeValue = node.nodeValue.replace(/\[\[BNSCOVER:[A-Za-z0-9+/=]+\]\]/g,'').trim();
-    }
-  }
 }
+
 const v322RenderNotebooksBase = renderNotebooks;
 renderNotebooks = async function() {
+  await v322MigrateLegacyCoverMarkers();
   await v322RenderNotebooksBase();
   await v322DecorateNotebookTop();
 };
+
+/* Also run once after startup so edit/export cannot expose a legacy marker first. */
+setTimeout(() => v322MigrateLegacyCoverMarkers(), 250);
