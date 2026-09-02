@@ -16,6 +16,7 @@ for (const file of consolidated) {
 }
 
 const ui = read('v3-ui.js');
+const sync = read('v3-sync.js');
 assert.match(ui, /placeholder="Поиск в этом блокноте"/);
 assert.match(ui, /grid-template-columns:1fr/);
 assert.ok(ui.indexOf('number === query') < ui.indexOf('number.startsWith(query)'));
@@ -66,6 +67,12 @@ assert.match(core, /Обложка хранится только на этом �
 assert.match(core, /COVER_PREFIX \+ notebook\.id/);
 assert.match(core, /isCoverRemoved\(notebook\.id\)/);
 assert.doesNotMatch(core, /COVER_PREFIX \+ notebook\.title/);
+assert.match(core, /window\.v340PruneRecents = pruneRecents/);
+assert.match(core, /Recent spreads could not be saved/);
+assert.match(ui, /getAll\('user_favorites'\)/);
+assert.match(ui, /Stale favorite reference could not be removed/);
+assert.match(ui, /window\.v340PruneRecents\(\)/);
+assert.match(sync, /pushFavorite[\s\S]*?if \(!sp\.server_id\) return queueResult\('deferred'/);
 assert.doesNotMatch(core, /\[\[BNSCOVER:/);
 
 console.log('v3-contract: PASS');

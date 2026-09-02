@@ -58,13 +58,18 @@
     }
   }
 
+  function saveRecents(rows) {
+    try { localStorage.setItem(RECENTS_KEY, JSON.stringify(rows.slice(0, 12))); }
+    catch (error) { console.warn('Recent spreads could not be saved', error); }
+  }
+
   v3LoadRecents = loadRecents;
   v3RememberSpread = function (spread) {
     if (!spread || !spread.id) return;
     const rows = loadRecents().filter(row => row.id !== spread.id);
     rows.unshift({id:spread.id, notebook_id:spread.notebook_id, number:spread.number,
       title:spread.title || '', at:Date.now()});
-    localStorage.setItem(RECENTS_KEY, JSON.stringify(rows.slice(0, 12)));
+    saveRecents(rows);
   };
 
   async function pruneRecents() {
@@ -73,9 +78,10 @@
       const spread = await get('spreads', row.id);
       if (spread && !spread.deleted_at) valid.push(row);
     }
-    localStorage.setItem(RECENTS_KEY, JSON.stringify(valid.slice(0, 12)));
+    saveRecents(valid);
     return valid;
   }
+  window.v340PruneRecents = pruneRecents;
 
   window.v340OpenSpread = async function (spread) {
     if (!spread || spread.deleted_at) { toast('Этот разворот больше недоступен'); return false; }

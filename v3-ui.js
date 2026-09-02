@@ -214,16 +214,33 @@
   };
 
   renderFavorites = async function () {
-    const allSpreads = await getAll('spreads');
+    let allSpreads = [];
+    try { allSpreads = await getAll('spreads'); }
+    catch (error) { console.error('Favorites could not read local spreads', error); }
+    const knownSpreads = new Map(allSpreads.filter(row => row && row.id).map(row => [row.id, row]));
+    try {
+      const favoriteRefs = await getAll('user_favorites');
+      for (const ref of favoriteRefs) {
+        const spreadId = ref && ref.spread_id;
+        const spread = knownSpreads.get(spreadId);
+        if (!spreadId || !spread || spread.deleted_at) {
+          try { if (spreadId) await del('user_favorites', spreadId); }
+          catch (error) { console.warn('Stale favorite reference could not be removed', spreadId, error); }
+        }
+      }
+    } catch (error) { console.warn('Favorite references could not be checked', error); }
     const stale = allSpreads.filter(row => row.deleted_at && row.favorite);
     for (const spread of stale) {
-      spread.favorite = false; await put('spreads', spread); await del('user_favorites', spread.id);
+      spread.favorite = false;
+      try { await put('spreads', spread); await del('user_favorites', spread.id); }
+      catch (error) { console.warn('Deleted spread favorite could not be cleared', spread.id, error); }
     }
     const favorites = allSpreads.filter(row => !row.deleted_at && row.favorite);
     const wrap = document.createElement('div'); wrap.className = 'v340-stack'; screenEl.appendChild(wrap);
     const recentRows = await (async () => {
       const rows = [];
-      for (const recent of v3LoadRecents()) {
+      const recents = typeof window.v340PruneRecents === 'function' ? await window.v340PruneRecents() : v3LoadRecents();
+      for (const recent of recents) {
         const spread = await get('spreads', recent.id);
         if (spread && !spread.deleted_at) rows.push(spread);
       }

@@ -27,7 +27,7 @@
     },
     {
       "path": "v3-core.js",
-      "sha256": "27c6a11032813fa931570196ac38fe8224c349470a512e0c182bef3cc8a3d5e8"
+      "sha256": "22264213f8ca2c15912b2993781be59cc618aca753010c100843c7fdcd8a4bfc"
     },
     {
       "path": "v3-photos.js",
@@ -43,7 +43,7 @@
     },
     {
       "path": "v3-ui.js",
-      "sha256": "26339fa34a28deeb764bdf7a368aa7e4a25e0e58ce4ff5dbf32a12c185d993d1"
+      "sha256": "209afa44ba0e6e8893db5acc9795c0a8d842a9d014294bcf3cfcc67616efc73d"
     }
   ]
 }
