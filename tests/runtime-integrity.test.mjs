@@ -14,7 +14,7 @@ const index = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
 assert.equal(manifest.version, '3.4.0');
 assert.ok(manifest.files.length > 0);
 for (const entry of manifest.files) {
-  const content = fs.readFileSync(path.join(root, entry.path));
+  const content = fs.readFileSync(path.join(root, entry.path), 'utf8').replace(/\r\n?/g, '\n');
   const hash = crypto.createHash('sha256').update(content).digest('hex');
   assert.equal(hash, entry.sha256, `${entry.path} hash mismatch`);
   assert.ok(sw.includes(`'./${entry.path}'`), `${entry.path} is missing from Service Worker shell`);
