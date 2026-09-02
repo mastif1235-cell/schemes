@@ -1,5 +1,5 @@
-// Блокнот-скан v3.1.1 — integrated app shell
-const CACHE = 'blocknot-shell-v8';
+// Блокнот-скан v3.1.2 — integrated app shell
+const CACHE = 'blocknot-shell-v9';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
@@ -22,8 +22,6 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== self.location.origin) return;
 
-  // Для самого приложения сначала проверяем сеть, чтобы новые версии не
-  // застревали в старом кэше. При отсутствии сети остаётся офлайн-копия.
   if (e.request.mode === 'navigate' || url.pathname.endsWith('/index.html')) {
     e.respondWith(
       fetch(e.request).then(resp => {
