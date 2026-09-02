@@ -9,7 +9,7 @@
   <div id="boot" style="font-family:system-ui;padding:24px">Запуск приложения…</div>
   <script>
     (async () => {
-      const APP_VERSION = '3.3.6';
+      const APP_VERSION = '3.3.7';
 
       /* One-time safe refresh: removes only the stale Service Worker registration.
          IndexedDB, localStorage, auth/session and user data are NOT cleared. */
@@ -91,11 +91,12 @@
         const member332 = await fetchTextWithOfflineFallback('./v3-member332.js');
         const history333 = await fetchTextWithOfflineFallback('./v3-history333.js');
         const orientation334 = await fetchTextWithOfflineFallback('./v3-orientation334.js');
+        const hotfix337 = await fetchTextWithOfflineFallback('./v3-hotfix337.js');
 
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
         const versionBridge = 'window.__BLOCKNOT_APP_VERSION__ = ' + JSON.stringify(APP_VERSION) + ';\n\n';
-        html = html.replace(marker, versionBridge + v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + ux + '\n\n' + auditfix + '\n\n' + polish + '\n\n' + crop + '\n\n' + ui328 + '\n\n' + history329 + '\n\n' + viewer331 + '\n\n' + member332 + '\n\n' + history333 + '\n\n' + orientation334 + '\n\n' + marker);
+        html = html.replace(marker, versionBridge + v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + ux + '\n\n' + auditfix + '\n\n' + polish + '\n\n' + crop + '\n\n' + ui328 + '\n\n' + history329 + '\n\n' + viewer331 + '\n\n' + member332 + '\n\n' + history333 + '\n\n' + orientation334 + '\n\n' + hotfix337 + '\n\n' + marker);
         html = html.replace(originalVersion, `Блокнот-скан · v${APP_VERSION} · Рабочие схемы`);
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
