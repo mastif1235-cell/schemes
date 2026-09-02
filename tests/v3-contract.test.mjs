@@ -46,6 +46,9 @@ const history = read('v3-history.js');
 assert.match(history, /История этого устройства/);
 assert.match(history, /не синхронизируется/);
 assert.match(history, /v340OpenSpread\(spread\)/);
+assert.match(history, /data-open="notebook"/);
+assert.match(history, /route = \{screen:'spreads', notebookId:targetNotebook\.id\}/);
+assert.doesNotMatch(history, /openSpread\(|openSpreadEditor\(/);
 
 const camera = read('v3-camera.js');
 assert.match(camera, /const maxSide = 2400/);

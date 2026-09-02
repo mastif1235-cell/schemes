@@ -44,6 +44,14 @@
     return null;
   }
 
+  async function resolveNotebook(row, spread, scopedNotebook) {
+    if (scopedNotebook && !scopedNotebook.deleted_at) return scopedNotebook;
+    const id = spread && spread.notebook_id || row && (row.notebook_id || row.notebookId);
+    if (!id) return null;
+    const notebook = await get('notebooks', id);
+    return notebook && !notebook.deleted_at ? notebook : null;
+  }
+
   async function openHistory(notebook) {
     const rows = (await visibleRows(notebook)).slice(0, 100);
     localStorage.setItem(SEEN_KEY, String(Date.now()));
@@ -55,13 +63,18 @@
     if (!rows.length) host.innerHTML = '<div class="empty-state">История пока пуста.</div>';
     for (const row of rows) {
       const spread = await resolveSpread(row);
+      const targetNotebook = await resolveNotebook(row, spread, notebook);
       const item = document.createElement('div'); item.className = 'v340-history-row';
       item.innerHTML = `<div><strong>${esc(actionLabel(row.action))}</strong>
         ${spread ? `<div>Разворот №${esc(spread.number)}</div>` : '<div class="v340-caption">Связанный разворот удалён или недоступен</div>'}
         <small>${eventTime(row) ? new Date(eventTime(row)).toLocaleString('ru-RU') : ''}</small></div>
-        ${spread && !spread.deleted_at ? '<button class="btn-secondary">Открыть</button>' : ''}`;
+        ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open="spread">Открыть</button>' : targetNotebook ? '<button class="btn-secondary" data-open="notebook">Открыть блокнот</button>' : ''}`;
       const button = item.querySelector('button');
-      if (button) button.onclick = async () => { close(); await window.v340OpenSpread(spread); };
+      if (button) button.onclick = async () => {
+        close();
+        if (button.dataset.open === 'spread') await window.v340OpenSpread(spread);
+        else { route = {screen:'spreads', notebookId:targetNotebook.id}; render(); }
+      };
       host.appendChild(item);
     }
     const clear = el.querySelector('[data-clear]');
