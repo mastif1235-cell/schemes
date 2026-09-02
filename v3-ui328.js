@@ -152,6 +152,7 @@ function v328ApplyLayout() {
 
 const v328Observer = new MutationObserver(v328ApplyLayout);
 setTimeout(() => {
+  if (window.__BLOCKNOT_LEGACY_DISABLED__) return;
   if (document.body) v328Observer.observe(document.body, {childList:true, subtree:true});
   v328ApplyLayout();
 }, 120);

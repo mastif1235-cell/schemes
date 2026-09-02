@@ -280,6 +280,7 @@ async function v321RefreshPhotoBadges() {
 
 let v321LastPendingCount = null;
 async function v321Tick() {
+  if (window.__BLOCKNOT_LEGACY_DISABLED__) return;
   try {
     v321DecorateSearchScope();
     await v321DecorateGlobalHistoryButton();
@@ -294,5 +295,5 @@ async function v321Tick() {
   } catch (_) {}
 }
 
-setInterval(v321Tick, 1500);
+const v321TickInterval = setInterval(v321Tick, 1500);
 setTimeout(v321Tick, 300);

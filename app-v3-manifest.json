@@ -27,7 +27,7 @@
     },
     {
       "path": "v3-fixes.js",
-      "sha256": "ac055fa3a3c7c8533a9b21f4cda8550027277241eb15aa9c5cac6e9c2dccd218"
+      "sha256": "f21e3ba4ed54c19c78807bef3a154002123c91d824d2fda78e2cf1e48f3c6068"
     },
     {
       "path": "v3-hotfix.js",
@@ -35,11 +35,11 @@
     },
     {
       "path": "v3-collab.js",
-      "sha256": "94d9aeda8ab3d986f6fa6282aecd6bd0795b3ed25131ee001803825dcc9573a2"
+      "sha256": "052190329aaca4de2a04bd11af9e09a5fa7719641121515e5654250ccfc2e7e0"
     },
     {
       "path": "v3-ux323.js",
-      "sha256": "e31f2091463212991281685b95195211604506302874a29c50c42dc001884e98"
+      "sha256": "c2c41016af628b7b45280bff9f4c33d172af127da6adc965d7a93309ba8c4618"
     },
     {
       "path": "v3-auditfix.js",
@@ -55,15 +55,15 @@
     },
     {
       "path": "v3-ui328.js",
-      "sha256": "9a5ef04ca77c8d7e0495e3c728fa2aa126c9e511ac8a6cb7688018c817a5b397"
+      "sha256": "96a3913c60b6d567159bb5853a429e1eb00522579fe8e561f29ad2755847d131"
     },
     {
       "path": "v3-history329.js",
-      "sha256": "d81d7055faad68ffedddbd3faa7f2703d9fc4aacb84aa6aae877555fad79f774"
+      "sha256": "a0b2f12764738d0dbadc587eb335a5a6e036206cdc051dffced9e6e00cd1ef49"
     },
     {
       "path": "v3-viewer331.js",
-      "sha256": "caaf382c8e04fb327fd28f931453ec38792b33ed51e396ee871d23964c3fcd45"
+      "sha256": "48ddac4d2966c7e83440f7ddde78f95583e08d5cbbc60f865b7096f4b8d1018a"
     },
     {
       "path": "v3-member332.js",
@@ -75,15 +75,35 @@
     },
     {
       "path": "v3-orientation334.js",
-      "sha256": "4b413ab141b1df28a89b30268ea4cc2bccde555542285cceb74b7a6cc512693d"
+      "sha256": "83813b6a25760d3738ddd890c0d6e9d21719861a6061c80afbf6939b08165566"
     },
     {
       "path": "v3-hotfix337.js",
-      "sha256": "519a02736822bfb725d478a728ed8d68f882c03209da9cddeb1fbdb7f5effb94"
+      "sha256": "957046207053c37182333be833fa7e940abc689dd6100a782491ee4ddfaf6570"
     },
     {
       "path": "v3-cover338.js",
-      "sha256": "353e6d38abc704da2a53adc21cb41a3e5439518f33c0eedd28340e4b0dede4b5"
+      "sha256": "a43930667e041c80edf0c339c7f5226b0df932555b568730b092fd5aef8c80d8"
+    },
+    {
+      "path": "v3-core.js",
+      "sha256": "e4da833e72354a44661dbc444348ae94b8757a02ab19999e8e7dc54d7a716504"
+    },
+    {
+      "path": "v3-photos.js",
+      "sha256": "50f6e953aaf67506b89ec481352d453e0a16d23101cdd0de6fbc3fc507c94bfb"
+    },
+    {
+      "path": "v3-camera.js",
+      "sha256": "40cc70aca8b3ed634cf65e4d02fbc631d1ecf8f9f7944b96ec7915ec88dd1584"
+    },
+    {
+      "path": "v3-history.js",
+      "sha256": "14eda50b784b8d934adba9dea95cef0394c55dfdfdda7dd4da56c2bfce46ec68"
+    },
+    {
+      "path": "v3-ui.js",
+      "sha256": "a17d16886378f13dfc90e6ab87a1fad1c4a2b606a282d8ee71e9526f6209a324"
     }
   ]
 }

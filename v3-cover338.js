@@ -187,6 +187,7 @@ const v338CoverObserver = new MutationObserver(() => {
   });
 });
 setTimeout(() => {
+  if (window.__BLOCKNOT_LEGACY_DISABLED__) return;
   if (document.body) v338CoverObserver.observe(document.body, {childList:true, subtree:true});
   v338PlaceCoversByIdentity().catch(() => {});
 }, 180);

@@ -17,7 +17,7 @@ function createRuntime(seed = {}) {
   };
   let apiImpl = async () => { throw new Error('Unexpected API request'); };
   const context = {
-    console,
+    console:{...console, warn() {}},
     Date,
     Math,
     Set,

@@ -60,6 +60,7 @@ function v329Schedule() {
 
 const v329Observer = new MutationObserver(v329Schedule);
 setTimeout(() => {
+  if (window.__BLOCKNOT_LEGACY_DISABLED__) return;
   if (document.body) v329Observer.observe(document.body, {childList:true,subtree:true});
   v329Schedule();
 }, 120);

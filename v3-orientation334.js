@@ -176,4 +176,4 @@ function v334ScheduleLayout() {
   requestAnimationFrame(() => { v334Queued = false; try { v334LandscapeCards(); } catch (_) {} });
 }
 const v334Observer = new MutationObserver(v334ScheduleLayout);
-setTimeout(() => { if (document.body) v334Observer.observe(document.body,{childList:true,subtree:true}); v334ScheduleLayout(); },150);
+setTimeout(() => { if (window.__BLOCKNOT_LEGACY_DISABLED__) return; if (document.body) v334Observer.observe(document.body,{childList:true,subtree:true}); v334ScheduleLayout(); },150);

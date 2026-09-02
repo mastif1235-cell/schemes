@@ -138,4 +138,4 @@ renderNotebooks = async function() {
 };
 
 /* Also run once after startup so edit/export cannot expose a legacy marker first. */
-setTimeout(() => v322MigrateLegacyCoverMarkers(), 250);
+setTimeout(() => { if (!window.__BLOCKNOT_LEGACY_DISABLED__) v322MigrateLegacyCoverMarkers(); }, 250);

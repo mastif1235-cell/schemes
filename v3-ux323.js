@@ -197,5 +197,5 @@ async function v323DecorateAll() {
 }
 
 const v323Observer = new MutationObserver(() => setTimeout(v323DecorateAll, 20));
-setTimeout(() => { if (document.body) v323Observer.observe(document.body,{childList:true,subtree:true}); v323DecorateAll(); }, 100);
-setInterval(v323DecorateAll, 2500);
+setTimeout(() => { if (window.__BLOCKNOT_LEGACY_DISABLED__) return; if (document.body) v323Observer.observe(document.body,{childList:true,subtree:true}); v323DecorateAll(); }, 100);
+const v323DecorateInterval = setInterval(v323DecorateAll, 2500);

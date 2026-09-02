@@ -11,7 +11,8 @@ const runtimeFiles = [
   'v3-collab.js', 'v3-ux323.js', 'v3-auditfix.js', 'v3-polish326.js',
   'v3-crop327.js', 'v3-ui328.js', 'v3-history329.js', 'v3-viewer331.js',
   'v3-member332.js', 'v3-history333.js', 'v3-orientation334.js',
-  'v3-hotfix337.js', 'v3-cover338.js'
+  'v3-hotfix337.js', 'v3-cover338.js', 'v3-core.js', 'v3-photos.js',
+  'v3-camera.js', 'v3-history.js', 'v3-ui.js'
 ];
 
 const manifest = {
