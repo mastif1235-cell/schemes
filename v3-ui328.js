@@ -1,4 +1,4 @@
-/* Blocknot Scan v3.3.0: mobile layout cleanup for notebook search, history and invite settings. */
+/* Blocknot Scan v3.3.5: mobile layout cleanup for notebook search, history and invite settings. */
 /* Search above Add spread, History promoted, invite strictly inside Settings, version always visible in Settings. */
 
 function v328FindButton(re) {
@@ -114,7 +114,6 @@ function v330PinSettingsVersion() {
   const host = v328SettingsHost();
   if (!host) return;
 
-  /* Hide old prototype/version/footer strings inside Settings so there is one canonical version line. */
   for (const el of [...host.querySelectorAll('div,p,small,span')]) {
     const text = (el.textContent || '').trim();
     if (/^Блокнот-скан\s*·/i.test(text) && el.id !== 'v330SettingsVersion') {
@@ -128,7 +127,8 @@ function v330PinSettingsVersion() {
     version.id = 'v330SettingsVersion';
     version.style.cssText = 'margin:22px 0 92px;padding:0 2px;text-align:center;color:var(--ink-soft);font-size:13px;line-height:1.4;';
   }
-  version.textContent = 'Блокнот-скан · v3.3.0';
+  const currentVersion = String(window.__BLOCKNOT_APP_VERSION__ || '3.3.5');
+  version.textContent = 'Блокнот-скан · v' + currentVersion;
   if (version.parentElement !== host || version !== host.lastElementChild) host.appendChild(version);
 }
 
@@ -145,7 +145,7 @@ function v328ApplyLayout() {
       v328AddInviteToSettings();
       v330PinSettingsVersion();
     } catch (e) {
-      console.warn('v3.3.0 layout', e);
+      console.warn('v3 layout', e);
     }
   });
 }
