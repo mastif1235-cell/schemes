@@ -1,9 +1,9 @@
-// Блокнот-скан v3.3.6 — integrated app shell
-const CACHE = 'blocknot-shell-v27';
+// Блокнот-скан v3.3.7 — integrated app shell
+const CACHE = 'blocknot-shell-v28';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
-  './v3-enhancements.txt', './v3-fixes.js', './v3-hotfix.js', './v3-collab.js', './v3-ux323.js', './v3-auditfix.js', './v3-polish326.js', './v3-crop327.js', './v3-ui328.js', './v3-history329.js', './v3-viewer331.js', './v3-member332.js', './v3-history333.js', './v3-orientation334.js'
+  './v3-enhancements.txt', './v3-fixes.js', './v3-hotfix.js', './v3-collab.js', './v3-ux323.js', './v3-auditfix.js', './v3-polish326.js', './v3-crop327.js', './v3-ui328.js', './v3-history329.js', './v3-viewer331.js', './v3-member332.js', './v3-history333.js', './v3-orientation334.js', './v3-hotfix337.js'
 ];
 
 self.addEventListener('install', (e) => {
@@ -33,7 +33,6 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  /* Versioned requests always prefer network, so a previous SW cannot pin old JS forever. */
   if (url.searchParams.has('v') || url.searchParams.has('appv') || url.searchParams.has('_refresh')) {
     e.respondWith(fetch(e.request, {cache:'no-store'}).catch(() => {
       const clean = new Request(url.origin + url.pathname, {credentials:'same-origin'});
