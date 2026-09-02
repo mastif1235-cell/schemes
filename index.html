@@ -9,6 +9,8 @@
   <div id="boot" style="font-family:system-ui;padding:24px">Запуск приложения…</div>
   <script>
     (async () => {
+      const APP_VERSION = '3.2.4';
+
       async function unpackBase64Gzip(text) {
         const b64 = text.trim();
         const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
@@ -16,11 +18,35 @@
         return new Response(stream).text();
       }
 
+      async function fetchTextWithOfflineFallback(path) {
+        let firstError = null;
+        try {
+          const r = await fetch(`${path}?v=${encodeURIComponent(APP_VERSION)}`, {cache:'no-store'});
+          if (r.ok) return await r.text();
+          firstError = new Error(`${path}: HTTP ${r.status}`);
+        } catch (e) {
+          firstError = e;
+        }
+        try {
+          const fallback = await fetch(path, {cache:'default'});
+          if (fallback.ok) return await fallback.text();
+          throw new Error(`${path}: HTTP ${fallback.status}`);
+        } catch (fallbackError) {
+          throw firstError || fallbackError;
+        }
+      }
+
       const names = ['chunk1.txt','chunk2.txt','chunk3.txt','chunk4.txt'];
       const parts = await Promise.all(names.map(async name => {
-        const r = await fetch(name, {cache:'no-store'});
-        if (!r.ok) throw new Error(`${name}: HTTP ${r.status}`);
-        return r.text();
+        try {
+          const r = await fetch(name, {cache:'no-store'});
+          if (!r.ok) throw new Error(`${name}: HTTP ${r.status}`);
+          return r.text();
+        } catch (networkError) {
+          const cached = await fetch(name, {cache:'default'});
+          if (!cached.ok) throw networkError;
+          return cached.text();
+        }
       }));
 
       let html = await unpackBase64Gzip(parts.join(''));
@@ -31,35 +57,16 @@
 
       const originalVersion = 'Блокнот-скан · прототип';
       try {
-        let r = await fetch('./v3-enhancements.txt?v=3.2.3', {cache:'no-store'});
-        if (!r.ok) r = await fetch('./v3-enhancements.txt', {cache:'reload'});
-        if (!r.ok) throw new Error(`v3-enhancements.txt: HTTP ${r.status}`);
-        const v3 = await unpackBase64Gzip(await r.text());
-
-        let fixResp = await fetch('./v3-fixes.js?v=3.2.3', {cache:'no-store'});
-        if (!fixResp.ok) fixResp = await fetch('./v3-fixes.js', {cache:'reload'});
-        if (!fixResp.ok) throw new Error(`v3-fixes.js: HTTP ${fixResp.status}`);
-        const fixes = await fixResp.text();
-
-        let hotfixResp = await fetch('./v3-hotfix.js?v=3.2.3', {cache:'no-store'});
-        if (!hotfixResp.ok) hotfixResp = await fetch('./v3-hotfix.js', {cache:'reload'});
-        if (!hotfixResp.ok) throw new Error(`v3-hotfix.js: HTTP ${hotfixResp.status}`);
-        const hotfix = await hotfixResp.text();
-
-        let collabResp = await fetch('./v3-collab.js?v=3.2.3', {cache:'no-store'});
-        if (!collabResp.ok) collabResp = await fetch('./v3-collab.js', {cache:'reload'});
-        if (!collabResp.ok) throw new Error(`v3-collab.js: HTTP ${collabResp.status}`);
-        const collab = await collabResp.text();
-
-        let uxResp = await fetch('./v3-ux323.js?v=3.2.3', {cache:'no-store'});
-        if (!uxResp.ok) uxResp = await fetch('./v3-ux323.js', {cache:'reload'});
-        if (!uxResp.ok) throw new Error(`v3-ux323.js: HTTP ${uxResp.status}`);
-        const ux = await uxResp.text();
+        const v3 = await unpackBase64Gzip(await fetchTextWithOfflineFallback('./v3-enhancements.txt'));
+        const fixes = await fetchTextWithOfflineFallback('./v3-fixes.js');
+        const hotfix = await fetchTextWithOfflineFallback('./v3-hotfix.js');
+        const collab = await fetchTextWithOfflineFallback('./v3-collab.js');
+        const ux = await fetchTextWithOfflineFallback('./v3-ux323.js');
 
         const marker = '// ===================== INIT =====================';
         if (!html.includes(marker)) throw new Error('INIT marker not found');
         html = html.replace(marker, v3 + '\n\n' + fixes + '\n\n' + hotfix + '\n\n' + collab + '\n\n' + ux + '\n\n' + marker);
-        html = html.replace(originalVersion, 'Блокнот-скан · v3.2.3 · Рабочие схемы');
+        html = html.replace(originalVersion, `Блокнот-скан · v${APP_VERSION} · Рабочие схемы`);
       } catch (err) {
         const msg = String(err && err.message ? err.message : err).replace(/[<>]/g, '');
         html = html.replace(originalVersion, `Блокнот-скан · v3 ERROR · ${msg}`);
