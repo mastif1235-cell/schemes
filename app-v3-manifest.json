@@ -26,66 +26,6 @@
       "sha256": "002d8d0146d3154db20ed2bdebef43aa520ab15e2c4004c55e28d59409fe139b"
     },
     {
-      "path": "v3-fixes.js",
-      "sha256": "f21e3ba4ed54c19c78807bef3a154002123c91d824d2fda78e2cf1e48f3c6068"
-    },
-    {
-      "path": "v3-hotfix.js",
-      "sha256": "0e38fd88701b67a7050c9a35be9b42cc6c89e8aaadf93d67576d38b4ef01a0f2"
-    },
-    {
-      "path": "v3-collab.js",
-      "sha256": "052190329aaca4de2a04bd11af9e09a5fa7719641121515e5654250ccfc2e7e0"
-    },
-    {
-      "path": "v3-ux323.js",
-      "sha256": "c2c41016af628b7b45280bff9f4c33d172af127da6adc965d7a93309ba8c4618"
-    },
-    {
-      "path": "v3-auditfix.js",
-      "sha256": "f866db0bd0f2ecc6871cfb8f1a93c0b5c053d33931ba24c9bad24fb9dbe6a292"
-    },
-    {
-      "path": "v3-polish326.js",
-      "sha256": "e7855461da1c8890c8ab2b3026e831b5eb3852d95a546951d28c29818b33db12"
-    },
-    {
-      "path": "v3-crop327.js",
-      "sha256": "35ab5d8f691b584049838a2761e4729170f23b8cb6506a8240d54dd36566ef5c"
-    },
-    {
-      "path": "v3-ui328.js",
-      "sha256": "96a3913c60b6d567159bb5853a429e1eb00522579fe8e561f29ad2755847d131"
-    },
-    {
-      "path": "v3-history329.js",
-      "sha256": "a0b2f12764738d0dbadc587eb335a5a6e036206cdc051dffced9e6e00cd1ef49"
-    },
-    {
-      "path": "v3-viewer331.js",
-      "sha256": "48ddac4d2966c7e83440f7ddde78f95583e08d5cbbc60f865b7096f4b8d1018a"
-    },
-    {
-      "path": "v3-member332.js",
-      "sha256": "fba8ff0382cf1c745dd2bae26e4c1eed797233195cf0d43dc4734f0dfd90b9d4"
-    },
-    {
-      "path": "v3-history333.js",
-      "sha256": "16275d7e7e4691fa4afc7cc27ceb0b1f8079c141be1f031e95b67f274c21e23f"
-    },
-    {
-      "path": "v3-orientation334.js",
-      "sha256": "83813b6a25760d3738ddd890c0d6e9d21719861a6061c80afbf6939b08165566"
-    },
-    {
-      "path": "v3-hotfix337.js",
-      "sha256": "957046207053c37182333be833fa7e940abc689dd6100a782491ee4ddfaf6570"
-    },
-    {
-      "path": "v3-cover338.js",
-      "sha256": "a43930667e041c80edf0c339c7f5226b0df932555b568730b092fd5aef8c80d8"
-    },
-    {
       "path": "v3-core.js",
       "sha256": "e4da833e72354a44661dbc444348ae94b8757a02ab19999e8e7dc54d7a716504"
     },
