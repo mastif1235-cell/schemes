@@ -6,8 +6,12 @@ import {fileURLToPath} from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sourcePath = path.join(root, 'v3-enhancements.js');
 const outputPath = path.join(root, 'v3-enhancements.txt');
-const source = fs.readFileSync(sourcePath);
-const output = zlib.gzipSync(source, {level:9, mtime:0}).toString('base64') + '\n';
+const source = Buffer.from(fs.readFileSync(sourcePath, 'utf8').replace(/\r\n?/g, '\n'));
+const compressed = zlib.gzipSync(source, {level:9, mtime:0});
+// RFC 1952's OS byte is metadata only. Normalize it so Windows and Linux
+// produce the same checked-in payload.
+compressed[9] = 255;
+const output = compressed.toString('base64') + '\n';
 
 if (process.argv.includes('--check')) {
   const current = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
