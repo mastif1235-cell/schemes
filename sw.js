@@ -1,5 +1,5 @@
-// Блокнот-скан v3.2.3 — integrated app shell
-const CACHE = 'blocknot-shell-v14';
+// Блокнот-скан v3.2.4 — integrated app shell
+const CACHE = 'blocknot-shell-v15';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
@@ -26,14 +26,23 @@ self.addEventListener('fetch', (e) => {
     e.respondWith(
       fetch(e.request).then(resp => {
         const copy = resp.clone();
-        caches.open(CACHE).then(c => c.put(e.request, copy));
+        caches.open(CACHE).then(c => c.put('./index.html', copy));
         return resp;
-      }).catch(() => caches.match(e.request).then(r => r || caches.match('./index.html')))
+      }).catch(() => caches.match('./index.html'))
     );
     return;
   }
 
+  /* Version query strings must map to the same cached shell resource. */
+  const normalized = new Request(url.origin + url.pathname, {
+    method: 'GET',
+    headers: e.request.headers,
+    mode: 'same-origin',
+    credentials: e.request.credentials,
+    redirect: e.request.redirect
+  });
+
   e.respondWith(
-    caches.match(e.request).then(cached => cached || fetch(e.request))
+    caches.match(normalized).then(cached => cached || caches.match(e.request).then(exact => exact || fetch(e.request)))
   );
 });
