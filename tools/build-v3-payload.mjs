@@ -14,7 +14,9 @@ compressed[9] = 255;
 const output = compressed.toString('base64') + '\n';
 
 if (process.argv.includes('--check')) {
-  const current = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
+  const current = fs.existsSync(outputPath)
+    ? fs.readFileSync(outputPath, 'utf8').replace(/\r\n?/g, '\n')
+    : '';
   if (current !== output) {
     console.error('v3-enhancements.txt is not generated from v3-enhancements.js');
     process.exit(1);
