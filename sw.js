@@ -1,9 +1,9 @@
-// Блокнот-скан v3.2.5 — integrated app shell
-const CACHE = 'blocknot-shell-v16';
+// Блокнот-скан v3.2.6 — integrated app shell
+const CACHE = 'blocknot-shell-v17';
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
-  './v3-enhancements.txt', './v3-fixes.js', './v3-hotfix.js', './v3-collab.js', './v3-ux323.js', './v3-auditfix.js'
+  './v3-enhancements.txt', './v3-fixes.js', './v3-hotfix.js', './v3-collab.js', './v3-ux323.js', './v3-auditfix.js', './v3-polish326.js'
 ];
 
 self.addEventListener('install', (e) => {
@@ -33,7 +33,6 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  /* Version query strings map to the same cached shell resource. */
   const normalized = new Request(url.origin + url.pathname, {
     method: 'GET',
     headers: e.request.headers,
