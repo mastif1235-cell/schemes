@@ -300,11 +300,16 @@
     vNextOpenPromise = (async () => {
       // Keep every connection in a local variable. Concurrent callers previously
       // reassigned the shared `db`, then closed another caller's connection.
-      let connection = await new Promise((resolve, reject) => {
+      let databaseExists = true;
+      if (typeof indexedDB.databases === 'function') {
+        try { databaseExists = (await indexedDB.databases()).some(entry => entry.name === DB_NAME); }
+        catch (error) { console.warn('IndexedDB database listing failed; using compatibility probe', error); }
+      }
+      let connection = databaseExists ? await new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME);
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
-      });
+      }) : await baseOpenDB();
       const closeForUpgrade = () => { connection.close(); };
       connection.onversionchange = closeForUpgrade;
       if (!connection.objectStoreNames.contains('spreads')) {
