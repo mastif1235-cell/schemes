@@ -25,6 +25,13 @@ assert.ok(ui.indexOf('number.startsWith(query)') < ui.indexOf('text.includes(que
 assert.match(ui, /getAllByIndex\('spreads', 'notebook_id', notebook\.id\)/);
 assert.match(ui, /revision === searchRevision/);
 assert.match(ui, /host\.replaceChildren\(grid\)/);
+assert.match(ui, /<label for="v340SearchNotebook">Блокнот<\/label>/);
+assert.match(ui, /<option value="">Все блокноты<\/option>/);
+assert.match(ui, /option\.value = notebook\.id/);
+assert.match(ui, /row\.notebook_id === selector\.value/);
+assert.match(ui, /route\.screen !== 'spreads'/);
+assert.match(ui, /route = \{screen:'search', notebookId\}/);
+assert.doesNotMatch(ui, /data-scope="global"/);
 assert.match(ui, /dataset\.notebookId = notebook\.id/);
 assert.match(ui, /Блокнот-скан · v3\.4\.2 · Stable/);
 assert.doesNotMatch(ui, /v3\.4\.0 RC/);

@@ -39,6 +39,8 @@
       background:var(--surface);color:var(--text);font:inherit;
     }
     .v340-search input{font-size:1rem;}
+    .v340-search-scope{display:grid;gap:6px;}
+    .v340-search-scope label{font-size:.82rem;color:var(--text-muted);}
     .v340-caption{color:var(--text-muted);font-size:.82rem;line-height:1.4;margin:0 0 var(--space-3);}
     .v340-action-list{display:grid;gap:var(--space-2);}
     .v340-cover-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:var(--space-2);}
@@ -206,29 +208,41 @@
   };
 
   renderSearch = async function () {
+    const notebooks = (await getAll('notebooks')).filter(row => !row.deleted_at && !row.hidden_no_access);
     const wrap = document.createElement('div'); wrap.className = 'v340-stack';
-    wrap.innerHTML = `<div class="scope-toggle"><button data-scope="current">Этот блокнот</button><button data-scope="global">Все блокноты</button></div>
+    wrap.innerHTML = `<div class="v340-search-scope"><label for="v340SearchNotebook">Блокнот</label><select id="v340SearchNotebook"><option value="">Все блокноты</option></select></div>
       <div class="v340-search"><input type="search" placeholder="Номер, название, примечание или тег" autocomplete="off"></div><div class="v340-results"></div>`;
     screenEl.appendChild(wrap);
-    let scope = route.notebookId ? 'current' : 'global';
-    const buttons = [...wrap.querySelectorAll('[data-scope]')];
+    const selector = wrap.querySelector('#v340SearchNotebook');
+    for (const notebook of notebooks) {
+      const option = document.createElement('option'); option.value = notebook.id; option.textContent = notebook.title;
+      selector.appendChild(option);
+    }
+    if (route.notebookId && notebooks.some(notebook => notebook.id === route.notebookId)) selector.value = route.notebookId;
     const input = wrap.querySelector('input');
     const results = wrap.querySelector('.v340-results');
     let searchRevision = 0;
     const run = async () => {
       const revision = ++searchRevision;
-      buttons.forEach(button => button.classList.toggle('active', button.dataset.scope === scope));
       const query = input.value.trim();
       if (!query) { if (revision === searchRevision) results.innerHTML = ''; return; }
       let spreads = (await getAll('spreads')).filter(row => !row.deleted_at);
-      if (scope === 'current' && route.notebookId) spreads = spreads.filter(row => row.notebook_id === route.notebookId);
+      if (selector.value) spreads = spreads.filter(row => row.notebook_id === selector.value);
       await renderSpreadList(results, spreads, query, () => revision === searchRevision);
     };
     const safeRun = () => run().catch(error => console.warn('Search could not be rendered', error));
-    buttons.forEach(button => button.onclick = () => { scope = button.dataset.scope; safeRun(); });
+    selector.addEventListener('change', () => { route.notebookId = selector.value || null; safeRun(); });
     input.addEventListener('input', safeRun);
     safeRun();
   };
+
+  const searchNavButton = document.querySelector('#bottomnav button[data-nav="search"]');
+  if (searchNavButton) searchNavButton.addEventListener('click', event => {
+    if (route.screen !== 'spreads' || !route.notebookId) return;
+    const notebookId = route.notebookId;
+    event.preventDefault(); event.stopImmediatePropagation();
+    route = {screen:'search', notebookId}; render();
+  }, true);
 
   renderFavorites = async function () {
     let allSpreads = [];
