@@ -24,11 +24,29 @@
     };
     host.querySelector('[data-note-add]').onclick = () => edit(null);
     for (const note of rows) {
+      const conflict = note.pending && note.sync_error ? await team.noteConflict(note) : null;
       const item = document.createElement('article'); item.className = 'vnext-note';
       item.innerHTML = `<strong>${esc(note.author_display_name || (note.author_id === settings.user_id ? 'Вы' : 'Участник'))}</strong>
         <small> · ${esc(new Date(note.updated_at || note.created_at).toLocaleString('ru-RU'))}</small>
         <p>${esc(note.body)}</p>${note.pending ? `<small>${note.sync_error ? '⚠ ' + esc(note.sync_error) : note.deleted_at ? 'Удаление ожидает синхронизации' : '⏳ Ожидает синхронизации'}</small>` : ''}
-        ${note.author_id === settings.user_id && !note.pending ? '<div class="btn-row"><button data-note-edit>Изменить</button><button data-note-delete>Удалить</button></div>' : ''}`;
+        ${note.author_id === settings.user_id && !note.pending ? '<div class="btn-row"><button data-note-edit>Изменить</button><button data-note-delete>Удалить</button></div>' : ''}
+        ${conflict && note.author_id === settings.user_id ? '<button data-note-conflict>Сравнить примечания</button>' : ''}`;
+      item.querySelector('[data-note-conflict]')?.addEventListener('click',() => {
+        const server = conflict.conflicts?.server_note;
+        const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>Примечание изменено на другом устройстве</h2>
+          <p>На сервере: ${esc(server?.deleted_at ? 'Удалено' : server?.body || 'Версия недоступна')}</p>
+          <div class="field"><label>Ваш текст (сохранён локально)</label><textarea data-note-mine maxlength="10000">${esc(note.body)}</textarea></div>
+          <p data-note-error role="alert"></p><button data-resolve-server class="btn-secondary">Принять серверную версию</button>
+          <button data-resolve-mine class="btn-primary" ${!server || server.deleted_at ? 'disabled' : ''}>${conflict.method === 'DELETE' ? 'Повторить удаление' : 'Сохранить мой текст'}</button>`);
+        const resolve = async choice => {
+          el.querySelectorAll('button').forEach(button => {button.disabled=true;});
+          try {await team.resolveNote(note,choice,el.querySelector('[data-note-mine]').value);close();await renderNotes(host,spread);}
+          catch(error){console.warn('Note conflict resolution failed',error);el.querySelector('[data-note-error]').textContent=error.message;
+            el.querySelector('[data-resolve-server]').disabled=false;el.querySelector('[data-resolve-mine]').disabled=!server || !!server.deleted_at;}
+        };
+        el.querySelector('[data-resolve-server]').onclick=()=>resolve('server');
+        el.querySelector('[data-resolve-mine]').onclick=()=>resolve('mine');
+      });
       item.querySelector('[data-note-edit]')?.addEventListener('click',() => edit(note));
       item.querySelector('[data-note-delete]')?.addEventListener('click',() => confirmAction('Удалить ваше примечание?',async () => {
         try { await team.saveNote(spread,'',note,true); await renderNotes(host,spread); }

@@ -241,4 +241,17 @@ assert.equal(upgrade.db.spread_notes.size,1,'upgrade backfills notes older than 
 assert.equal(upgrade.context.settings.sync_cursor,9000,'existing sync cursor is not reset');
 await upgrade.context.fullSync();
 assert.equal(backfills,1,'successful backfill only once per backend/account');
+const conflictNote = {id:'n',cache_id:'https://example.test|u1|n',scope:'https://example.test|u1',spread_id:'sp',notebook_id:'nb',author_id:'u1',body:'mine',pending:true,sync_error:'conflict'};
+const noteResolution = createRuntime({...teamSeed,spread_notes:[conflictNote],sync_queue:[{
+  id:1,entity:'spread_note',local_id:conflictNote.cache_id,spread_id:'sp',note_id:'n',method:'PATCH',scope:conflictNote.scope,status:'conflict',
+  payload:{client_ref:'previous',body:'mine',revision:1},conflicts:{server_note:{id:'n',body:'server',revision:3,deleted_at:null}}
+}]});
+noteResolution.context.fullSync=async()=>{};
+await noteResolution.context.window.vNextSync.resolveNote(conflictNote,'mine','merged');
+assert.equal(noteResolution.db.sync_queue.get(1).status,'done');
+const resolvedItem=[...noteResolution.db.sync_queue.values()].find(item=>item.status==='pending');
+assert.equal(resolvedItem.payload.revision,3);
+assert.equal(resolvedItem.payload.body,'merged');
+assert.notEqual(resolvedItem.payload.client_ref,'previous','resolution is a new explicit operation');
+assert.equal(noteResolution.db.spread_notes.get(conflictNote.cache_id).body,'merged');
 console.log('sync-safety: PASS');

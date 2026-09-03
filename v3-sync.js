@@ -71,6 +71,28 @@
     return queueResult('sent');
   }
 
+  async function noteConflict(note) {
+    return (await getAll('sync_queue')).find(item => item.entity === 'spread_note' && item.local_id === note.cache_id &&
+      item.scope === scope() && item.status === 'conflict');
+  }
+
+  async function resolveNote(note, choice, body) {
+    const previous = await noteConflict(note), server = previous?.conflicts?.server_note;
+    if (!previous || !server || note.author_id !== settings.user_id) throw new Error('Нет доступной серверной версии; повторите синхронизацию');
+    if (choice !== 'server' && server.deleted_at) throw new Error('Примечание удалено на сервере; новый текст можно добавить отдельным примечанием');
+    if (choice !== 'server' && previous.method !== 'DELETE' && (!body.trim() || body.trim().length > 10000)) throw new Error('Введите примечание до 10000 символов');
+    await window.vNextAtomic('spread_notes',note.cache_id,current => {
+      if (!current?.pending) throw new Error('Конфликт уже разрешён');
+      const row = {...current,body:choice === 'server' ? server.body : body.trim(),revision:server.revision,
+        deleted_at:choice === 'server' ? server.deleted_at : previous.method === 'DELETE' ? nowISO() : null,
+        updated_at:server.updated_at,pending:choice !== 'server',sync_error:null};
+      return {row,retired:[{...previous,status:'done',last_error:'note conflict resolved explicitly'}],
+        ...(choice === 'server' ? {} : {item:{...previous,id:undefined,status:'pending',retry_count:0,last_error:null,conflicts:null,
+          payload:{...previous.payload,body:row.body,revision:server.revision,client_ref:uid()}}})};
+    });
+    void fullSync();
+  }
+
   async function saveFields(spread, changes, baseValues, retired = []) {
     if (!enabled('field_merge')) throw new Error('Обновите сервер перед редактированием');
     if (!Object.keys(changes).length) return;
@@ -595,5 +617,5 @@
   };
 
   window.v340Sync = {retryDelay, retryDue, mapServerPhoto};
-  window.vNextSync = {scope, enabled, metadata, saveNote, saveFields, applyTeamChanges, cacheNote};
+  window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote};
 })();

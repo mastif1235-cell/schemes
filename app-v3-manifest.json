@@ -23,7 +23,7 @@
     },
     {
       "path": "v3-sync.js",
-      "sha256": "af6508cd4a6674365a6d9828ff5f89c774361af352a88d8c86703db8c5a7c62e"
+      "sha256": "323f0e6e64aea50962ca9e1c0d88b6c1ed4700a5d83f23dc2586acab477a9564"
     },
     {
       "path": "v3-core.js",
@@ -31,7 +31,7 @@
     },
     {
       "path": "v3-photos.js",
-      "sha256": "4284415f8dfbff4509fdaf35f113572fd8f76d39ce675f15d8f87686a975f569"
+      "sha256": "7c3ea5effadd4671d40a4fff658336f202faa7accf041ce00946d126993155fd"
     },
     {
       "path": "v3-camera.js",
