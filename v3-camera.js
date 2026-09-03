@@ -3,10 +3,9 @@
   function chooseSource() {
     return new Promise(resolve => {
       const {close, el} = openSheet(`<div class="sheet-handle"></div><h2>Добавить фото страницы</h2>
-        <p class="v340-caption">Выберите форму страницы или готовое фото.</p><div class="v340-action-list">
-        <button class="btn-primary" data-choice="portrait">▯ Вертикальная страница</button>
-        <button class="btn-secondary" data-choice="landscape">▭ Горизонтальная страница</button>
-        <button class="btn-secondary" data-choice="gallery">🖼 Выбрать из галереи</button>
+        <p class="v340-caption">Сделайте новый снимок или выберите готовое фото.</p><div class="v340-action-list">
+        <button class="btn-primary" data-choice="camera">📷 Сфотографировать</button>
+        <button class="btn-secondary" data-choice="gallery">🖼️ Выбрать из галереи</button>
         <button class="btn-ghost" data-choice="cancel">Отмена</button></div>`);
       el.closest('.sheet-backdrop').classList.add('v340-camera-sheet');
       let settled = false;
@@ -61,7 +60,10 @@
       let bitmap;
       try { bitmap = await workingBitmap(file); }
       catch (error) { console.error('Camera image decode failed', error); resolve({action:'cancel'}); return; }
-      const ratio = orientation === 'landscape' ? 1.414 : 1 / 1.414;
+      const pageOrientation = orientation === 'auto'
+        ? (bitmap.width >= bitmap.height ? 'landscape' : 'portrait')
+        : orientation;
+      const ratio = pageOrientation === 'landscape' ? 1.414 : 1 / 1.414;
       const backdrop = document.createElement('div'); backdrop.className = 'sheet-backdrop v340-crop-backdrop';
       const sheet = document.createElement('div'); sheet.className = 'sheet v340-crop-sheet';
       sheet.innerHTML = `<div class="sheet-handle"></div><h2>Подготовить страницу</h2>
@@ -138,7 +140,7 @@
       }
 
       async function outputFile() {
-        const outputWidth = orientation === 'landscape' ? 2200 : 1600;
+        const outputWidth = pageOrientation === 'landscape' ? 2200 : 1600;
         const outputHeight = Math.round(outputWidth / ratio);
         const output = document.createElement('canvas'); output.width = outputWidth; output.height = outputHeight;
         const outputContext = output.getContext('2d', {alpha:false}); outputContext.fillStyle = '#fff'; outputContext.fillRect(0, 0, outputWidth, outputHeight);
@@ -230,11 +232,10 @@
   window.v340CapturePhoto = async function () {
     const choice = await chooseSource();
     if (!choice) return null;
-    if (choice === 'gallery') return pickRawImage(false);
     while (true) {
-      const file = await pickRawImage(true);
+      const file = await pickRawImage(choice === 'camera');
       if (!file) return null;
-      const result = await interactiveCrop(file, choice);
+      const result = await interactiveCrop(file, 'auto');
       if (result.action === 'retake') continue;
       return result.action === 'use' ? result.file : null;
     }

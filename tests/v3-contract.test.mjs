@@ -72,6 +72,12 @@ assert.match(camera, /rgba\(0,0,0,\.58\)/);
 assert.match(camera, /data-action="rotate-left"/);
 assert.match(camera, /data-action="rotate-right"/);
 assert.match(camera, /imageOrientation:'from-image'/);
+assert.match(camera, /data-choice="camera">📷 Сфотографировать/);
+assert.match(camera, /data-choice="gallery">🖼️ Выбрать из галереи/);
+assert.match(camera, /choice === 'camera'/);
+assert.match(camera, /interactiveCrop\(file, 'auto'\)/);
+assert.match(camera, /bitmap\.width >= bitmap\.height \? 'landscape' : 'portrait'/);
+assert.doesNotMatch(camera, /data-choice="(?:portrait|landscape)"/);
 
 const core = read('v3-core.js');
 assert.match(core, /notebook_cover_/);
