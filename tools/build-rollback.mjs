@@ -42,7 +42,9 @@ for(let i=0;i<chunkNames.length;i++){
 assert.equal(offset,encoded.length);
 
 let sw=fs.readFileSync(path.join(output,'sw.js'),'utf8');
-sw=sw.replace(/const CACHE_NAME\s*=\s*['"][^'"]+['"]/,"const CACHE_NAME = 'blocknot-scan-v3.4.2-rollback-compatible';");
+const stableCache="const CACHE = CACHE_PREFIX + 'v342-stable-1';";
+assert.equal(sw.split(stableCache).length,2,'expected stable v3.4.2 cache declaration');
+sw=sw.replace(stableCache,"const CACHE = CACHE_PREFIX + 'v342-rollback-compatible';");
 fs.writeFileSync(path.join(output,'sw.js'),sw);
 const manifest={...originalManifest,files:originalManifest.files.map(entry=>{
   const text=fs.readFileSync(path.join(output,entry.path),'utf8').replace(/\r\n?/g,'\n');
