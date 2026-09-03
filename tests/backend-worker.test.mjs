@@ -419,6 +419,7 @@ const largeOrder = await api(large.env, 'PUT', '/api/notebooks/n1/spreads/order'
 assert.equal(largeOrder.status, 200, '200-spread reorder respects D1 parameter/query limits');
 assert.equal(largeOrder.data.spreads[0].id, 's200');
 assert.equal(largeOrder.data.spreads[199].id, 's1');
+assert.equal((await api(large.env, 'GET', '/api/notebooks/n1/snapshot')).data.spreads.length,200,'large reordered notebook remains readable');
 db2.prepare(`INSERT INTO activity_events
   (id,notebook_id,entity,entity_id,actor_user_id,action,created_at,seq,client_ref)
   VALUES(?,?,?,?,?,?,?,?,?)`).run('activity-tie-a','n1','spread','s2','u1','fixture','x',2000,'activity-tie-a');

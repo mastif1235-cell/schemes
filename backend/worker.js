@@ -472,10 +472,10 @@ on('GET', '/api/notebooks/:id/snapshot', async (request, env, p) => {
   const spreadIds = spreads.results.map(s => s.id);
   let photos = { results: [] }, tags = { results: [] }, spreadTags = { results: [] }, favorites = { results: [] };
   if (spreadIds.length) {
-    const placeholders = spreadIds.map(() => '?').join(',');
-    photos = await env.DB.prepare(`SELECT * FROM photos WHERE spread_id IN (${placeholders})`).bind(...spreadIds).all();
-    spreadTags = await env.DB.prepare(`SELECT * FROM spread_tags WHERE spread_id IN (${placeholders})`).bind(...spreadIds).all();
-    favorites = await env.DB.prepare(`SELECT * FROM user_favorites WHERE user_id=? AND spread_id IN (${placeholders})`).bind(u.userId, ...spreadIds).all();
+    const notebookSpreads = 'SELECT id FROM spreads WHERE notebook_id=?';
+    photos = await env.DB.prepare(`SELECT * FROM photos WHERE spread_id IN (${notebookSpreads})`).bind(p.id).all();
+    spreadTags = await env.DB.prepare(`SELECT * FROM spread_tags WHERE spread_id IN (${notebookSpreads})`).bind(p.id).all();
+    favorites = await env.DB.prepare(`SELECT * FROM user_favorites WHERE user_id=? AND spread_id IN (${notebookSpreads})`).bind(u.userId, p.id).all();
   }
   tags = await env.DB.prepare('SELECT * FROM tags WHERE notebook_id=?').bind(p.id).all();
   const members = await env.DB.prepare('SELECT * FROM notebook_members WHERE notebook_id=?').bind(p.id).all();
