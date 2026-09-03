@@ -85,6 +85,7 @@ try {
   await page.locator('[data-action="edit"]').click();
   await page.locator('[data-field="title"]').fill('Текст с телефона B');
   await page.locator('[data-fields-save]').click();
+  await page.waitForFunction(async () => (await getAll('sync_queue')).some(row=>row.entity==='spread_fields'));
   const metadataRequest=await page.evaluate(async () => (await getAll('sync_queue')).find(row=>row.entity==='spread_fields'));
   assert.deepEqual(metadataRequest.payload.changes,{title:'Текст с телефона B'});
   assert.deepEqual(metadataRequest.payload.base_values,{title:'Разворот 1'});
@@ -104,6 +105,7 @@ try {
   await page.locator('[data-order-list] [data-down]').first().click();
   assert.equal(await page.evaluate(async () => (await get('spreads','s1')).number),1,'draft order does not mutate data');
   await page.locator('[data-order-save]').click();
+  await page.waitForFunction(async () => (await getAll('sync_queue')).some(row=>row.entity==='spread_order'));
   const orderRequest=await page.evaluate(async () => (await getAll('sync_queue')).find(row=>row.entity==='spread_order'));
   assert.deepEqual(orderRequest.payload.items.map(row=>row.spread_id),['remote-s2','remote-s1','remote-s3']);
   await context.route(origin+'/api/notebooks/remote-nb/activity?limit=100',route=>route.fulfill({json:{events:[{
