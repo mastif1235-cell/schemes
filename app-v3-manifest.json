@@ -27,11 +27,11 @@
     },
     {
       "path": "v3-core.js",
-      "sha256": "77713d6e7dc5d71c0f94857a4fcb9ad0993c8809b9b85d11f86923b64fbad707"
+      "sha256": "73dbe999c0e5d0a980d9b408a8186363eabecbb37b640630b433c1217b685fba"
     },
     {
       "path": "v3-photos.js",
-      "sha256": "7c3ea5effadd4671d40a4fff658336f202faa7accf041ce00946d126993155fd"
+      "sha256": "3e69fa2bd6340b45b41d3904f8126149d5ad7ba2e3d6b018b1b5f3f1c1b3edeb"
     },
     {
       "path": "v3-camera.js",

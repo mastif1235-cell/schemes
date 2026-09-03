@@ -8,6 +8,7 @@
   const COVER_REMOVED_PREFIX = 'blocknot_cover_removed_';
   const LEGACY_COVER_RE = /\s*\[\[BNSCOVER:([A-Za-z0-9+/=]+)\]\]\s*/g;
   const baseOpenDB = openDB;
+  let vNextOpenPromise = null;
   const baseOpenNotebookEditor = openNotebookEditorV2 || openNotebookEditor;
 
   function isCoverRemoved(notebookId) {
@@ -294,35 +295,51 @@
   }
 
   openDB = async function () {
-    // Open the current version first: the v2 loader cannot reopen an upgraded DB.
-    db = await new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    if (!db.objectStoreNames.contains('spreads')) {
-      db.close();
-      await baseOpenDB();
-    }
-    if (db.version < 3) {
-      db.close();
-      db = await new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, 3);
-        request.onupgradeneeded = () => {
-          for (const name of ['spread_notes', 'activity_events']) {
-            if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name, {keyPath:'cache_id'});
-          }
-        };
-        request.onblocked = () => toast('Закройте другие вкладки блокнота для безопасного обновления локального хранилища');
-        request.onerror = () => reject(request.error);
+    if (db && db.version >= 3) return db;
+    if (vNextOpenPromise) return vNextOpenPromise;
+    vNextOpenPromise = (async () => {
+      // Keep every connection in a local variable. Concurrent callers previously
+      // reassigned the shared `db`, then closed another caller's connection.
+      let connection = await new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME);
         request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
       });
-    }
-    db.onversionchange = () => db.close();
-    try { await migrateLegacyCoverMarkers(); await pruneRecents(); }
-    catch (error) { console.warn('One-time v3 local cleanup failed', error); }
-    BlocknotV3.emit('db-ready');
-    return db;
+      const closeForUpgrade = () => { connection.close(); };
+      connection.onversionchange = closeForUpgrade;
+      if (!connection.objectStoreNames.contains('spreads')) {
+        connection.close();
+        connection = await baseOpenDB();
+        connection.onversionchange = () => connection.close();
+      }
+      if (connection.version < 3) {
+        connection.close();
+        connection = await new Promise((resolve, reject) => {
+          const request = indexedDB.open(DB_NAME, 3);
+          request.onupgradeneeded = () => {
+            for (const name of ['spread_notes', 'activity_events']) {
+              if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name, {keyPath:'cache_id'});
+            }
+          };
+          request.onblocked = () => toast('Другая вкладка держит старую версию базы. Закройте её — данные будут сохранены, обновление продолжится автоматически.');
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => resolve(request.result);
+        });
+      }
+      const ready = connection;
+      ready.onversionchange = () => {
+        ready.close();
+        if (db === ready) db = null;
+        vNextOpenPromise = null;
+      };
+      db = ready;
+      try { await migrateLegacyCoverMarkers(); await pruneRecents(); }
+      catch (error) { console.warn('One-time v3 local cleanup failed', error); }
+      BlocknotV3.emit('db-ready');
+      return ready;
+    })();
+    try { return await vNextOpenPromise; }
+    catch (error) { vNextOpenPromise = null; throw error; }
   };
 
   // Local content and its outbox entry commit together, not on request.onsuccess.

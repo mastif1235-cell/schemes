@@ -87,6 +87,10 @@ assert.match(camera, /bitmap\.width >= bitmap\.height \? 'landscape' : 'portrait
 assert.doesNotMatch(camera, /data-choice="(?:portrait|landscape)"/);
 
 const core = read('v3-core.js');
+assert.match(core, /if \(vNextOpenPromise\) return vNextOpenPromise/);
+assert.match(core, /const ready = connection;[\s\S]*?ready\.onversionchange = \(\) =>/);
+assert.match(core, /vNextOpenPromise = null/);
+assert.match(read('v3-photos.js'), /\.sheet-backdrop\{z-index:120\}/);
 assert.match(core, /notebook_cover_/);
 assert.match(core, /Обложка хранится только на этом устройстве/);
 assert.match(core, /COVER_PREFIX \+ notebook\.id/);
