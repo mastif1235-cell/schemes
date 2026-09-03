@@ -5,6 +5,6 @@
   "scripts": {
     "build": "node tools/build-v3-payload.mjs && node tools/build-runtime-manifest.mjs",
     "check:generated": "node tools/build-v3-payload.mjs --check && node tools/build-runtime-manifest.mjs --check",
-    "test": "node tests/sync-safety.test.mjs && node tests/sw-offline.test.mjs && node tests/runtime-integrity.test.mjs && node tests/v3-contract.test.mjs"
+    "test": "node tests/backend-worker.test.mjs && node tests/sync-safety.test.mjs && node tests/sw-offline.test.mjs && node tests/runtime-integrity.test.mjs && node tests/v3-contract.test.mjs"
   }
 }

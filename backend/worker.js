@@ -23,7 +23,7 @@
 function cors() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   };
 }
@@ -94,6 +94,107 @@ async function logHistory(env, { notebook_id, entity, entity_id, user_id, action
   await env.DB.prepare(
     `INSERT INTO history (id, notebook_id, entity, entity_id, user_id, action, created_at) VALUES (?,?,?,?,?,?,?)`
   ).bind(uuid(), notebook_id, entity, entity_id, user_id, action, nowISO()).run();
+}
+
+function requiredText(value, field, maxLength = 10000) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) throw new HttpError(400, `${field}_required`);
+  if (text.length > maxLength) throw new HttpError(400, `${field}_too_long`);
+  return text;
+}
+
+function requiredClientRef(value) {
+  return requiredText(value, 'client_ref', 200);
+}
+
+function parseJsonValue(value) {
+  if (value === null || value === undefined) return null;
+  try { return JSON.parse(value); }
+  catch { return null; }
+}
+
+function activityStatement(env, {
+  id = uuid(), notebookId, spreadId = null, entity, entityId, actorUserId,
+  action, revisionBefore = null, revisionAfter = null, oldValue = null,
+  newValue = null, payload = null, createdAt = nowISO(), seq, clientRef,
+  guardSql = null, guardParams = [],
+}) {
+  return env.DB.prepare(
+    `INSERT INTO activity_events (
+      id, notebook_id, spread_id, entity, entity_id, actor_user_id, action,
+      entity_revision_before, entity_revision_after, old_value, new_value,
+      payload_json, created_at, seq, client_ref
+    ) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+      ${guardSql ? `WHERE EXISTS (${guardSql})` : ''}`
+  ).bind(
+    id, notebookId, spreadId, entity, entityId, actorUserId, action,
+    revisionBefore, revisionAfter,
+    oldValue === null ? null : JSON.stringify(oldValue),
+    newValue === null ? null : JSON.stringify(newValue),
+    payload === null ? null : JSON.stringify(payload),
+    createdAt, seq, clientRef, ...guardParams,
+  );
+}
+
+function publicActivity(row) {
+  return {
+    id: row.id,
+    notebook_id: row.notebook_id,
+    notebook_title: row.notebook_title || null,
+    spread_id: row.spread_id || null,
+    spread_number: row.spread_number ?? null,
+    entity: row.entity,
+    entity_id: row.entity_id,
+    actor: {
+      id: row.actor_user_id,
+      display_name: row.actor_display_name || null,
+    },
+    action: row.action,
+    entity_revision_before: row.entity_revision_before ?? null,
+    entity_revision_after: row.entity_revision_after ?? null,
+    old_value: parseJsonValue(row.old_value),
+    new_value: parseJsonValue(row.new_value),
+    payload: parseJsonValue(row.payload_json),
+    created_at: row.created_at,
+    seq: row.seq ?? null,
+    legacy: Boolean(row.legacy),
+  };
+}
+
+async function selectNote(env, noteId) {
+  return env.DB.prepare(
+    `SELECT sn.*, u.display_name AS author_display_name
+     FROM spread_notes sn JOIN users u ON u.id=sn.author_id
+     WHERE sn.id=?`
+  ).bind(noteId).first();
+}
+
+async function activityRetry(env, userId, clientRef, entity, entityId, action, newValue) {
+  const event = await env.DB.prepare(
+    'SELECT * FROM activity_events WHERE actor_user_id=? AND client_ref=?'
+  ).bind(userId, clientRef).first();
+  if (!event) return false;
+  if (event.entity !== entity || event.entity_id !== entityId || event.action !== action ||
+      JSON.stringify(parseJsonValue(event.new_value)) !== JSON.stringify(newValue)) {
+    throw new HttpError(409, 'idempotency_mismatch');
+  }
+  return true;
+}
+
+async function fetchSyncRows(env, selectSql, scopeParams, since, limit) {
+  const first = await env.DB.prepare(
+    `${selectSql} AND seq > ? ORDER BY seq LIMIT ?`
+  ).bind(...scopeParams, since, limit).all();
+  let rows = first.results;
+  const hitLimit = rows.length >= limit;
+  if (hitLimit && rows.length) {
+    const boundarySeq = rows[rows.length - 1].seq;
+    const completeBoundary = await env.DB.prepare(
+      `${selectSql} AND seq > ? AND seq <= ? ORDER BY seq`
+    ).bind(...scopeParams, since, boundarySeq).all();
+    rows = completeBoundary.results;
+  }
+  return { rows, hitLimit };
 }
 
 // -------------------------------------------------------------- Telegram
@@ -513,6 +614,213 @@ on('DELETE', '/api/spreads/:id', async (request, env, p) => {
 });
 
 // ==================================================================
+// SPREAD NOTES
+// ==================================================================
+
+on('GET', '/api/spreads/:id/notes', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  const spread = await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(p.id).first();
+  if (!spread) return err(404, 'not_found');
+  await requireMembership(env, u.userId, spread.notebook_id);
+  const url = new URL(request.url);
+  const requestedLimit = parseInt(url.searchParams.get('limit') || '200', 10);
+  const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 200, 1), 500);
+  const rows = await env.DB.prepare(
+    `SELECT sn.*, us.display_name AS author_display_name
+     FROM spread_notes sn JOIN users us ON us.id=sn.author_id
+     WHERE sn.spread_id=? AND sn.deleted_at IS NULL
+     ORDER BY sn.created_at, sn.id LIMIT ?`
+  ).bind(p.id, limit).all();
+  return json({ notes: rows.results });
+});
+
+on('POST', '/api/spreads/:id/notes', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  const spread = await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(p.id).first();
+  if (!spread || spread.deleted_at) return err(404, 'not_found');
+  await requireMembership(env, u.userId, spread.notebook_id);
+  const body = await request.json();
+  const clientRef = requiredClientRef(body.client_ref);
+  const noteBody = requiredText(body.body, 'body');
+  const existing = await env.DB.prepare(
+    'SELECT * FROM spread_notes WHERE author_id=? AND client_ref=?'
+  ).bind(u.userId, clientRef).first();
+  if (existing) {
+    if (existing.spread_id !== p.id) return err(409, 'idempotency_mismatch');
+    await activityRetry(env, u.userId, clientRef, 'spread_note', existing.id, 'note.created', { body: noteBody });
+    return json({ note: await selectNote(env, existing.id) });
+  }
+
+  const id = body.id ? requiredText(body.id, 'id', 200) : uuid();
+  const now = nowISO();
+  const seq = await nextSeq(env);
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO spread_notes (
+          id, spread_id, notebook_id, author_id, body, created_at, updated_at,
+          deleted_at, revision, seq, client_ref
+        ) VALUES (?,?,?,?,?,?,?,NULL,1,?,?)`
+      ).bind(id, p.id, spread.notebook_id, u.userId, noteBody, now, now, seq, clientRef),
+      activityStatement(env, {
+        notebookId: spread.notebook_id, spreadId: p.id, entity: 'spread_note',
+        entityId: id, actorUserId: u.userId, action: 'note.created',
+        revisionAfter: 1, newValue: { body: noteBody }, createdAt: now,
+        seq, clientRef,
+      }),
+    ]);
+  } catch (e) {
+    const raced = await env.DB.prepare(
+      'SELECT * FROM spread_notes WHERE author_id=? AND client_ref=?'
+    ).bind(u.userId, clientRef).first();
+    if (!raced || raced.spread_id !== p.id || raced.body !== noteBody) throw e;
+    return json({ note: await selectNote(env, raced.id) });
+  }
+  return json({ note: await selectNote(env, id) }, 201);
+});
+
+on('PATCH', '/api/notes/:id', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  const current = await selectNote(env, p.id);
+  if (!current) return err(404, 'not_found');
+  await requireMembership(env, u.userId, current.notebook_id);
+  if (current.author_id !== u.userId) return err(403, 'note_author_required');
+  const body = await request.json();
+  const clientRef = requiredClientRef(body.client_ref);
+  const noteBody = requiredText(body.body, 'body');
+  const revision = Number(body.revision);
+  const priorEvent = await activityRetry(env, u.userId, clientRef, 'spread_note', p.id, 'note.updated', { body: noteBody });
+  if (priorEvent) return json({ note: await selectNote(env, p.id) });
+  if (current.deleted_at) return err(409, 'note_deleted');
+  if (!Number.isInteger(revision) || revision !== current.revision) {
+    return json({ error: 'conflict', server_note: current }, 409);
+  }
+  if (noteBody === current.body) return json({ note: current });
+
+  const now = nowISO();
+  const seq = await nextSeq(env);
+  const nextRevision = current.revision + 1;
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE spread_notes SET body=?, updated_at=?, revision=?, seq=?
+       WHERE id=? AND author_id=? AND revision=? AND deleted_at IS NULL`
+    ).bind(noteBody, now, nextRevision, seq, p.id, u.userId, current.revision),
+    activityStatement(env, {
+      notebookId: current.notebook_id, spreadId: current.spread_id,
+      entity: 'spread_note', entityId: p.id, actorUserId: u.userId,
+      action: 'note.updated', revisionBefore: current.revision,
+      revisionAfter: nextRevision, oldValue: { body: current.body },
+      newValue: { body: noteBody }, createdAt: now, seq, clientRef,
+      guardSql: 'SELECT 1 FROM spread_notes WHERE id=? AND revision=? AND seq=?',
+      guardParams: [p.id, nextRevision, seq],
+    }),
+  ]);
+  if (!results[0].meta.changes) return json({ error: 'conflict', server_note: await selectNote(env, p.id) }, 409);
+  return json({ note: await selectNote(env, p.id) });
+});
+
+on('DELETE', '/api/notes/:id', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  const current = await selectNote(env, p.id);
+  if (!current) return err(404, 'not_found');
+  await requireMembership(env, u.userId, current.notebook_id);
+  if (current.author_id !== u.userId) return err(403, 'note_author_required');
+  const body = await request.json();
+  const clientRef = requiredClientRef(body.client_ref);
+  const priorEvent = await activityRetry(env, u.userId, clientRef, 'spread_note', p.id, 'note.deleted', null);
+  if (priorEvent || current.deleted_at) return json({ note: current });
+  const revision = Number(body.revision);
+  if (!Number.isInteger(revision) || revision !== current.revision) {
+    return json({ error: 'conflict', server_note: current }, 409);
+  }
+
+  const now = nowISO();
+  const seq = await nextSeq(env);
+  const nextRevision = current.revision + 1;
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE spread_notes SET deleted_at=?, updated_at=?, revision=?, seq=?
+       WHERE id=? AND author_id=? AND revision=? AND deleted_at IS NULL`
+    ).bind(now, now, nextRevision, seq, p.id, u.userId, current.revision),
+    activityStatement(env, {
+      notebookId: current.notebook_id, spreadId: current.spread_id,
+      entity: 'spread_note', entityId: p.id, actorUserId: u.userId,
+      action: 'note.deleted', revisionBefore: current.revision,
+      revisionAfter: nextRevision, oldValue: { body: current.body },
+      newValue: null, createdAt: now, seq, clientRef,
+      guardSql: 'SELECT 1 FROM spread_notes WHERE id=? AND revision=? AND seq=? AND deleted_at IS NOT NULL',
+      guardParams: [p.id, nextRevision, seq],
+    }),
+  ]);
+  if (!results[0].meta.changes) return json({ error: 'conflict', server_note: await selectNote(env, p.id) }, 409);
+  return json({ note: await selectNote(env, p.id) });
+});
+
+// ==================================================================
+// SHARED ACTIVITY
+// ==================================================================
+
+async function activityResponse(request, env, userId, notebookId, spreadId = null) {
+  await requireMembership(env, userId, notebookId);
+  const url = new URL(request.url);
+  const requestedLimit = parseInt(url.searchParams.get('limit') || '100', 10);
+  const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 100, 1), 200);
+  const beforeParam = url.searchParams.get('before_seq');
+  const beforeSeq = beforeParam === null ? Number.MAX_SAFE_INTEGER : parseInt(beforeParam, 10);
+  const scopeSql = spreadId ? 'ae.spread_id=?' : 'ae.notebook_id=?';
+  const scopeId = spreadId || notebookId;
+  const rows = await env.DB.prepare(
+    `SELECT ae.*, us.display_name AS actor_display_name,
+      nb.title AS notebook_title, sp.number AS spread_number, 0 AS legacy
+     FROM activity_events ae
+     JOIN users us ON us.id=ae.actor_user_id
+     JOIN notebooks nb ON nb.id=ae.notebook_id
+     LEFT JOIN spreads sp ON sp.id=ae.spread_id
+     WHERE ${scopeSql} AND ae.seq < ?
+     ORDER BY ae.seq DESC LIMIT ?`
+  ).bind(scopeId, Number.isFinite(beforeSeq) ? beforeSeq : Number.MAX_SAFE_INTEGER, limit).all();
+
+  let legacyEvents = [];
+  if (beforeParam === null) {
+    const legacyScope = spreadId ? "h.entity='spread' AND h.entity_id=?" : 'h.notebook_id=?';
+    const legacy = await env.DB.prepare(
+      `SELECT h.id, h.notebook_id,
+        CASE WHEN h.entity='spread' THEN h.entity_id ELSE NULL END AS spread_id,
+        h.entity, h.entity_id, h.user_id AS actor_user_id, h.action,
+        NULL AS entity_revision_before, NULL AS entity_revision_after,
+        NULL AS old_value, NULL AS new_value, NULL AS payload_json,
+        h.created_at, NULL AS seq, 1 AS legacy,
+        us.display_name AS actor_display_name, nb.title AS notebook_title,
+        sp.number AS spread_number
+       FROM history h
+       JOIN users us ON us.id=h.user_id
+       JOIN notebooks nb ON nb.id=h.notebook_id
+       LEFT JOIN spreads sp ON sp.id=(CASE WHEN h.entity='spread' THEN h.entity_id ELSE NULL END)
+       WHERE ${legacyScope}
+       ORDER BY h.created_at DESC LIMIT ?`
+    ).bind(scopeId, limit).all();
+    legacyEvents = legacy.results.map(publicActivity);
+  }
+  const events = rows.results.map(publicActivity);
+  const lastSeq = events.length ? events[events.length - 1].seq : null;
+  return json({ events, legacy_events: legacyEvents, next_before_seq: lastSeq, has_more: events.length >= limit });
+}
+
+on('GET', '/api/notebooks/:id/activity', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  const notebook = await env.DB.prepare('SELECT id FROM notebooks WHERE id=?').bind(p.id).first();
+  if (!notebook) return err(404, 'not_found');
+  return activityResponse(request, env, u.userId, p.id);
+});
+
+on('GET', '/api/spreads/:id/activity', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  const spread = await env.DB.prepare('SELECT notebook_id FROM spreads WHERE id=?').bind(p.id).first();
+  if (!spread) return err(404, 'not_found');
+  return activityResponse(request, env, u.userId, spread.notebook_id, p.id);
+});
+
+// ==================================================================
 // PHOTOS
 // ==================================================================
 
@@ -714,52 +1022,58 @@ on('DELETE', '/api/favorites/:spreadId', async (request, env, p) => {
 on('GET', '/api/sync', async (request, env) => {
   const u = await requireAuth(request, env);
   const url = new URL(request.url);
-  const since = parseInt(url.searchParams.get('since') || '0', 10);
-  const limit = Math.min(parseInt(url.searchParams.get('limit') || '500', 10), 1000);
+  const requestedSince = parseInt(url.searchParams.get('since') || '0', 10);
+  const requestedLimit = parseInt(url.searchParams.get('limit') || '500', 10);
+  const since = Math.max(Number.isFinite(requestedSince) ? requestedSince : 0, 0);
+  const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 500, 1), 1000);
 
   const nbRows = await env.DB.prepare(
     'SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL'
   ).bind(u.userId).all();
   const notebookIds = nbRows.results.map(r => r.notebook_id);
-  if (notebookIds.length === 0) return json({ changes: {}, next_cursor: since, has_more: false });
+  if (notebookIds.length === 0) return json({ changes: {
+    notebooks: [], notebook_members: [], spreads: [], tags: [], photos: [],
+    spread_tags: [], favorites: [], spread_notes: [], activity_events: [],
+  }, next_cursor: since, has_more: false });
   const ph = notebookIds.map(() => '?').join(',');
 
   const tables = [
-    { name: 'notebooks', sql: `SELECT * FROM notebooks WHERE id IN (${ph}) AND seq > ? ORDER BY seq LIMIT ?` },
-    { name: 'notebook_members', sql: `SELECT * FROM notebook_members WHERE notebook_id IN (${ph}) AND seq > ? ORDER BY seq LIMIT ?` },
-    { name: 'spreads', sql: `SELECT * FROM spreads WHERE notebook_id IN (${ph}) AND seq > ? ORDER BY seq LIMIT ?` },
-    { name: 'tags', sql: `SELECT * FROM tags WHERE notebook_id IN (${ph}) AND seq > ? ORDER BY seq LIMIT ?` },
+    { name: 'notebooks', sql: `SELECT * FROM notebooks WHERE id IN (${ph})`, params: notebookIds },
+    { name: 'notebook_members', sql: `SELECT * FROM notebook_members WHERE notebook_id IN (${ph})`, params: notebookIds },
+    { name: 'spreads', sql: `SELECT * FROM spreads WHERE notebook_id IN (${ph})`, params: notebookIds },
+    { name: 'tags', sql: `SELECT * FROM tags WHERE notebook_id IN (${ph})`, params: notebookIds },
+    { name: 'spread_notes', sql: `SELECT * FROM spread_notes WHERE notebook_id IN (${ph})`, params: notebookIds },
+    { name: 'activity_events', sql: `SELECT * FROM activity_events WHERE notebook_id IN (${ph})`, params: notebookIds },
   ];
   const changes = {};
+  const fullTables = [];
   let maxSeqSeen = since;
   for (const t of tables) {
-    const rows = await env.DB.prepare(t.sql).bind(...notebookIds, since, limit).all();
-    changes[t.name] = rows.results;
-    for (const row of rows.results) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
+    const page = await fetchSyncRows(env, t.sql, t.params, since, limit);
+    changes[t.name] = page.rows;
+    if (page.hitLimit) fullTables.push(t.name);
+    for (const row of page.rows) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
   }
   const spreadIdsRows = await env.DB.prepare(`SELECT id FROM spreads WHERE notebook_id IN (${ph})`).bind(...notebookIds).all();
   const spreadIds = spreadIdsRows.results.map(r => r.id);
   if (spreadIds.length) {
     const sph = spreadIds.map(() => '?').join(',');
-    const photos = await env.DB.prepare(`SELECT * FROM photos WHERE spread_id IN (${sph}) AND seq > ? ORDER BY seq LIMIT ?`)
-      .bind(...spreadIds, since, limit).all();
-    changes.photos = photos.results;
-    for (const row of photos.results) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
-
-    const spreadTags = await env.DB.prepare(`SELECT * FROM spread_tags WHERE spread_id IN (${sph}) AND seq > ? ORDER BY seq LIMIT ?`)
-      .bind(...spreadIds, since, limit).all();
-    changes.spread_tags = spreadTags.results;
-    for (const row of spreadTags.results) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
-
-    const favorites = await env.DB.prepare(`SELECT * FROM user_favorites WHERE user_id=? AND spread_id IN (${sph}) AND seq > ? ORDER BY seq LIMIT ?`)
-      .bind(u.userId, ...spreadIds, since, limit).all();
-    changes.favorites = favorites.results;
-    for (const row of favorites.results) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
+    const scopedTables = [
+      { name: 'photos', sql: `SELECT * FROM photos WHERE spread_id IN (${sph})`, params: spreadIds },
+      { name: 'spread_tags', sql: `SELECT * FROM spread_tags WHERE spread_id IN (${sph})`, params: spreadIds },
+      { name: 'favorites', sql: `SELECT * FROM user_favorites WHERE user_id=? AND spread_id IN (${sph})`, params: [u.userId, ...spreadIds] },
+    ];
+    for (const t of scopedTables) {
+      const page = await fetchSyncRows(env, t.sql, t.params, since, limit);
+      changes[t.name] = page.rows;
+      if (page.hitLimit) fullTables.push(t.name);
+      for (const row of page.rows) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
+    }
   } else {
     changes.photos = []; changes.spread_tags = []; changes.favorites = [];
   }
 
-  const anyFull = Object.values(changes).some(arr => arr.length >= limit);
+  const anyFull = fullTables.length > 0;
   let cursor = maxSeqSeen;
   if (anyFull) {
     const fullMaxes = Object.values(changes).filter(arr => arr.length > 0).map(arr => Math.max(...arr.map(r => r.seq)));

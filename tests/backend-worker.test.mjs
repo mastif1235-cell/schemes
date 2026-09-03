@@ -1,0 +1,289 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import worker from '../backend/worker.js';
+
+class TestPreparedStatement {
+  constructor(owner, sql, params = []) {
+    this.owner = owner;
+    this.sql = sql;
+    this.params = params;
+  }
+  bind(...params) { return new TestPreparedStatement(this.owner, this.sql, params); }
+  async all() {
+    const results = this.owner.sqlite.prepare(this.sql).all(...this.params);
+    return { success: true, results, meta: { changes: 0 } };
+  }
+  async first(column) {
+    const row = this.owner.sqlite.prepare(this.sql).get(...this.params) || null;
+    return column && row ? row[column] : row;
+  }
+  async run() { return this.runSync(); }
+  runSync() {
+    const info = this.owner.sqlite.prepare(this.sql).run(...this.params);
+    return {
+      success: true,
+      results: [],
+      meta: {
+        changes: Number(info.changes),
+        last_row_id: Number(info.lastInsertRowid),
+      },
+    };
+  }
+}
+
+class TestD1 {
+  constructor(sqlite) { this.sqlite = sqlite; }
+  prepare(sql) { return new TestPreparedStatement(this, sql); }
+  async batch(statements) {
+    this.sqlite.exec('BEGIN IMMEDIATE');
+    try {
+      const results = statements.map(statement => statement.runSync());
+      this.sqlite.exec('COMMIT');
+      return results;
+    } catch (error) {
+      this.sqlite.exec('ROLLBACK');
+      throw error;
+    }
+  }
+}
+
+const baseSchema = `
+PRAGMA foreign_keys=ON;
+CREATE TABLE users (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  token_hash TEXT NOT NULL,
+  device_name TEXT,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+CREATE TABLE notebooks (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL REFERENCES users(id),
+  created_by TEXT NOT NULL REFERENCES users(id),
+  title TEXT NOT NULL,
+  description TEXT,
+  archived INTEGER NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  seq INTEGER NOT NULL,
+  client_ref TEXT,
+  deleted_at TEXT,
+  deleted_by TEXT
+);
+CREATE TABLE notebook_members (
+  notebook_id TEXT NOT NULL REFERENCES notebooks(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  role TEXT NOT NULL,
+  added_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  revoked_at TEXT,
+  PRIMARY KEY(notebook_id,user_id)
+);
+CREATE TABLE spreads (
+  id TEXT PRIMARY KEY,
+  notebook_id TEXT NOT NULL REFERENCES notebooks(id),
+  number INTEGER NOT NULL,
+  title TEXT,
+  note_short TEXT,
+  note_full TEXT,
+  status TEXT NOT NULL DEFAULT 'Актуально',
+  current_photo_id TEXT,
+  searchableText TEXT,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  updated_by TEXT REFERENCES users(id),
+  updated_at TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  seq INTEGER NOT NULL,
+  deleted_at TEXT,
+  deleted_by TEXT REFERENCES users(id),
+  client_ref TEXT
+);
+CREATE UNIQUE INDEX ux_spreads_notebook_number
+ON spreads(notebook_id, number) WHERE deleted_at IS NULL;
+CREATE TABLE photos (
+  id TEXT PRIMARY KEY,
+  spread_id TEXT NOT NULL REFERENCES spreads(id),
+  version INTEGER NOT NULL,
+  is_current INTEGER NOT NULL,
+  provider TEXT,
+  storage_object_id TEXT,
+  telegram_message_id TEXT,
+  telegram_file_id TEXT,
+  telegram_file_unique_id TEXT,
+  mime_type TEXT,
+  file_size INTEGER,
+  created_by TEXT,
+  created_at TEXT,
+  seq INTEGER NOT NULL,
+  client_upload_id TEXT
+);
+CREATE TABLE history (
+  id TEXT PRIMARY KEY,
+  notebook_id TEXT NOT NULL,
+  entity TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  action TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE change_seq (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL);
+CREATE TABLE tags (
+  id TEXT PRIMARY KEY,
+  notebook_id TEXT NOT NULL,
+  name TEXT,
+  normalized_name TEXT,
+  seq INTEGER NOT NULL,
+  deleted_at TEXT
+);
+CREATE TABLE spread_tags (
+  spread_id TEXT NOT NULL,
+  tag_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  deleted_at TEXT,
+  PRIMARY KEY(spread_id,tag_id)
+);
+CREATE TABLE user_favorites (
+  user_id TEXT NOT NULL,
+  spread_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  deleted_at TEXT,
+  PRIMARY KEY(user_id,spread_id)
+);
+CREATE TABLE invites (
+  id TEXT PRIMARY KEY, notebook_id TEXT, code_hash TEXT, role TEXT,
+  created_by TEXT, created_at TEXT, expires_at TEXT, used_by TEXT, used_at TEXT
+);
+CREATE TABLE uploads (
+  client_upload_id TEXT PRIMARY KEY, photo_id TEXT, result_json TEXT, created_at TEXT
+);
+CREATE TABLE photo_previews (
+  photo_id TEXT PRIMARY KEY, preview_base64 TEXT, mime_type TEXT, created_at TEXT
+);
+`;
+
+function tokenHash(token) {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function createFixture() {
+  const sqlite = new DatabaseSync(':memory:');
+  sqlite.exec(baseSchema);
+  sqlite.exec(readFileSync(new URL('../backend/migrations/0001_team_history_notes.sql', import.meta.url), 'utf8'));
+  const now = '2026-09-03T10:00:00.000Z';
+  const expiry = '2099-01-01T00:00:00.000Z';
+  const seed = sqlite.prepare.bind(sqlite);
+  seed('INSERT INTO users VALUES (?,?,?)').run('u1', 'Артём', now);
+  seed('INSERT INTO users VALUES (?,?,?)').run('u2', 'Петя', now);
+  seed('INSERT INTO sessions(id,user_id,token_hash,device_name,created_at,expires_at) VALUES(?,?,?,?,?,?)')
+    .run('session-1', 'u1', tokenHash('token-1'), 'phone-a', now, expiry);
+  seed('INSERT INTO sessions(id,user_id,token_hash,device_name,created_at,expires_at) VALUES(?,?,?,?,?,?)')
+    .run('session-2', 'u2', tokenHash('token-2'), 'phone-b', now, expiry);
+  seed(`INSERT INTO notebooks
+    (id,owner_id,created_by,title,created_at,updated_at,revision,seq)
+    VALUES(?,?,?,?,?,?,?,?)`).run('n1', 'u1', 'u1', 'Общий', now, now, 1, 1);
+  seed(`INSERT INTO notebook_members
+    (notebook_id,user_id,role,added_at,updated_at,seq) VALUES(?,?,?,?,?,?)`)
+    .run('n1', 'u1', 'OWNER', now, now, 1);
+  seed(`INSERT INTO notebook_members
+    (notebook_id,user_id,role,added_at,updated_at,seq) VALUES(?,?,?,?,?,?)`)
+    .run('n1', 'u2', 'MEMBER', now, now, 1);
+  seed(`INSERT INTO spreads
+    (id,notebook_id,number,title,note_short,note_full,status,current_photo_id,searchableText,
+     created_by,created_at,updated_by,updated_at,revision,seq)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run('s1', 'n1', 1, 'Разворот', 'legacy short', 'legacy full', 'Актуально', null,
+      '1 разворот legacy short legacy full', 'u1', now, 'u1', now, 1, 2);
+  return { sqlite, env: { DB: new TestD1(sqlite) } };
+}
+
+async function api(env, method, path, token = 'token-1', body) {
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  let requestBody;
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    requestBody = JSON.stringify(body);
+  }
+  const response = await worker.fetch(new Request(`https://worker.test${path}`, {
+    method, headers, body: requestBody,
+  }), env, { waitUntil() {} });
+  const data = response.status === 204 ? null : await response.json();
+  return { status: response.status, data, headers: response.headers };
+}
+
+const { sqlite, env } = createFixture();
+
+const created = await api(env, 'POST', '/api/spreads/s1/notes', 'token-1', {
+  id: 'note-1', client_ref: 'phone-a:create-1', body: 'Проверил муфту',
+});
+assert.equal(created.status, 201, 'create note');
+assert.equal(created.data.note.author_id, 'u1');
+assert.equal(created.data.note.body, 'Проверил муфту');
+
+const retry = await api(env, 'POST', '/api/spreads/s1/notes', 'token-1', {
+  id: 'different-id', client_ref: 'phone-a:create-1', body: 'Проверил муфту',
+});
+assert.equal(retry.status, 200, 'retry note');
+assert.equal(retry.data.note.id, 'note-1');
+assert.equal(sqlite.prepare('SELECT COUNT(*) AS c FROM spread_notes WHERE client_ref=?').get('phone-a:create-1').c, 1);
+
+const secondPhone = await api(env, 'POST', '/api/spreads/s1/notes', 'token-2', {
+  id: 'note-2', client_ref: 'phone-b:create-1', body: 'Обновил бумажный блокнот',
+});
+assert.equal(secondPhone.status, 201, 'second phone creates independent note');
+assert.equal(sqlite.prepare('SELECT COUNT(*) AS c FROM spread_notes').get().c, 2);
+
+const edited = await api(env, 'PATCH', '/api/notes/note-1', 'token-1', {
+  client_ref: 'phone-a:edit-1', revision: 1, body: 'Проверил муфту — всё нормально',
+});
+assert.equal(edited.status, 200, 'edit own note');
+assert.equal(edited.data.note.revision, 2);
+
+const editForeign = await api(env, 'PATCH', '/api/notes/note-1', 'token-2', {
+  client_ref: 'phone-b:edit-foreign', revision: 2, body: 'Нельзя',
+});
+assert.equal(editForeign.status, 403, 'cannot edit foreign note');
+
+const deleted = await api(env, 'DELETE', '/api/notes/note-1', 'token-1', {
+  client_ref: 'phone-a:delete-1', revision: 2,
+});
+assert.equal(deleted.status, 200, 'soft delete note');
+assert.ok(deleted.data.note.deleted_at);
+assert.equal(sqlite.prepare('SELECT COUNT(*) AS c FROM spread_notes WHERE id=?').get('note-1').c, 1);
+
+const deleteEvent = sqlite.prepare("SELECT old_value FROM activity_events WHERE action='note.deleted'").get();
+assert.equal(JSON.parse(deleteEvent.old_value).body, 'Проверил муфту — всё нормально');
+
+const activityForMember = await api(env, 'GET', '/api/notebooks/n1/activity', 'token-2');
+assert.equal(activityForMember.status, 200, 'activity visible to second member');
+assert.ok(activityForMember.data.events.some(event => event.action === 'note.deleted'));
+
+const sync = await api(env, 'GET', '/api/sync?since=2', 'token-2');
+assert.equal(sync.status, 200, 'incremental sync');
+assert.ok(sync.data.changes.spread_notes.some(note => note.id === 'note-1'));
+assert.ok(sync.data.changes.activity_events.some(event => event.action === 'note.deleted'));
+
+sqlite.prepare(`INSERT INTO spread_notes
+  (id,spread_id,notebook_id,author_id,body,created_at,updated_at,revision,seq,client_ref)
+  VALUES(?,?,?,?,?,?,?,?,?,?)`).run('tie-1', 's1', 'n1', 'u1', 'tie one', 'x', 'x', 1, 1000, 'tie-1');
+sqlite.prepare(`INSERT INTO spread_notes
+  (id,spread_id,notebook_id,author_id,body,created_at,updated_at,revision,seq,client_ref)
+  VALUES(?,?,?,?,?,?,?,?,?,?)`).run('tie-2', 's1', 'n1', 'u2', 'tie two', 'x', 'x', 1, 1000, 'tie-2');
+const tiedSync = await api(env, 'GET', '/api/sync?since=999&limit=1', 'token-1');
+assert.deepEqual(tiedSync.data.changes.spread_notes.map(note => note.id), ['tie-1', 'tie-2']);
+assert.equal(tiedSync.data.next_cursor, 1000);
+
+console.log('backend notes/activity/sync tests passed');
