@@ -8,25 +8,36 @@
   const metadata = row => Object.fromEntries(FIELD_NAMES.map(key => [key, row[key] ?? (key === 'number' ? 0 : '')]));
   const enabled = name => settings.team_capabilities?.scope === scope() && settings.team_capabilities.flags?.[name] === true;
   const assertScope = expected => { if (expected !== scope()) throw new Error('Аккаунт изменился; повторите синхронизацию'); };
+  const recoveringNotebooks = new Set();
 
   async function cacheNote(note, localSpread, force = false) {
     const cache_id = scope() + '|' + note.id;
     const local = await get('spread_notes', cache_id);
     if (!force && local?.pending) return;
-    await put('spread_notes', {...local, ...note, cache_id, scope:scope(), server_id:note.id,
-      server_spread_id:note.spread_id, spread_id:localSpread.id, notebook_id:localSpread.notebook_id, pending:false, sync_error:null});
+    await window.vNextAtomic('spread_notes',cache_id,current => ({row:!force && current?.pending ? current :
+      {...current, ...note, cache_id, scope:scope(), server_id:note.id,
+      server_spread_id:note.spread_id, spread_id:localSpread.id, notebook_id:localSpread.notebook_id, pending:false, sync_error:null}}));
   }
 
   async function applyTeamChanges(changes) {
-    const spreads = await getAll('spreads');
+    let spreads = await getAll('spreads');
     for (const note of changes.spread_notes || []) {
-      const spread = spreads.find(row => row.server_id === note.spread_id);
+      let spread = spreads.find(row => row.server_id === note.spread_id);
+      if (!spread && note.notebook_id && !recoveringNotebooks.has(note.notebook_id)) {
+        // A parent's newest seq can be later than its child's page. Recover the scoped
+        // snapshot instead of permanently retrying the same page or skipping the child.
+        recoveringNotebooks.add(note.notebook_id);
+        try { await applySnapshot(note.notebook_id); }
+        finally { recoveringNotebooks.delete(note.notebook_id); }
+        spreads = await getAll('spreads'); spread = spreads.find(row => row.server_id === note.spread_id);
+      }
       // Never advance the shared cursor past a child we could not persist.
       if (!spread) throw new Error('Примечание ожидает загрузки разворота');
       await cacheNote(note, spread);
     }
     for (const event of changes.activity_events || []) {
-      await put('activity_events', {...event, cache_id:scope() + '|' + event.id, scope:scope()});
+      const cache_id = scope() + '|' + event.id;
+      await window.vNextAtomic('activity_events',cache_id,() => ({row:{...event, cache_id, scope:scope()}}));
     }
   }
 
@@ -96,6 +107,7 @@
     const data = await api(`/api/notebooks/${notebook.server_id}/spreads/order`, {method:'PUT', json:item.payload});
     assertScope(item.scope);
     await applyChangeBatch({spreads:data.spreads});
+    window.BlocknotV3?.emit('spread-order-saved',{notebookId:notebook.id});
     return queueResult('sent');
   }
 
@@ -323,10 +335,12 @@
         photo.telegram_link = data.telegram_link || null;
         photo.server_id = data.photo_id || photo.server_id;
         photo.upload_status = 'synced';
+        const latestPhoto = await get('photos', photo.id);
+        if (latestPhoto) photo.is_current = latestPhoto.is_current;
         await put('photos', photo);
         if (data.spread_revision) {
-          spread.revision = data.spread_revision;
-          await put('spreads', spread);
+          const latestSpread = await get('spreads', spread.id);
+          if (latestSpread) await put('spreads', {...latestSpread, revision:Math.max(latestSpread.revision || 0, data.spread_revision)});
         }
         markDone(item);
         await put('sync_queue', item);

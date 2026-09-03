@@ -1,6 +1,7 @@
 /* Blocknot Scan v3.4.0: one render layer and one visual system. */
 (function () {
   const baseRenderSettings = renderSettings;
+  const baseSpreadForm = openSpreadForm;
   const style = document.createElement('style');
   style.id = 'v340DesignSystem';
   style.textContent = `
@@ -193,6 +194,9 @@
     wrap.innerHTML = '<div class="v340-search"><input type="search" id="v340NotebookSearch" placeholder="Поиск в этом блокноте" autocomplete="off"></div>';
     const add = document.createElement('button'); add.className = 'btn-primary'; add.textContent = '+ Добавить разворот';
     add.onclick = () => openAddSpreadFlow(notebook.id); wrap.appendChild(add);
+    const order = document.createElement('button'); order.className = 'btn-secondary';
+    order.textContent = '↕ Изменить порядок разворотов'; order.onclick = () => window.vNextOpenOrder(notebook);
+    wrap.appendChild(order);
     const results = document.createElement('div'); wrap.appendChild(results); screenEl.appendChild(wrap);
     let searchRevision = 0;
     if (!spreads.length) results.innerHTML = '<div class="empty-state"><div class="big">📄</div>В этом блокноте пока нет разворотов.</div>';
@@ -292,6 +296,121 @@
     if (!favorites.length) host.innerHTML = '<div class="empty-state"><div class="big">⭐</div>Пока нет избранных разворотов.</div>';
     else await renderSpreadList(host, favorites, '');
   };
+
+  window.vNextOpenOrder = async function (notebook) {
+    const team = window.vNextSync;
+    if (!notebook.server_id || !team.enabled('spread_order')) { toast('Порядок доступен после синхронизации блокнота и обновления сервера'); return; }
+    const scope = team.scope();
+    const rows = (await getAllByIndex('spreads','notebook_id',notebook.id)).filter(row => !row.deleted_at).sort((a,b) => a.number - b.number);
+    if (rows.length < 2 || rows.length > 200 || rows.some(row => !row.server_id)) { toast('Нужно от 2 до 200 синхронизированных разворотов'); return; }
+    const prior = (await getAll('sync_queue')).filter(item => item.entity === 'spread_order' && item.local_id === notebook.id && item.status !== 'done');
+    if (prior.some(item => item.status !== 'conflict')) { toast('Предыдущая перестановка ещё ожидает синхронизации'); return; }
+    const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>Порядок разворотов</h2>
+      <p>Перетащите строку или используйте ↑ ↓. Номера станут 1…${rows.length} только после нажатия «Сохранить» и подтверждения сервера.</p>
+      ${prior.length ? '<p class="warn-box">Порядок изменился на другом устройстве. Сначала синхронизируйте, затем повторите перестановку.</p>' : ''}
+      <div data-order-list></div><p data-order-error role="alert"></p><button class="btn-primary" data-order-save>Сохранить порядок</button>`);
+    let draft = rows.slice(), dragged = null;
+    function move(from,to) {
+      if (from < 0 || to < 0 || to >= draft.length) return;
+      const [item] = draft.splice(from,1); draft.splice(to,0,item); draw();
+    }
+    function draw() {
+      const list = el.querySelector('[data-order-list]'); list.replaceChildren();
+      draft.forEach((row,index) => {
+        const item = document.createElement('div'); item.className = 'vnext-order-row'; item.draggable = true;
+        item.innerHTML = `<span>☰ ${index+1}. ${esc(row.title || 'Без названия')} <small>(был №${esc(row.number)})</small></span>
+          <button data-up aria-label="Выше" ${index ? '' : 'disabled'}>↑</button><button data-down aria-label="Ниже" ${index === draft.length-1 ? 'disabled' : ''}>↓</button>`;
+        item.querySelector('[data-up]').onclick = () => move(index,index-1);
+        item.querySelector('[data-down]').onclick = () => move(index,index+1);
+        item.ondragstart = event => { dragged = row.id; event.dataTransfer.setData('text/plain',row.id); };
+        item.ondragover = event => event.preventDefault();
+        item.ondrop = event => { event.preventDefault(); move(draft.findIndex(row => row.id === dragged),index); dragged = null; };
+        list.appendChild(item);
+      });
+    }
+    draw();
+    el.querySelector('[data-order-save]').onclick = async event => {
+      event.target.disabled = true;
+      try {
+        if (team.scope() !== scope) throw new Error('Аккаунт изменился');
+        await window.vNextAtomic('notebooks',notebook.id,current => {
+          if (!current || current.hidden_no_access || current.deleted_at) throw new Error('Блокнот недоступен');
+          return {retired:prior.map(item => ({...item,status:'done',last_error:'order replaced explicitly'})),
+            item:{entity:'spread_order',local_id:notebook.id,scope,status:'pending',retry_count:0,
+              payload:{client_ref:uid(),items:draft.map(row => ({spread_id:row.server_id,expected_revision:row.revision,expected_number:row.number}))}}};
+        });
+        close(); toast('Порядок ожидает подтверждения сервера'); void fullSync();
+      } catch (error) { console.warn('Order save failed',error); el.querySelector('[data-order-error]').textContent = error.message; event.target.disabled = false; }
+    };
+  };
+
+  openSpreadForm = async function (notebookId, existing, photoFile) {
+    const team = window.vNextSync;
+    if (!existing?.server_id || !team.enabled('field_merge')) return baseSpreadForm(notebookId,existing,photoFile);
+    const spread = await get('spreads',existing.id);
+    if (!spread || spread.deleted_at) { toast('Разворот недоступен'); return; }
+    const scope = team.scope(), base = team.metadata(spread);
+    const queued = (await getAll('sync_queue')).filter(item => item.entity === 'spread_fields' && item.local_id === spread.id && item.status !== 'done');
+    if (queued.some(item => item.status !== 'conflict')) { toast('Сначала синхронизируйте предыдущее изменение полей'); return; }
+    const retired = queued.filter(item => item.status === 'conflict');
+    const labels = {number:'Номер разворота',title:'Название',status:'Статус',note_short:'Старое краткое примечание',note_full:'Старое полное примечание'};
+    const conflicts = spread.field_conflicts || {};
+    const allTags = await getAll('tags'), links = await getAllByIndex('spread_tags','spread_id',spread.id);
+    const names = links.map(link => allTags.find(tag => tag.id === link.tag_id)?.name).filter(Boolean);
+    const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>Редактировать разворот</h2>
+      <p>Фото не изменяется. Новые записи добавляйте в «Примечания» под фото.</p>
+      ${Object.keys(base).map(key => `<div class="field"><label>${labels[key]}</label>
+        ${key === 'status' ? `<select data-field="${key}">${[...new Set([base.status,'Актуально','Требует проверки','Устарело'])].map(value => `<option ${value === base.status ? 'selected' : ''}>${esc(value)}</option>`).join('')}</select>` : key === 'note_full' ? `<textarea data-field="${key}" maxlength="10000">${esc(base[key])}</textarea>` : `<input data-field="${key}" type="${key === 'number' ? 'number' : 'text'}" value="${esc(base[key])}" maxlength="10000">`}
+        ${conflicts[key] ? `<div class="warn-box">Было: ${esc(conflicts[key].base ?? '—')}<br>На сервере: ${esc(conflicts[key].server ?? '—')}<br>Ваше: ${esc(conflicts[key].mine ?? '—')}<button data-use-server="${key}">Взять поле с сервера</button></div>` : ''}</div>`).join('')}
+      <div class="field"><label>Теги через запятую</label><input data-tags value="${esc(names.join(', '))}"></div>
+      <p data-fields-error role="alert"></p><button class="btn-primary" data-fields-save>Сохранить</button>`);
+    el.querySelectorAll('[data-use-server]').forEach(button => button.onclick = () => {
+      el.querySelector(`[data-field="${button.dataset.useServer}"]`).value = conflicts[button.dataset.useServer].server ?? '';
+    });
+    el.querySelector('[data-fields-save]').onclick = async event => {
+      event.target.disabled = true;
+      try {
+        if (team.scope() !== scope) throw new Error('Аккаунт изменился');
+        const changes = {}, bases = {};
+        for (const key of Object.keys(base)) {
+          const input = el.querySelector(`[data-field="${key}"]`);
+          const value = key === 'number' ? Number(input.value) : input.value.trim();
+          if (key === 'number' && (!Number.isSafeInteger(value) || value < 1)) throw new Error('Номер должен быть целым положительным числом');
+          const previous = retired.find(item => Object.hasOwn(item.payload.changes,key));
+          if (value !== base[key] || previous) {
+            changes[key] = value;
+            bases[key] = conflicts[key] ? conflicts[key].server : previous ? previous.payload.base_values[key] : base[key];
+          }
+        }
+        const duplicate = (await getAllByIndex('spreads','notebook_id',notebookId)).some(row => !row.deleted_at && row.id !== spread.id && row.number === changes.number);
+        if (duplicate) throw new Error('Этот номер уже занят; для обмена номерами используйте «Изменить порядок»');
+        await team.saveFields(spread,changes,bases,retired);
+        const chosen = [...new Set(el.querySelector('[data-tags]').value.split(',').map(name => name.trim()).filter(Boolean))];
+        // Keep unrelated/newly pulled links; change only tags explicitly edited in this form.
+        for (const name of chosen.filter(name => !names.includes(name))) {
+          let tag = allTags.find(row => row.name === name);
+          if (!tag) { tag = {id:uid(),name}; await put('tags',tag); allTags.push(tag); }
+          await put('spread_tags',{spread_id:spread.id,tag_id:tag.id});
+          await queueEntityChange('tag_link',spread.id,{tag_id:tag.id,op:'add'});
+        }
+        for (const name of names.filter(name => !chosen.includes(name))) {
+          const tag = allTags.find(row => row.name === name);
+          for (const link of links.filter(row => row.tag_id === tag.id)) await del('spread_tags',link.id);
+          await queueEntityChange('tag_link',spread.id,{tag_id:tag.id,op:'remove'});
+        }
+        if (photoFile) await attachPhoto(await get('spreads',spread.id),photoFile);
+        close(); toast('Сохранено на устройстве'); route = {screen:'spreads',notebookId}; render();
+      } catch (error) { console.warn('Field edit failed',error); el.querySelector('[data-fields-error]').textContent = error.message; event.target.disabled = false; }
+    };
+  };
+
+  const teamStyle = document.createElement('style');
+  teamStyle.textContent = `.vnext-order-row{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--border)}.vnext-order-row button{padding:0;min-width:44px}.v340-history-list pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.82rem}.v340-history-list summary{cursor:pointer;padding:10px 0}`;
+  document.head.appendChild(teamStyle);
+  window.BlocknotV3.on('spread-order-saved',({notebookId}) => {
+    toast('Порядок подтверждён сервером');
+    if (route.screen === 'spreads' && route.notebookId === notebookId) render();
+  });
 
   renderSettings = async function () {
     await baseRenderSettings();

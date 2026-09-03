@@ -31,6 +31,9 @@
       'Создано':'Создан разворот', 'Изменено':'Изменён разворот',
       'Фото добавлено/заменено':'Добавлено или заменено фото',
       spread_created:'Создан разворот', spread_updated:'Изменён разворот', photo_added:'Добавлено фото'
+      ,'note.created':'Добавлено примечание', 'note.updated':'Изменено примечание', 'note.deleted':'Удалено примечание',
+      'spread.updated':'Изменены поля разворота', 'spread.reordered':'Изменён порядок разворотов',
+      'photo.added':'Добавлена версия фото', 'photo.made_current':'Выбрана версия фото'
     };
     return labels[action] || action || 'Изменение';
   }
@@ -96,8 +99,73 @@
     button.setAttribute('aria-label', count ? `История, новых записей: ${count}` : 'История');
   }
 
-  window.openNotebookHistory = notebook => openHistory(notebook);
-  window.v340OpenGlobalHistory = () => openHistory(null);
+  async function openTeamHistory(notebook) {
+    if (!notebook.server_id || !window.vNextSync.enabled('activity')) return openHistory(notebook);
+    const team = window.vNextSync, sessionScope = team.scope();
+    const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>🕘 История команды</h2>
+      <p>${esc(notebook.title)}</p><p data-team-state role="status"></p>
+      <button class="btn-secondary" data-local-history>История этого устройства</button>
+      <div class="v340-history-list" data-team-history></div><button class="btn-secondary" data-more hidden>Ещё</button>`);
+    el.querySelector('[data-local-history]').onclick = () => { close(); openHistory(notebook); };
+    const host = el.querySelector('[data-team-history]'), more = el.querySelector('[data-more]');
+    const state = el.querySelector('[data-team-state]');
+    let before = null, accessDenied = false;
+    const value = input => {
+      if (typeof input === 'string') { try { return JSON.parse(input); } catch { return input; } }
+      return input;
+    };
+    const describe = input => input === null || input === undefined ? '—' : typeof input === 'object' ? JSON.stringify(input,null,2) : String(input);
+    async function draw() {
+      const events = (await getAll('activity_events')).filter(row => row.scope === sessionScope && row.notebook_id === notebook.server_id)
+        .sort((a,b) => eventTime(b) - eventTime(a) || (b.seq || 0) - (a.seq || 0));
+      if (!el.isConnected || team.scope() !== sessionScope) return;
+      host.replaceChildren();
+      if (accessDenied) return;
+      if (!events.length) host.textContent = 'Загруженных событий пока нет.';
+      const spreads = await getAllByIndex('spreads','notebook_id',notebook.id);
+      for (const row of events) {
+        const spread = spreads.find(item => item.server_id === row.spread_id);
+        const item = document.createElement('article'); item.className = 'v340-history-row';
+        item.innerHTML = `<div><strong>${esc(row.actor?.display_name || row.actor_display_name || 'Участник')}</strong>
+          <small> · ${esc(new Date(eventTime(row)).toLocaleString('ru-RU'))}</small>
+          <div>${esc(notebook.title)}${row.spread_number || spread ? ' · №' + esc(row.spread_number ?? spread.number) : ''}</div>
+          <details><summary>${esc(actionLabel(row.action))}</summary>
+          ${row.legacy ? '<p>Старая запись: значения «было / стало» не сохранены.</p>' : `<div>Было<pre>${esc(describe(value(row.old_value)))}</pre></div><div>Стало<pre>${esc(describe(value(row.new_value)))}</pre></div>`}</details></div>
+          ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open>Открыть</button>' : ''}`;
+        item.querySelector('[data-open]')?.addEventListener('click',async () => {
+          close(); await window.v340OpenSpread(await get('spreads',spread.id));
+        });
+        host.appendChild(item);
+      }
+    }
+    async function load() {
+      more.disabled = true;
+      try {
+        if (!isOnline()) { state.textContent = 'Офлайн: показана сохранённая история команды.'; return; }
+        const data = await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/activity?limit=100${before === null ? '' : '&before_seq=' + before}`);
+        if (team.scope() !== sessionScope) return;
+        for (const event of [...data.events,...(data.legacy_events || [])]) {
+          const cache_id = sessionScope + '|' + (event.legacy ? 'legacy:' : '') + event.id;
+          await window.vNextAtomic('activity_events',cache_id,() => ({row:{...event,scope:sessionScope,cache_id}}));
+        }
+        before = data.next_before_seq;
+        more.hidden = !data.has_more || before === null;
+        state.textContent = 'Общая история участников. Старые записи показаны без деталей; загружаются последние 100 старых записей.';
+      } catch (error) {
+        console.warn('Team history load failed',error);
+        accessDenied = error.status === 403 || error.status === 401;
+        state.textContent = 'Не удалось обновить общую историю: ' + error.message;
+      } finally { more.disabled = false; await draw(); }
+    }
+    more.onclick = load;
+    await draw(); await load();
+  }
+
+  window.openNotebookHistory = notebook => openTeamHistory(notebook);
+  window.v340OpenGlobalHistory = async () => {
+    const notebook = route.screen === 'spreads' && route.notebookId ? await get('notebooks',route.notebookId) : null;
+    return notebook ? openTeamHistory(notebook) : openHistory(null);
+  };
   logHistory = async function (spreadId, action) {
     await baseLogHistory(spreadId, action);
     BlocknotV3.emit('history-change');

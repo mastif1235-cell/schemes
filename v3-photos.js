@@ -148,6 +148,41 @@
     if (spread) return window.v340OpenSpread(spread);
   };
 
+  attachPhoto = async function (spread, file) {
+    const thumbBlob = await makeThumbnail(file), photoId = uid(), createdAt = nowISO();
+    // Read the latest spread inside the write transaction, never a stale viewer/form copy.
+    const saved = await new Promise((resolve,reject) => {
+      const transaction = db.transaction(['spreads','photos','blobs','sync_queue'],'readwrite');
+      let latest;
+      transaction.oncomplete = () => resolve(latest);
+      transaction.onabort = () => reject(transaction.error || new Error('Фото не сохранено'));
+      const request = transaction.objectStore('spreads').get(spread.id);
+      request.onsuccess = () => {
+        latest = request.result;
+        if (!latest || latest.deleted_at) { transaction.abort(); return; }
+        const photos = transaction.objectStore('photos');
+        const previous = photos.index('spread_id').getAll(spread.id);
+        previous.onsuccess = () => {
+          const version = Math.max(0,...previous.result.map(row => Number(row.version) || 0)) + 1;
+          for (const row of previous.result) if (row.is_current) photos.put({...row,is_current:false});
+          photos.put({id:photoId,spread_id:spread.id,version,is_current:true,provider:'telegram',
+            mime_type:file.type,file_size:file.size,upload_status:'local_pending',created_at:createdAt,
+            storage_object_id:null,telegram_message_id:null,telegram_file_id:null,telegram_file_unique_id:null,
+            ocr_text:null,ocr_status:'none',ocr_updated_at:null});
+          transaction.objectStore('blobs').put({id:photoId+'_orig',blob:file});
+          transaction.objectStore('blobs').put({id:photoId+'_thumb',blob:thumbBlob});
+          latest.current_photo_id = photoId; latest.photo_updated_at = createdAt;
+          transaction.objectStore('spreads').put(latest);
+          transaction.objectStore('sync_queue').put({entity:'photo',photo_id:photoId,status:'pending',retry_count:0,last_attempt_at:null});
+        };
+      };
+    });
+    Object.assign(spread,saved);
+    await logHistory(spread.id,'Фото добавлено/заменено');
+    // The upload route itself advances current_photo_id. No stale metadata PATCH is needed.
+    void fullSync();
+  };
+
   openViewer = async function (spreads, initialIndex) {
     if (!Array.isArray(spreads) || !spreads.length) return;
     let index = Math.max(0, Math.min(spreads.length - 1, initialIndex || 0));

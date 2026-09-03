@@ -23,7 +23,7 @@
     },
     {
       "path": "v3-sync.js",
-      "sha256": "85fc02cb19f9013856d335b0fe0c4c0b0b684788536ca4ae8e5709f7602af2ba"
+      "sha256": "8618dba869d6bc5974bef6df62e0fb5aaa3b44c10b5a26150d22d69650c703a7"
     },
     {
       "path": "v3-core.js",
@@ -31,7 +31,7 @@
     },
     {
       "path": "v3-photos.js",
-      "sha256": "3f3e37d838da60261528ff8ae4f9c78c8139450b8b12d5390f2afa0c019fa291"
+      "sha256": "4284415f8dfbff4509fdaf35f113572fd8f76d39ce675f15d8f87686a975f569"
     },
     {
       "path": "v3-camera.js",
@@ -39,11 +39,11 @@
     },
     {
       "path": "v3-history.js",
-      "sha256": "b373288f752c32ec60cb47499dc69b1eb039adcc115bd9b912c7ee772d0161b0"
+      "sha256": "96dc29951c837f83ecb5fdb15152118674af436237d47498ef8d6e904a1a86e2"
     },
     {
       "path": "v3-ui.js",
-      "sha256": "cd9396a4c6b31ccd1271e7c0fb262ab241840261d8a5c2a0ccf24038fdf06330"
+      "sha256": "fb0ba0f82d7c8be1b8705fb9171f67e0dc443143887bee43edb7b18a0a90eef6"
     }
   ]
 }

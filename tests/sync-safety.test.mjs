@@ -208,4 +208,23 @@ snapshotRuntime.setApi(async () => ({notebook:{title:'nb'},spreads:[{id:'remote-
   photos:[{id:'remote-photo',spread_id:'remote-sp',is_current:1}],tags:[],spread_tags:[],favorites:[]}));
 await snapshotRuntime.context.applySnapshot('remote-nb');
 assert.equal(snapshotRuntime.db.spreads.get('sp').current_photo_id,'local-photo','snapshot preserves pending original');
+const orphanRuntime = createRuntime({notebooks:[{id:'nb',server_id:'remote-nb'}]});
+orphanRuntime.setApi(async path => {
+  assert.equal(path,'/api/notebooks/remote-nb/snapshot');
+  return {notebook:{id:'remote-nb',title:'nb'},spreads:[{id:'late-parent',notebook_id:'remote-nb',title:'parent'}],photos:[],tags:[],spread_tags:[],favorites:[]};
+});
+await orphanRuntime.context.applyChangeBatch({spread_notes:[{id:'child',spread_id:'late-parent',notebook_id:'remote-nb',body:'earlier seq'}]});
+assert.equal(orphanRuntime.db.spread_notes.size,1,'parent with later seq recovered without skipping child');
+const upload = createRuntime(teamSeed);
+upload.db.blobs.set('local-photo_orig',{blob:{}});
+upload.context.fetch = async () => {
+  upload.db.spreads.set('sp',{...upload.db.spreads.get('sp'),title:'edited during upload',current_photo_id:'newer-photo',revision:8});
+  upload.db.photos.set('local-photo',{...upload.db.photos.get('local-photo'),is_current:false});
+  return {ok:true,json:async()=>({photo_id:'uploaded',spread_revision:5})};
+};
+await upload.context.pushPhotoQueue(false);
+assert.equal(upload.db.spreads.get('sp').title,'edited during upload');
+assert.equal(upload.db.spreads.get('sp').current_photo_id,'newer-photo');
+assert.equal(upload.db.spreads.get('sp').revision,8,'upload response cannot roll revision back');
+assert.equal(upload.db.photos.get('local-photo').is_current,false,'late response cannot reselect superseded photo');
 console.log('sync-safety: PASS');
