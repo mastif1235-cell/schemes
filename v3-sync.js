@@ -79,6 +79,7 @@
   async function resolveNote(note, choice, body) {
     const previous = await noteConflict(note), server = previous?.conflicts?.server_note;
     if (!previous || !server || note.author_id !== settings.user_id) throw new Error('Нет доступной серверной версии; повторите синхронизацию');
+    const {id: previousId, ...requeued} = previous;
     if (choice !== 'server' && server.deleted_at) throw new Error('Примечание удалено на сервере; новый текст можно добавить отдельным примечанием');
     if (choice !== 'server' && previous.method !== 'DELETE' && (!body.trim() || body.trim().length > 10000)) throw new Error('Введите примечание до 10000 символов');
     await window.vNextAtomic('spread_notes',note.cache_id,current => {
@@ -87,7 +88,7 @@
         deleted_at:choice === 'server' ? server.deleted_at : previous.method === 'DELETE' ? nowISO() : null,
         updated_at:server.updated_at,pending:choice !== 'server',sync_error:null};
       return {row,retired:[{...previous,status:'done',last_error:'note conflict resolved explicitly'}],
-        ...(choice === 'server' ? {} : {item:{...previous,id:undefined,status:'pending',retry_count:0,last_error:null,conflicts:null,
+        ...(choice === 'server' ? {} : {item:{...requeued,status:'pending',retry_count:0,last_error:null,conflicts:null,
           payload:{...previous.payload,body:row.body,revision:server.revision,client_ref:uid()}}})};
     });
     void fullSync();

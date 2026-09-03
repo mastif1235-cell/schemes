@@ -51,6 +51,7 @@ function createRuntime(seed = {}) {
     getAll: async store => [...db[store].values()].map(row => structuredClone(row)),
     getAllByIndex: async () => [],
     put: async (store, row) => {
+      if (store === 'sync_queue' && Object.hasOwn(row,'id')) assert.notEqual(row.id,undefined,'IndexedDB auto-key requires the id property to be absent');
       const key = store === 'sync_queue' ? (row.id ?? db.sync_queue.size + 1) :
         (store === 'user_favorites' ? row.spread_id : ['spread_notes','activity_events'].includes(store) ? row.cache_id : row.id);
       if (store === 'sync_queue') row.id = key;
