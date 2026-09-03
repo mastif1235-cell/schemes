@@ -24,6 +24,8 @@ jobs:
         run: |
           node --check sw.js
           node --check v3-enhancements.js
+          node --check backend/worker.js
+          for file in tests/*.mjs tests/team-preview-fixture.js; do node --check "$file"; done
           for file in v3-*.js; do node --check "$file"; done
       - name: Regression tests
         run: npm test
