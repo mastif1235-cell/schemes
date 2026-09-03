@@ -37,6 +37,7 @@ const origin = `http://127.0.0.1:${server.address().port}`;
 
 async function isolatedContext(browser) {
   const context = await browser.newContext({serviceWorkers:'block'});
+  context.on('page', page => page.on('pageerror', error => console.error('IDB page error:', error.message)));
   await context.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
   return context;
 }
@@ -59,7 +60,12 @@ async function seedV2(page, hold = false) {
 }
 
 async function waitV3(page) {
-  await page.waitForFunction(() => typeof db !== 'undefined' && db?.version === 3, null, {timeout:10000});
+  try { await page.waitForFunction(() => typeof db !== 'undefined' && db?.version === 3, null, {timeout:10000}); }
+  catch (error) {
+    const state=await page.evaluate(async () => ({href:location.href,db:typeof db==='undefined'?'undefined':db?.version,
+      openDB:typeof openDB,databases:typeof indexedDB.databases==='function'?await indexedDB.databases():[],body:document.body.innerText.slice(0,300)}));
+    throw new Error(`v3 readiness timeout: ${JSON.stringify(state)}`, {cause:error});
+  }
 }
 
 async function verifySentinels(page, expectedVersion = 3) {
