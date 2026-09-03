@@ -562,6 +562,14 @@
         await pushEntityQueue(!!manual);
         await pushPhotoQueue(!!manual);
         await syncMembership();
+        if (enabled('team_notes') && settings.team_snapshot_scope !== sessionScope) {
+          // Old clients already advanced the same cursor while ignoring new fields.
+          // Backfill notes once without resetting that cursor or deleting local data.
+          const notebooks = (await getAll('notebooks')).filter(row => row.server_id && !row.deleted_at && !row.hidden_no_access);
+          for (const notebook of notebooks) await applySnapshot(notebook.server_id);
+          assertScope(sessionScope);
+          settings.team_snapshot_scope = sessionScope;
+        }
         await pullChanges();
       } else {
         await pushPhotoQueue(!!manual);

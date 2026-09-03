@@ -227,4 +227,18 @@ assert.equal(upload.db.spreads.get('sp').title,'edited during upload');
 assert.equal(upload.db.spreads.get('sp').current_photo_id,'newer-photo');
 assert.equal(upload.db.spreads.get('sp').revision,8,'upload response cannot roll revision back');
 assert.equal(upload.db.photos.get('local-photo').is_current,false,'late response cannot reselect superseded photo');
+const upgrade = createRuntime({notebooks:[{id:'nb',server_id:'remote-nb'}]});
+upgrade.context.settings.sync_cursor = 9000;
+let backfills = 0;
+upgrade.setApi(async path => {
+  if (path === '/api/me') return {capabilities:{team_notes:true}};
+  assert.equal(path,'/api/notebooks/remote-nb/snapshot'); backfills++;
+  return {notebook:{id:'remote-nb',title:'nb'},spreads:[{id:'sp',notebook_id:'remote-nb'}],photos:[],tags:[],spread_tags:[],favorites:[],
+    spread_notes:[{id:'historic-note',notebook_id:'remote-nb',spread_id:'sp',body:'seq below old cursor',seq:10}]};
+});
+await upgrade.context.fullSync();
+assert.equal(upgrade.db.spread_notes.size,1,'upgrade backfills notes older than saved cursor');
+assert.equal(upgrade.context.settings.sync_cursor,9000,'existing sync cursor is not reset');
+await upgrade.context.fullSync();
+assert.equal(backfills,1,'successful backfill only once per backend/account');
 console.log('sync-safety: PASS');
