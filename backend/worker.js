@@ -692,21 +692,30 @@ on('PUT', '/api/notebooks/:id/spreads/order', async (request, env, p) => {
   const now = nowISO();
   // This constraint assertion executes INSIDE the batch. A concurrent edit/create/delete
   // makes it insert NULL into change_seq.at (NOT NULL), rolling the entire batch back.
-  const guard = env.DB.prepare(`WITH expected(id, revision, number) AS (VALUES ${items.map(() => '(?,?,?)').join(',')})
+  const orderJson = JSON.stringify(items.map((item, index) => ({id:item.spread_id,
+    revision:item.expected_revision, number:item.expected_number, temporary:temporaryStart - index, final:index + 1,
+    search:normalizeSearch([index + 1, ...['title','note_short','note_full'].map(key => current.find(row => row.id === item.spread_id)[key])].join(' '))})));
+  // A single JSON binding avoids D1's parameter limit and keeps batch query count constant.
+  const expectedSql = `SELECT json_extract(value,'$.id') AS id, json_extract(value,'$.revision') AS revision,
+    json_extract(value,'$.number') AS number FROM json_each(?)`;
+  const guard = env.DB.prepare(`WITH expected AS (${expectedSql})
     INSERT INTO change_seq(at) SELECT NULL WHERE
     (SELECT COUNT(*) FROM spreads WHERE notebook_id=? AND deleted_at IS NULL) <> ? OR
     EXISTS (SELECT 1 FROM expected e LEFT JOIN spreads s ON s.id=e.id AND s.notebook_id=? AND s.deleted_at IS NULL
       WHERE s.id IS NULL OR s.revision<>e.revision OR s.number<>e.number)`)
-    .bind(...items.flatMap(item => [item.spread_id, item.expected_revision, item.expected_number]), p.id, items.length, p.id);
+    .bind(orderJson, p.id, items.length, p.id);
   try {
     await env.DB.batch([
       guard,
       env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
-      ...items.map((item, index) => env.DB.prepare('UPDATE spreads SET number=? WHERE id=? AND notebook_id=?')
-        .bind(temporaryStart - index, item.spread_id, p.id)),
-      ...items.map((item, index) => env.DB.prepare(`UPDATE spreads SET number=?, revision=revision+1,
-        updated_at=?, updated_by=?, seq=(SELECT MAX(seq) FROM change_seq), searchableText=? WHERE id=? AND notebook_id=?`)
-        .bind(index + 1, now, u.userId, normalizeSearch([index + 1, ...['title','note_short','note_full'].map(key => current.find(row => row.id === item.spread_id)[key])].join(' ')), item.spread_id, p.id)),
+      env.DB.prepare(`WITH draft AS (SELECT value FROM json_each(?))
+        UPDATE spreads SET number=(SELECT json_extract(value,'$.temporary') FROM draft WHERE json_extract(value,'$.id')=spreads.id)
+        WHERE notebook_id=? AND deleted_at IS NULL`).bind(orderJson, p.id),
+      env.DB.prepare(`WITH draft AS (SELECT value FROM json_each(?))
+        UPDATE spreads SET number=(SELECT json_extract(value,'$.final') FROM draft WHERE json_extract(value,'$.id')=spreads.id),
+        searchableText=(SELECT json_extract(value,'$.search') FROM draft WHERE json_extract(value,'$.id')=spreads.id),
+        revision=revision+1, updated_at=?, updated_by=?, seq=(SELECT MAX(seq) FROM change_seq)
+        WHERE notebook_id=? AND deleted_at IS NULL`).bind(orderJson, now, u.userId, p.id),
       activityStatement(env, { notebookId: p.id, entity: 'notebook', entityId: p.id,
         actorUserId: u.userId, action: 'spread.reordered', clientRef, createdAt: now,
         oldValue: current.map(row => ({ id: row.id, number: row.number })), newValue: newOrder }),
@@ -874,16 +883,20 @@ async function activityResponse(request, env, userId, notebookId, spreadId = nul
   const beforeSeq = beforeParam === null ? Number.MAX_SAFE_INTEGER : parseInt(beforeParam, 10);
   const scopeSql = spreadId ? 'ae.spread_id=?' : 'ae.notebook_id=?';
   const scopeId = spreadId || notebookId;
-  const rows = await env.DB.prepare(
+  const activitySql =
     `SELECT ae.*, us.display_name AS actor_display_name,
       nb.title AS notebook_title, sp.number AS spread_number, 0 AS legacy
      FROM activity_events ae
      JOIN users us ON us.id=ae.actor_user_id
      JOIN notebooks nb ON nb.id=ae.notebook_id
      LEFT JOIN spreads sp ON sp.id=ae.spread_id
-     WHERE ${scopeSql} AND ae.seq < ?
-     ORDER BY ae.seq DESC LIMIT ?`
-  ).bind(scopeId, Number.isFinite(beforeSeq) ? beforeSeq : Number.MAX_SAFE_INTEGER, limit).all();
+     WHERE ${scopeSql} AND ae.seq < ?`;
+  const upper = Number.isFinite(beforeSeq) ? beforeSeq : Number.MAX_SAFE_INTEGER;
+  let rows = await env.DB.prepare(activitySql + ' ORDER BY ae.seq DESC, ae.id DESC LIMIT ?').bind(scopeId, upper, limit).all();
+  if (rows.results.length === limit) {
+    const boundary = rows.results[rows.results.length - 1].seq;
+    rows = await env.DB.prepare(activitySql + ' AND ae.seq >= ? ORDER BY ae.seq DESC, ae.id DESC').bind(scopeId, upper, boundary).all();
+  }
 
   let legacyEvents = [];
   if (beforeParam === null) {

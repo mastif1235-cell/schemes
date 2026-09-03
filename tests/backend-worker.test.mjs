@@ -10,7 +10,10 @@ class TestPreparedStatement {
     this.sql = sql;
     this.params = params;
   }
-  bind(...params) { return new TestPreparedStatement(this.owner, this.sql, params); }
+  bind(...params) {
+    assert.ok(params.length <= 100, 'D1 maximum 100 parameters per statement');
+    return new TestPreparedStatement(this.owner, this.sql, params);
+  }
   async all() {
     const results = this.owner.sqlite.prepare(this.sql).all(...this.params);
     return { success: true, results, meta: { changes: 0 } };
@@ -37,6 +40,7 @@ class TestD1 {
   constructor(sqlite) { this.sqlite = sqlite; }
   prepare(sql) { return new TestPreparedStatement(this, sql); }
   async batch(statements) {
+    assert.ok(statements.length <= 40, 'leave room for auth/read queries on D1 Free');
     if (this.beforeBatch) { const hook = this.beforeBatch; this.beforeBatch = null; hook(); }
     this.sqlite.exec('BEGIN IMMEDIATE');
     try {
@@ -405,4 +409,23 @@ db2.prepare('INSERT INTO history VALUES(?,?,?,?,?,?,?)').run('legacy-event', 'n1
 const legacyRead = await api(env2, 'GET', '/api/spreads/s2/activity');
 assert.ok(legacyRead.data.legacy_events.some(event => event.id === 'legacy-event' && event.legacy && event.old_value === null));
 assert.deepEqual(db2.prepare('PRAGMA foreign_key_check').all(), []);
+const large = createFixture();
+for (let i = 2; i <= 200; i++) large.sqlite.prepare(`INSERT INTO spreads
+  (id,notebook_id,number,title,created_by,created_at,updated_at,revision,seq)
+  VALUES(?,?,?,?,?,?,?,?,?)`).run('s'+i, 'n1', i, 'title '+i, 'u1', 'x', 'x', 1, 1);
+const largeItems = large.sqlite.prepare('SELECT * FROM spreads ORDER BY number DESC').all().map(row =>
+  ({spread_id:row.id, expected_revision:row.revision, expected_number:row.number}));
+const largeOrder = await api(large.env, 'PUT', '/api/notebooks/n1/spreads/order', 'token-1', {client_ref:'large-order', items:largeItems});
+assert.equal(largeOrder.status, 200, '200-spread reorder respects D1 parameter/query limits');
+assert.equal(largeOrder.data.spreads[0].id, 's200');
+assert.equal(largeOrder.data.spreads[199].id, 's1');
+db2.prepare(`INSERT INTO activity_events
+  (id,notebook_id,entity,entity_id,actor_user_id,action,created_at,seq,client_ref)
+  VALUES(?,?,?,?,?,?,?,?,?)`).run('activity-tie-a','n1','spread','s2','u1','fixture','x',2000,'activity-tie-a');
+db2.prepare(`INSERT INTO activity_events
+  (id,notebook_id,entity,entity_id,actor_user_id,action,created_at,seq,client_ref)
+  VALUES(?,?,?,?,?,?,?,?,?)`).run('activity-tie-b','n1','spread','s2','u1','fixture','x',2000,'activity-tie-b');
+const activityTie = await api(env2, 'GET', '/api/notebooks/n1/activity?limit=1');
+assert.equal(activityTie.data.events.length, 2, 'history pagination includes all seq ties');
+assert.equal(activityTie.data.next_before_seq, 2000);
 console.log('backend notes/activity/merge/reorder/photo/security compatibility tests passed (22 required scenarios + race checks)');
