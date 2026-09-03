@@ -26,7 +26,7 @@ assert.match(ui, /getAllByIndex\('spreads', 'notebook_id', notebook\.id\)/);
 assert.match(ui, /revision === searchRevision/);
 assert.match(ui, /host\.replaceChildren\(grid\)/);
 assert.match(ui, /dataset\.notebookId = notebook\.id/);
-assert.match(ui, /Блокнот-скан · v3\.4\.1 · Stable/);
+assert.match(ui, /Блокнот-скан · v3\.4\.2 · Stable/);
 assert.doesNotMatch(ui, /v3\.4\.0 RC/);
 
 const photos = read('v3-photos.js');

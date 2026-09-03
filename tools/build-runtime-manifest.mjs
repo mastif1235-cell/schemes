@@ -12,7 +12,7 @@ const runtimeFiles = [
 ];
 
 const manifest = {
-  version:'3.4.1',
+  version:'3.4.2',
   files:runtimeFiles.map(file => ({
     path:file,
     sha256:crypto.createHash('sha256')

@@ -18,7 +18,7 @@ function createWorker({failInstall = false, offline = true} = {}) {
   };
   const caches = {
     open: async () => cache,
-    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable', 'unrelated-cache'],
+    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable', 'blocknot-shell-v342-stable-1', 'unrelated-cache'],
     delete: async key => { deleted.push(key); return true; },
     match: async request => {
       const key = typeof request === 'string' ? request : new URL(request.url).pathname.split('/').pop();
