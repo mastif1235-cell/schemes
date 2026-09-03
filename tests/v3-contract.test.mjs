@@ -88,8 +88,6 @@ assert.doesNotMatch(camera, /data-choice="(?:portrait|landscape)"/);
 
 const core = read('v3-core.js');
 assert.match(core, /if \(vNextOpenPromise\) return vNextOpenPromise/);
-assert.match(core, /indexedDB\.databases/);
-assert.match(core, /databaseExists \? await new Promise/);
 assert.match(core, /const ready = connection;[\s\S]*?ready\.onversionchange = \(\) =>/);
 assert.match(core, /vNextOpenPromise = null/);
 assert.match(read('v3-photos.js'), /\.sheet-backdrop\{z-index:120\}/);

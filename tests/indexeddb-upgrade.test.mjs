@@ -8,7 +8,7 @@ import {gunzipSync} from 'node:zlib';
 
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE_PATH
   ? pathToFileURL(process.env.PLAYWRIGHT_MODULE_PATH).href : 'playwright');
-const root = fileURLToPath(new URL('../', import.meta.url));
+const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
 const rollbackRoot = resolve(root, 'rollback/v3.4.2-compatible');
 const base = gunzipSync(Buffer.from([1, 2, 3, 4]
   .map(number => readFileSync(resolve(root, `chunk${number}.txt`), 'utf8')).join(''), 'base64')).toString();
