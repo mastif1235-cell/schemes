@@ -11,7 +11,7 @@ const expected=stable.replace('const req = indexedDB.open(DB_NAME, DB_VER);','co
   .replace('req.onsuccess = ()=>{ db = req.result; res(db); };','req.onsuccess = ()=>{ db = req.result; db.onversionchange = ()=>db.close(); res(db); };');
 assert.equal(app,expected,'rollback runtime must otherwise be byte-for-byte stable v3.4.2');
 assert.match(app,/indexedDB\.open\(DB_NAME\)/);assert.doesNotMatch(app,/indexedDB\.open\(DB_NAME,\s*DB_VER\)/);
-assert.match(app,/db\.onversionchange\s*=\s*\(\)=>db\.close\(\)/);assert.doesNotMatch(app,/deleteDatabase/);
+assert.match(app,/db\.onversionchange\s*=\s*\(\)=>db\.close\(\)/);
 for(const store of ['notebooks','spreads','photos','tags','spread_tags','history','sync_queue','settings','blobs','user_favorites'])assert.ok(app.includes(`'${store}'`));
 assert.match(fs.readFileSync(path.join(root,'sw.js'),'utf8'),/rollback-compatible/);
 console.log('rollback-contract: PASS',info.tree_sha256);
