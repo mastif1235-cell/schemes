@@ -479,7 +479,8 @@ on('GET', '/api/notebooks/:id/snapshot', async (request, env, p) => {
   }
   tags = await env.DB.prepare('SELECT * FROM tags WHERE notebook_id=?').bind(p.id).all();
   const members = await env.DB.prepare('SELECT * FROM notebook_members WHERE notebook_id=?').bind(p.id).all();
-  const notes = await env.DB.prepare('SELECT * FROM spread_notes WHERE notebook_id=?').bind(p.id).all();
+  const notes = await env.DB.prepare(`SELECT sn.*, (SELECT display_name FROM users WHERE id=sn.author_id) AS author_display_name
+    FROM spread_notes sn WHERE notebook_id=?`).bind(p.id).all();
   const cursorRow = await env.DB.prepare('SELECT MAX(seq) as m FROM change_seq').first();
   return json({
     notebook, spreads: spreads.results, photos: photos.results, tags: tags.results,
@@ -1173,8 +1174,8 @@ on('GET', '/api/sync', async (request, env) => {
     { name: 'notebook_members', sql: `SELECT * FROM notebook_members WHERE notebook_id IN (${ph})`, params: notebookIds },
     { name: 'spreads', sql: `SELECT * FROM spreads WHERE notebook_id IN (${ph})`, params: notebookIds },
     { name: 'tags', sql: `SELECT * FROM tags WHERE notebook_id IN (${ph})`, params: notebookIds },
-    { name: 'spread_notes', sql: `SELECT * FROM spread_notes WHERE notebook_id IN (${ph})`, params: notebookIds },
-    { name: 'activity_events', sql: `SELECT * FROM activity_events WHERE notebook_id IN (${ph})`, params: notebookIds },
+    { name: 'spread_notes', sql: `SELECT sn.*, (SELECT display_name FROM users WHERE id=sn.author_id) AS author_display_name FROM spread_notes sn WHERE notebook_id IN (${ph})`, params: notebookIds },
+    { name: 'activity_events', sql: `SELECT ae.*, (SELECT display_name FROM users WHERE id=ae.actor_user_id) AS actor_display_name FROM activity_events ae WHERE notebook_id IN (${ph})`, params: notebookIds },
   ];
   const changes = {};
   const fullTables = [];

@@ -294,10 +294,58 @@
   }
 
   openDB = async function () {
-    const result = await baseOpenDB();
+    // Open the current version first: the v2 loader cannot reopen an upgraded DB.
+    db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    if (!db.objectStoreNames.contains('spreads')) {
+      db.close();
+      await baseOpenDB();
+    }
+    if (db.version < 3) {
+      db.close();
+      db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 3);
+        request.onupgradeneeded = () => {
+          for (const name of ['spread_notes', 'activity_events']) {
+            if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name, {keyPath:'cache_id'});
+          }
+        };
+        request.onblocked = () => toast('Закройте другие вкладки блокнота для безопасного обновления локального хранилища');
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+      });
+    }
+    db.onversionchange = () => db.close();
     try { await migrateLegacyCoverMarkers(); await pruneRecents(); }
     catch (error) { console.warn('One-time v3 local cleanup failed', error); }
     BlocknotV3.emit('db-ready');
-    return result;
+    return db;
+  };
+
+  // Local content and its outbox entry commit together, not on request.onsuccess.
+  window.vNextAtomic = function (store, key, update) {
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([store, 'sync_queue'], 'readwrite');
+      let result;
+      transaction.oncomplete = () => resolve(result);
+      transaction.onabort = () => reject(transaction.error || new Error('Локальное сохранение отменено'));
+      transaction.onerror = () => {};
+      const request = transaction.objectStore(store).get(key);
+      request.onsuccess = () => {
+        try {
+          result = update(request.result);
+          if (result.row) transaction.objectStore(store).put(result.row);
+          if (result.item) transaction.objectStore('sync_queue').put(result.item);
+          for (const item of result.retired || []) transaction.objectStore('sync_queue').put(item);
+        } catch (error) {
+          console.warn('Atomic local save failed', store, error);
+          transaction.abort();
+          reject(error);
+        }
+      };
+    });
   };
 })();

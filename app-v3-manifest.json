@@ -23,11 +23,11 @@
     },
     {
       "path": "v3-sync.js",
-      "sha256": "002d8d0146d3154db20ed2bdebef43aa520ab15e2c4004c55e28d59409fe139b"
+      "sha256": "85fc02cb19f9013856d335b0fe0c4c0b0b684788536ca4ae8e5709f7602af2ba"
     },
     {
       "path": "v3-core.js",
-      "sha256": "3283be44ca43eaae01729318e3b9744f0e82e88f998f93d0f30d2ac971464912"
+      "sha256": "77713d6e7dc5d71c0f94857a4fcb9ad0993c8809b9b85d11f86923b64fbad707"
     },
     {
       "path": "v3-photos.js",

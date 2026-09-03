@@ -10,6 +10,8 @@ function createRuntime(seed = {}) {
     spreads: new Map((seed.spreads || []).map(row => [row.id, structuredClone(row)])),
     tags: new Map((seed.tags || []).map(row => [row.id, structuredClone(row)])),
     photos: new Map((seed.photos || []).map(row => [row.id, structuredClone(row)])),
+    spread_notes: new Map((seed.spread_notes || []).map(row => [row.cache_id, structuredClone(row)])),
+    activity_events: new Map(),
     blobs: new Map(),
     spread_tags: new Map(),
     user_favorites: new Map(),
@@ -27,7 +29,7 @@ function createRuntime(seed = {}) {
     Promise,
     Error,
     window: {},
-    settings: {auth_token:'token', backend_url:'https://example.test', keep_originals_offline:true, sync_status:'idle'},
+    settings: {auth_token:'token', user_id:'u1', backend_url:'https://example.test', keep_originals_offline:true, sync_status:'idle'},
     syncing: false,
     route: {screen:'notebooks'},
     nowISO: () => new Date().toISOString(),
@@ -49,7 +51,9 @@ function createRuntime(seed = {}) {
     getAll: async store => [...db[store].values()].map(row => structuredClone(row)),
     getAllByIndex: async () => [],
     put: async (store, row) => {
-      const key = store === 'sync_queue' ? row.id : (store === 'user_favorites' ? row.spread_id : row.id);
+      const key = store === 'sync_queue' ? (row.id ?? db.sync_queue.size + 1) :
+        (store === 'user_favorites' ? row.spread_id : ['spread_notes','activity_events'].includes(store) ? row.cache_id : row.id);
+      if (store === 'sync_queue') row.id = key;
       db[store].set(key, structuredClone(row));
       return key;
     },
@@ -60,6 +64,12 @@ function createRuntime(seed = {}) {
   };
   vm.createContext(context);
   vm.runInContext(source, context, {filename:'v3-sync.js'});
+  context.window.vNextAtomic = async (store, key, update) => {
+    const result = update(await context.get(store, key));
+    if (result.row) await context.put(store, result.row);
+    if (result.item) await context.put('sync_queue', result.item);
+    for (const item of result.retired || []) await context.put('sync_queue', item);
+  };
   return {context, db, setApi(fn) { apiImpl = fn; }};
 }
 
@@ -140,4 +150,62 @@ await testFailedRetryBackoffAndManualRetry();
 await testConflictIsNotMarkedDone();
 await testPullPreservesPendingLocalEdit();
 await testIncrementalPhotoMappingMatchesSnapshotFields();
+
+const teamSeed = {
+  notebooks:[{id:'nb',server_id:'remote-nb'}],
+  spreads:[{id:'sp',server_id:'remote-sp',notebook_id:'nb',number:1,title:'before',current_photo_id:'local-photo'}],
+  photos:[{id:'local-photo',spread_id:'sp',is_current:true,upload_status:'local_pending'}],
+  sync_queue:[{id:1,entity:'photo',photo_id:'local-photo',status:'pending'}]
+};
+const team = createRuntime(teamSeed), c = team.context;
+c.settings.team_capabilities = {scope:c.window.vNextSync.scope(),flags:{team_notes:true,field_merge:true,spread_order:true}};
+c.fullSync = async () => {};
+await c.window.vNextSync.saveNote(teamSeed.spreads[0], 'Phone A');
+const queuedNote = [...team.db.sync_queue.values()].find(row => row.entity === 'spread_note');
+assert.ok(queuedNote.payload.client_ref);
+let tries = 0;
+team.setApi(async (path, options) => {
+  assert.equal(path, '/api/spreads/remote-sp/notes');
+  assert.equal(options.json.client_ref, queuedNote.payload.client_ref, 'retry identity is immutable');
+  if (++tries === 1) throw new Error('response lost');
+  return {note:{id:options.json.id,spread_id:'remote-sp',body:'Phone A',author_id:'u1',revision:1}};
+});
+await c.pushEntityQueue(false);
+assert.equal(team.db.sync_queue.get(queuedNote.id).status, 'failed');
+await c.pushEntityQueue(true);
+assert.equal(team.db.sync_queue.get(queuedNote.id).status, 'done');
+assert.equal(team.db.spread_notes.get(queuedNote.local_id).pending, false);
+await c.applyChangeBatch({spreads:[{id:'remote-sp',notebook_id:'remote-nb',title:'B text',number:1,revision:5,current_photo_id:'remote-photo'}],
+  photos:[{id:'remote-photo',spread_id:'remote-sp',is_current:1}],
+  spread_notes:[{id:'b-note',spread_id:'remote-sp',body:'Phone B',author_id:'u2'}],
+  activity_events:[{id:'event-1',action:'note.created',actor_user_id:'u2'}]});
+assert.equal(team.db.spreads.get('sp').title, 'B text', 'text from B reaches A');
+assert.equal(team.db.spreads.get('sp').current_photo_id, 'local-photo', 'pending A photo not overwritten');
+assert.equal(team.db.spread_notes.size, 2, 'independent notes retained');
+assert.equal(team.db.activity_events.size, 1);
+await assert.rejects(c.window.vNextSync.applyTeamChanges({spread_notes:[{id:'orphan',spread_id:'missing'}]}), /ожидает/);
+const foreign = [...team.db.spread_notes.values()].find(row => row.author_id === 'u2');
+await assert.rejects(c.window.vNextSync.saveNote(teamSeed.spreads[0], 'attack', foreign), /своё/);
+await c.window.vNextSync.saveFields(team.db.spreads.get('sp'), {title:'mine'}, {title:'B text'});
+team.setApi(async () => { const error = new Error('field_conflict'); error.status = 409;
+  error.data = {conflicts:{title:{base:'B text',mine:'mine',server:'other'}}}; throw error; });
+await c.pushEntityQueue(false);
+assert.equal(team.db.spreads.get('sp').field_conflicts.title.server, 'other');
+assert.equal(team.db.spreads.get('sp').conflict, undefined, 'no whole-record conflict for metadata');
+await c.applyChangeBatch({spreads:[{id:'remote-sp',notebook_id:'remote-nb',title:'other',number:2,revision:6,current_photo_id:'remote-photo'}]});
+assert.equal(team.db.spreads.get('sp').title, 'mine', 'pending field preserved');
+assert.equal(team.db.spreads.get('sp').number, 2, 'independent field pulled');
+assert.equal(team.db.spreads.get('sp').current_photo_id, 'local-photo');
+c.settings.team_capabilities.flags = {};
+await assert.rejects(c.window.vNextSync.saveNote(teamSeed.spreads[0], 'unsupported'), /обновления сервера/);
+const pending = {...queuedNote,id:90,status:'pending'};
+team.db.sync_queue.set(90,pending);
+team.setApi(async () => { throw new Error('Must not send unsupported notes'); });
+await c.pushEntityQueue(true);
+assert.equal(team.db.sync_queue.get(90).status, 'pending', 'old backend does not discard team outbox');
+const snapshotRuntime = createRuntime(teamSeed);
+snapshotRuntime.setApi(async () => ({notebook:{title:'nb'},spreads:[{id:'remote-sp',notebook_id:'remote-nb',current_photo_id:'remote-photo'}],
+  photos:[{id:'remote-photo',spread_id:'remote-sp',is_current:1}],tags:[],spread_tags:[],favorites:[]}));
+await snapshotRuntime.context.applySnapshot('remote-nb');
+assert.equal(snapshotRuntime.db.spreads.get('sp').current_photo_id,'local-photo','snapshot preserves pending original');
 console.log('sync-safety: PASS');
