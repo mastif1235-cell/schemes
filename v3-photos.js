@@ -1,5 +1,43 @@
 /* Blocknot Scan v3.4.0: photo state, original resolution and leak-free viewer. */
 (function () {
+  async function renderNotes(host, spread) {
+    if (!host?.isConnected) return;
+    const team = window.vNextSync;
+    if (!team.enabled('team_notes')) {
+      host.innerHTML = '<h3>Примечания</h3><p>Общие примечания станут доступны после обновления сервера.</p>';
+      return;
+    }
+    const rows = (await getAll('spread_notes')).filter(row => row.scope === team.scope() && row.spread_id === spread.id && (!row.deleted_at || row.pending))
+      .sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)));
+    if (!host.isConnected) return;
+    host.innerHTML = `<h3>Примечания</h3><p class="vnext-note-caption">Общие для участников блокнота · ${isOnline() ? 'загруженные записи' : 'офлайн-копия'}</p>
+      <div data-note-list></div><button class="btn-secondary" data-note-add>+ Добавить примечание</button>`;
+    const edit = note => {
+      const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>${note ? 'Изменить' : 'Добавить'} примечание</h2>
+        <div class="field"><label>Ваше примечание</label><textarea data-note-body maxlength="10000">${esc(note?.body || '')}</textarea></div>
+        <p data-note-error role="alert"></p><button class="btn-primary" data-note-save>Сохранить</button>`);
+      el.querySelector('[data-note-save]').onclick = async event => {
+        event.target.disabled = true;
+        try { await team.saveNote(spread,el.querySelector('[data-note-body]').value,note); close(); await renderNotes(host,spread); }
+        catch (error) { console.warn('Note save failed',error); el.querySelector('[data-note-error]').textContent = error.message; event.target.disabled = false; }
+      };
+    };
+    host.querySelector('[data-note-add]').onclick = () => edit(null);
+    for (const note of rows) {
+      const item = document.createElement('article'); item.className = 'vnext-note';
+      item.innerHTML = `<strong>${esc(note.author_display_name || (note.author_id === settings.user_id ? 'Вы' : 'Участник'))}</strong>
+        <small> · ${esc(new Date(note.updated_at || note.created_at).toLocaleString('ru-RU'))}</small>
+        <p>${esc(note.body)}</p>${note.pending ? `<small>${note.sync_error ? '⚠ ' + esc(note.sync_error) : note.deleted_at ? 'Удаление ожидает синхронизации' : '⏳ Ожидает синхронизации'}</small>` : ''}
+        ${note.author_id === settings.user_id && !note.pending ? '<div class="btn-row"><button data-note-edit>Изменить</button><button data-note-delete>Удалить</button></div>' : ''}`;
+      item.querySelector('[data-note-edit]')?.addEventListener('click',() => edit(note));
+      item.querySelector('[data-note-delete]')?.addEventListener('click',() => confirmAction('Удалить ваше примечание?',async () => {
+        try { await team.saveNote(spread,'',note,true); await renderNotes(host,spread); }
+        catch (error) { console.warn('Note delete failed',error); toast(error.message); }
+      }));
+      host.querySelector('[data-note-list]').appendChild(item);
+    }
+  }
+
   function photoQueueItem(photo, queue) {
     return (queue || []).find(item => item.entity === 'photo' && item.photo_id === photo.id);
   }
@@ -115,6 +153,9 @@
     let index = Math.max(0, Math.min(spreads.length - 1, initialIndex || 0));
     let currentUrl = null;
     let closed = false;
+    const stopSyncUpdates = window.BlocknotV3.on('sync-complete', () => {
+      renderNotes(overlay.querySelector('[data-team-notes]'),spreads[index]).catch(error => console.warn('Notes refresh failed',error));
+    });
     const historyToken = 'v340-viewer-' + Date.now();
     const overlay = document.createElement('div');
     overlay.className = 'viewer v340-viewer';
@@ -130,6 +171,7 @@
     function finish() {
       if (closed) return;
       closed = true;
+      stopSyncUpdates();
       revokeCurrentUrl();
       window.removeEventListener('popstate', onPopState);
       overlay.remove();
@@ -172,15 +214,17 @@
           ${spreads.length > 1 ? '<button class="viewer-nav prev v341-nav-zone" data-nav="prev" aria-label="Предыдущее фото">←</button><button class="viewer-nav next v341-nav-zone" data-nav="next" aria-label="Следующее фото">→</button>' : ''}
         </div>
         <div class="v340-zoom-controls"><button data-action="minus">−</button><button data-action="reset">100%</button><button data-action="plus">+</button><button data-action="rotate-left" aria-label="Повернуть влево на 90 градусов">↺ 90°</button><button data-action="rotate-right" aria-label="Повернуть вправо на 90 градусов">↻ 90°</button><button data-action="download">⬇</button></div>
-        ${spread.conflict ? '<div class="warn-box v340-conflict">⚠ Конфликт версий<div class="btn-row"><button class="btn-secondary" data-action="server">Версия сервера</button><button class="btn-primary" data-action="mine">Сохранить мою</button></div></div>' : ''}
+        ${spread.field_conflicts ? '<div class="warn-box v340-conflict">⚠ Одно поле изменено на двух устройствах <button data-action="edit">Сравнить поля</button></div>' : spread.conflict ? '<div class="warn-box v340-conflict">⚠ Конфликт версий<div class="btn-row"><button class="btn-secondary" data-action="server">Версия сервера</button><button class="btn-primary" data-action="mine">Сохранить мою</button></div></div>' : ''}
         <div class="viewer-bottom"><div class="t">${esc(spread.title || 'Без названия')}</div>
           ${photoState ? `<div class="v340-viewer-state">${photoState.label}${resolved.fallback ? ' · показана миниатюра' : ''}</div>` : ''}
           <div class="tags">${tags.map(tag => `<span>#${esc(tag.name)}</span>`).join('')}</div>
           ${spread.note_short ? `<div class="note" style="font-weight:600">${esc(spread.note_short)}</div>` : ''}
           ${spread.note_full ? `<div class="note">${esc(spread.note_full)}</div>` : ''}
-          <div class="viewer-actions"><button data-action="replace">Заменить фото</button>
-          <button data-action="telegram" ${photo && photo.telegram_message_id ? '' : 'disabled'}>Открыть в Telegram</button>
-          <button data-action="delete">Удалить</button></div></div>`;
+          <section class="vnext-notes" data-team-notes></section>
+          <div class="viewer-actions"><button data-action="replace">📷 Заменить</button>
+          <button data-action="telegram" ${photo && photo.telegram_message_id ? '' : 'disabled'}>✈ Telegram</button>
+          <button data-action="delete" aria-label="Удалить разворот">🗑</button></div></div>`;
+      renderNotes(overlay.querySelector('[data-team-notes]'),spread).catch(error => console.warn('Notes could not be displayed',error));
 
       const stage = overlay.querySelector('[data-stage]');
       const image = overlay.querySelector('[data-image]');
@@ -367,4 +411,7 @@
   const extraStyle = document.createElement('style');
   extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img{will-change:transform;transform-origin:center}.v341-nav-zone{position:absolute;top:12%;bottom:12%;height:auto;width:min(24vw,128px);z-index:3;border:0;background:transparent;color:#ffffff99;font-size:2rem;touch-action:none}.v341-nav-zone.prev{left:0;text-align:left;padding-left:14px}.v341-nav-zone.next{right:0;text-align:right;padding-right:14px}.viewer-stage.v341-zoomed .v341-nav-zone{pointer-events:none;opacity:0}`;
   document.head.appendChild(extraStyle);
+  const teamStyle = document.createElement('style');
+  teamStyle.textContent = `.v340-viewer .viewer-top .icon-btn{color:#fff;background:rgba(255,255,255,.18);border:1px solid #ffffff38;width:44px;height:44px;min-width:44px;min-height:44px;border-radius:50%;padding:0}.v340-viewer .viewer-actions{display:flex;gap:8px}.v340-viewer .viewer-actions button{min-height:44px;flex:1;padding:8px 10px}.vnext-notes{margin-top:12px;border-top:1px solid #ffffff38;padding-top:10px}.vnext-note{padding:10px 0;border-bottom:1px solid #ffffff28}.vnext-note p{white-space:pre-wrap;overflow-wrap:anywhere}.vnext-note-caption,.vnext-note small{font-size:.8rem;opacity:.8}.vnext-notes button{color:inherit;background:#ffffff18;border:1px solid #ffffff38}`;
+  document.head.appendChild(teamStyle);
 })();
