@@ -29,3 +29,20 @@ jobs:
           for file in v3-*.js; do node --check "$file"; done
       - name: Regression tests
         run: npm test
+
+  chromium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install isolated browser test tools
+        run: npm install --no-save --ignore-scripts playwright@1.62.1
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Standalone Chromium runtime
+        run: npm run test:runtime
