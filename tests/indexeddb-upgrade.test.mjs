@@ -151,7 +151,7 @@ try {
     await page.goto(origin + '/'); await waitV3(page);
     await page.evaluate(() => new Promise((done, fail) => {
       const tx=db.transaction('spread_notes','readwrite');
-      tx.objectStore('spread_notes').put({id:'rollback-note',spread_id:'spread',notebook_id:'nb',body:'preserve new store'});
+      tx.objectStore('spread_notes').put({cache_id:'rollback-note',id:'rollback-note',spread_id:'spread',notebook_id:'nb',body:'preserve new store'});
       tx.oncomplete=done;tx.onabort=()=>fail(tx.error);
     }));
     await page.goto(origin + '/rollback/');
