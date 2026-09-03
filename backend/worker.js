@@ -124,7 +124,7 @@ function activityStatement(env, {
       id, notebook_id, spread_id, entity, entity_id, actor_user_id, action,
       entity_revision_before, entity_revision_after, old_value, new_value,
       payload_json, created_at, seq, client_ref
-    ) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+    ) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,${seq === undefined ? '(SELECT MAX(seq) FROM change_seq)' : '?'},?
       ${guardSql ? `WHERE EXISTS (${guardSql})` : ''}`
   ).bind(
     id, notebookId, spreadId, entity, entityId, actorUserId, action,
@@ -132,7 +132,7 @@ function activityStatement(env, {
     oldValue === null ? null : JSON.stringify(oldValue),
     newValue === null ? null : JSON.stringify(newValue),
     payload === null ? null : JSON.stringify(payload),
-    createdAt, seq, clientRef, ...guardParams,
+    createdAt, ...(seq === undefined ? [] : [seq]), clientRef, ...guardParams,
   );
 }
 
@@ -338,7 +338,8 @@ on('GET', '/api/me', async (request, env) => {
   const devices = await env.DB.prepare(
     'SELECT id, device_name, created_at, last_used_at, expires_at FROM sessions WHERE user_id=? AND revoked_at IS NULL ORDER BY last_used_at DESC'
   ).bind(u.userId).all();
-  return json({ user: { id: u.userId, display_name: u.displayName }, devices: devices.results });
+  return json({ user: { id: u.userId, display_name: u.displayName }, devices: devices.results,
+    capabilities: { team_notes: true, activity: true, field_merge: true, spread_order: true } });
 });
 
 on('DELETE', '/api/me/sessions/:id', async (request, env, p) => {
@@ -478,10 +479,11 @@ on('GET', '/api/notebooks/:id/snapshot', async (request, env, p) => {
   }
   tags = await env.DB.prepare('SELECT * FROM tags WHERE notebook_id=?').bind(p.id).all();
   const members = await env.DB.prepare('SELECT * FROM notebook_members WHERE notebook_id=?').bind(p.id).all();
+  const notes = await env.DB.prepare('SELECT * FROM spread_notes WHERE notebook_id=?').bind(p.id).all();
   const cursorRow = await env.DB.prepare('SELECT MAX(seq) as m FROM change_seq').first();
   return json({
     notebook, spreads: spreads.results, photos: photos.results, tags: tags.results,
-    spread_tags: spreadTags.results, favorites: favorites.results, members: members.results,
+    spread_tags: spreadTags.results, favorites: favorites.results, members: members.results, spread_notes: notes.results,
     cursor: cursorRow.m || 0,
   });
 });
@@ -569,12 +571,67 @@ on('GET', '/api/spreads/:id', async (request, env, p) => {
   return json({ spread });
 });
 
+async function patchSpreadFields(env, u, spreadId, body) {
+  const allowed = ['number', 'title', 'status', 'note_short', 'note_full'];
+  const changes = body.changes;
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes) ||
+      Object.keys(changes).some(key => !allowed.includes(key))) return err(400, 'invalid_metadata_fields');
+  const keys = allowed.filter(key => Object.hasOwn(changes, key));
+  if (!keys.length) return err(400, 'changes_required');
+  if (!body.base_values || keys.some(key => !Object.hasOwn(body.base_values, key))) return err(400, 'base_values_required');
+  if (keys.some(key => key === 'number' ? !Number.isSafeInteger(changes[key]) || changes[key] < 1
+    : changes[key] !== null && (typeof changes[key] !== 'string' || changes[key].length > 10000))) return err(400, 'invalid_metadata_value');
+  if (Object.hasOwn(changes, 'status') && !changes.status) return err(400, 'status_required');
+  const clientRef = requiredClientRef(body.client_ref);
+  const requested = Object.fromEntries(keys.map(key => [key, changes[key]]));
+  if (await activityRetry(env, u.userId, clientRef, 'spread', spreadId, 'spread.updated', requested)) {
+    return json({ spread: await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(spreadId).first() });
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(spreadId).first();
+    if (!current || current.deleted_at) return err(404, 'not_found');
+    const conflicts = {};
+    for (const key of keys) {
+      if (current[key] !== body.base_values[key] && current[key] !== changes[key]) {
+        conflicts[key] = { base: body.base_values[key], mine: changes[key], server: current[key] };
+      }
+    }
+    if (Object.keys(conflicts).length) return json({ error: 'field_conflict', conflicts, server_copy: current }, 409);
+    const merged = { ...current, ...requested };
+    const now = nowISO();
+    try {
+      const results = await env.DB.batch([
+        env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
+        env.DB.prepare(`UPDATE spreads SET ${keys.map(key => key + '=?').join(',')}, searchableText=?,
+          updated_by=?, updated_at=?, revision=revision+1, seq=(SELECT MAX(seq) FROM change_seq) WHERE id=? AND revision=? AND deleted_at IS NULL`)
+          .bind(...keys.map(key => changes[key]), normalizeSearch([merged.number, merged.title, merged.note_short, merged.note_full].join(' ')),
+            u.userId, now, spreadId, current.revision),
+        activityStatement(env, {
+          notebookId: current.notebook_id, spreadId, entity: 'spread', entityId: spreadId,
+          actorUserId: u.userId, action: 'spread.updated', clientRef, createdAt: now,
+          revisionBefore: current.revision, revisionAfter: current.revision + 1,
+          oldValue: Object.fromEntries(keys.map(key => [key, current[key]])), newValue: requested,
+          guardSql: 'SELECT 1 FROM spreads WHERE id=? AND seq=(SELECT MAX(seq) FROM change_seq)', guardParams: [spreadId],
+        }),
+      ]);
+      if (!results[1].meta.changes) continue;
+      return json({ spread: await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(spreadId).first(), applied_fields: keys });
+    } catch (error) {
+      if (/ux_spreads_notebook_number|spreads.notebook_id, spreads.number/.test(String(error))) return err(409, 'duplicate_number');
+      throw error;
+    }
+  }
+  return err(409, 'concurrent_metadata_update');
+}
+
 on('PATCH', '/api/spreads/:id', async (request, env, p) => {
   const u = await requireAuth(request, env);
   const current = await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(p.id).first();
   if (!current) return err(404, 'not_found');
   await requireMembership(env, u.userId, current.notebook_id);
   const body = await request.json();
+  if (Object.hasOwn(body, 'current_photo_id')) return err(400, 'photo_not_metadata');
+  if (body.changes !== undefined) return patchSpreadFields(env, u, p.id, body);
   if (body.revision !== undefined && body.revision !== current.revision) {
     return json({ error: 'conflict', server_copy: current }, 409);
   }
@@ -611,6 +668,54 @@ on('DELETE', '/api/spreads/:id', async (request, env, p) => {
   await env.DB.prepare('UPDATE spreads SET deleted_at=?, deleted_by=?, seq=? WHERE id=?').bind(nowISO(), u.userId, seq, p.id).run();
   await logHistory(env, { notebook_id: current.notebook_id, entity: 'spread', entity_id: p.id, user_id: u.userId, action: 'spread_deleted' });
   return json({ ok: true });
+});
+
+on('PUT', '/api/notebooks/:id/spreads/order', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  await requireMembership(env, u.userId, p.id);
+  const body = await request.json();
+  const clientRef = requiredClientRef(body.client_ref);
+  const items = body.items;
+  if (!Array.isArray(items) || !items.length || items.length > 200 ||
+      items.some(item => !item || typeof item.spread_id !== 'string' || !Number.isInteger(item.expected_revision) || !Number.isInteger(item.expected_number)) ||
+      new Set(items.map(item => item.spread_id)).size !== items.length) return err(400, 'invalid_order');
+  const newOrder = items.map((item, index) => ({ id: item.spread_id, number: index + 1 }));
+  if (await activityRetry(env, u.userId, clientRef, 'notebook', p.id, 'spread.reordered', newOrder)) {
+    const rows = await env.DB.prepare('SELECT * FROM spreads WHERE notebook_id=? AND deleted_at IS NULL ORDER BY number').bind(p.id).all();
+    return json({ spreads: rows.results });
+  }
+  const current = (await env.DB.prepare('SELECT * FROM spreads WHERE notebook_id=? AND deleted_at IS NULL ORDER BY number').bind(p.id).all()).results;
+  const stale = current.length !== items.length || items.some(item => !current.some(row =>
+    row.id === item.spread_id && row.revision === item.expected_revision && row.number === item.expected_number));
+  if (stale) return json({ error: 'reorder_stale', current_items: current }, 409);
+  const temporaryStart = Math.min(0, ...current.map(row => row.number)) - items.length - 1;
+  const now = nowISO();
+  // This constraint assertion executes INSIDE the batch. A concurrent edit/create/delete
+  // makes it insert NULL into change_seq.at (NOT NULL), rolling the entire batch back.
+  const guard = env.DB.prepare(`WITH expected(id, revision, number) AS (VALUES ${items.map(() => '(?,?,?)').join(',')})
+    INSERT INTO change_seq(at) SELECT NULL WHERE
+    (SELECT COUNT(*) FROM spreads WHERE notebook_id=? AND deleted_at IS NULL) <> ? OR
+    EXISTS (SELECT 1 FROM expected e LEFT JOIN spreads s ON s.id=e.id AND s.notebook_id=? AND s.deleted_at IS NULL
+      WHERE s.id IS NULL OR s.revision<>e.revision OR s.number<>e.number)`)
+    .bind(...items.flatMap(item => [item.spread_id, item.expected_revision, item.expected_number]), p.id, items.length, p.id);
+  try {
+    await env.DB.batch([
+      guard,
+      env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
+      ...items.map((item, index) => env.DB.prepare('UPDATE spreads SET number=? WHERE id=? AND notebook_id=?')
+        .bind(temporaryStart - index, item.spread_id, p.id)),
+      ...items.map((item, index) => env.DB.prepare(`UPDATE spreads SET number=?, revision=revision+1,
+        updated_at=?, updated_by=?, seq=(SELECT MAX(seq) FROM change_seq), searchableText=? WHERE id=? AND notebook_id=?`)
+        .bind(index + 1, now, u.userId, normalizeSearch([index + 1, ...['title','note_short','note_full'].map(key => current.find(row => row.id === item.spread_id)[key])].join(' ')), item.spread_id, p.id)),
+      activityStatement(env, { notebookId: p.id, entity: 'notebook', entityId: p.id,
+        actorUserId: u.userId, action: 'spread.reordered', clientRef, createdAt: now,
+        oldValue: current.map(row => ({ id: row.id, number: row.number })), newValue: newOrder }),
+    ]);
+  } catch (error) {
+    if (/change_seq.at|spreads.notebook_id, spreads.number/.test(String(error))) return err(409, 'reorder_stale');
+    throw error;
+  }
+  return json({ spreads: (await env.DB.prepare('SELECT * FROM spreads WHERE notebook_id=? AND deleted_at IS NULL ORDER BY number').bind(p.id).all()).results });
 });
 
 // ==================================================================
@@ -653,20 +758,20 @@ on('POST', '/api/spreads/:id/notes', async (request, env, p) => {
 
   const id = body.id ? requiredText(body.id, 'id', 200) : uuid();
   const now = nowISO();
-  const seq = await nextSeq(env);
   try {
     await env.DB.batch([
+      env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
       env.DB.prepare(
         `INSERT INTO spread_notes (
           id, spread_id, notebook_id, author_id, body, created_at, updated_at,
           deleted_at, revision, seq, client_ref
-        ) VALUES (?,?,?,?,?,?,?,NULL,1,?,?)`
-      ).bind(id, p.id, spread.notebook_id, u.userId, noteBody, now, now, seq, clientRef),
+        ) VALUES (?,?,?,?,?,?,?,NULL,1,(SELECT MAX(seq) FROM change_seq),?)`
+      ).bind(id, p.id, spread.notebook_id, u.userId, noteBody, now, now, clientRef),
       activityStatement(env, {
         notebookId: spread.notebook_id, spreadId: p.id, entity: 'spread_note',
         entityId: id, actorUserId: u.userId, action: 'note.created',
         revisionAfter: 1, newValue: { body: noteBody }, createdAt: now,
-        seq, clientRef,
+        clientRef,
       }),
     ]);
   } catch (e) {
@@ -698,24 +803,24 @@ on('PATCH', '/api/notes/:id', async (request, env, p) => {
   if (noteBody === current.body) return json({ note: current });
 
   const now = nowISO();
-  const seq = await nextSeq(env);
   const nextRevision = current.revision + 1;
   const results = await env.DB.batch([
+    env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
     env.DB.prepare(
-      `UPDATE spread_notes SET body=?, updated_at=?, revision=?, seq=?
+      `UPDATE spread_notes SET body=?, updated_at=?, revision=?, seq=(SELECT MAX(seq) FROM change_seq)
        WHERE id=? AND author_id=? AND revision=? AND deleted_at IS NULL`
-    ).bind(noteBody, now, nextRevision, seq, p.id, u.userId, current.revision),
+    ).bind(noteBody, now, nextRevision, p.id, u.userId, current.revision),
     activityStatement(env, {
       notebookId: current.notebook_id, spreadId: current.spread_id,
       entity: 'spread_note', entityId: p.id, actorUserId: u.userId,
       action: 'note.updated', revisionBefore: current.revision,
       revisionAfter: nextRevision, oldValue: { body: current.body },
-      newValue: { body: noteBody }, createdAt: now, seq, clientRef,
-      guardSql: 'SELECT 1 FROM spread_notes WHERE id=? AND revision=? AND seq=?',
-      guardParams: [p.id, nextRevision, seq],
+      newValue: { body: noteBody }, createdAt: now, clientRef,
+      guardSql: 'SELECT 1 FROM spread_notes WHERE id=? AND revision=? AND seq=(SELECT MAX(seq) FROM change_seq)',
+      guardParams: [p.id, nextRevision],
     }),
   ]);
-  if (!results[0].meta.changes) return json({ error: 'conflict', server_note: await selectNote(env, p.id) }, 409);
+  if (!results[1].meta.changes) return json({ error: 'conflict', server_note: await selectNote(env, p.id) }, 409);
   return json({ note: await selectNote(env, p.id) });
 });
 
@@ -735,24 +840,24 @@ on('DELETE', '/api/notes/:id', async (request, env, p) => {
   }
 
   const now = nowISO();
-  const seq = await nextSeq(env);
   const nextRevision = current.revision + 1;
   const results = await env.DB.batch([
+    env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
     env.DB.prepare(
-      `UPDATE spread_notes SET deleted_at=?, updated_at=?, revision=?, seq=?
+      `UPDATE spread_notes SET deleted_at=?, updated_at=?, revision=?, seq=(SELECT MAX(seq) FROM change_seq)
        WHERE id=? AND author_id=? AND revision=? AND deleted_at IS NULL`
-    ).bind(now, now, nextRevision, seq, p.id, u.userId, current.revision),
+    ).bind(now, now, nextRevision, p.id, u.userId, current.revision),
     activityStatement(env, {
       notebookId: current.notebook_id, spreadId: current.spread_id,
       entity: 'spread_note', entityId: p.id, actorUserId: u.userId,
       action: 'note.deleted', revisionBefore: current.revision,
       revisionAfter: nextRevision, oldValue: { body: current.body },
-      newValue: null, createdAt: now, seq, clientRef,
-      guardSql: 'SELECT 1 FROM spread_notes WHERE id=? AND revision=? AND seq=? AND deleted_at IS NOT NULL',
-      guardParams: [p.id, nextRevision, seq],
+      newValue: null, createdAt: now, clientRef,
+      guardSql: 'SELECT 1 FROM spread_notes WHERE id=? AND revision=? AND seq=(SELECT MAX(seq) FROM change_seq) AND deleted_at IS NOT NULL',
+      guardParams: [p.id, nextRevision],
     }),
   ]);
-  if (!results[0].meta.changes) return json({ error: 'conflict', server_note: await selectNote(env, p.id) }, 409);
+  if (!results[1].meta.changes) return json({ error: 'conflict', server_note: await selectNote(env, p.id) }, 409);
   return json({ note: await selectNote(env, p.id) });
 });
 
@@ -851,7 +956,7 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   const now = nowISO();
 
   const statements = [
-    env.DB.prepare('UPDATE photos SET is_current=0 WHERE spread_id=? AND is_current=1').bind(p.id),
+    env.DB.prepare('UPDATE photos SET is_current=0, seq=? WHERE spread_id=? AND is_current=1').bind(seq, p.id),
     env.DB.prepare(
       `INSERT INTO photos (id, spread_id, version, is_current, provider, storage_object_id, telegram_message_id,
         telegram_file_id, telegram_file_unique_id, mime_type, file_size, created_by, created_at, seq, client_upload_id)
@@ -860,6 +965,10 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
       doc.mime_type || file.type, doc.file_size, u.userId, now, seq, clientUploadId),
     env.DB.prepare('UPDATE spreads SET current_photo_id=?, updated_at=?, updated_by=?, revision=revision+1, seq=? WHERE id=?')
       .bind(photoId, now, u.userId, seq, p.id),
+    activityStatement(env, { notebookId: spread.notebook_id, spreadId: p.id, entity: 'photo', entityId: photoId,
+      actorUserId: u.userId, action: 'photo.added', seq, clientRef: 'photo-upload:' + clientUploadId,
+      oldValue: { current_photo_id: spread.current_photo_id }, newValue: { current_photo_id: photoId, version },
+      payload: { operation: 'upload' }, createdAt: now }),
   ];
   if (preview) {
     const previewBuf = await preview.arrayBuffer();
@@ -924,13 +1033,19 @@ on('POST', '/api/spreads/:id/photos/:photoId/make-current', async (request, env,
   await requireMembership(env, u.userId, spread.notebook_id);
   const photo = await env.DB.prepare('SELECT * FROM photos WHERE id=? AND spread_id=?').bind(p.photoId, p.id).first();
   if (!photo) return err(404, 'photo_not_found');
+  const body = request.headers.get('Content-Type')?.includes('application/json') ? await request.json() : {};
+  const clientRef = body.client_ref ? requiredClientRef(body.client_ref) : 'server:' + uuid();
+  if (await activityRetry(env, u.userId, clientRef, 'photo', p.photoId, 'photo.made_current', { current_photo_id: p.photoId })) return json({ ok: true });
   const seq = await nextSeq(env);
   const now = nowISO();
   await env.DB.batch([
-    env.DB.prepare('UPDATE photos SET is_current=0 WHERE spread_id=? AND is_current=1').bind(p.id),
+    env.DB.prepare('UPDATE photos SET is_current=0, seq=? WHERE spread_id=? AND is_current=1').bind(seq, p.id),
     env.DB.prepare('UPDATE photos SET is_current=1, seq=? WHERE id=?').bind(seq, p.photoId),
     env.DB.prepare('UPDATE spreads SET current_photo_id=?, updated_at=?, updated_by=?, revision=revision+1, seq=? WHERE id=?')
       .bind(p.photoId, now, u.userId, seq, p.id),
+    activityStatement(env, { notebookId: spread.notebook_id, spreadId: p.id, entity: 'photo', entityId: p.photoId,
+      actorUserId: u.userId, action: 'photo.made_current', seq, clientRef, createdAt: now,
+      oldValue: { current_photo_id: spread.current_photo_id }, newValue: { current_photo_id: p.photoId } }),
   ]);
   return json({ ok: true });
 });
@@ -999,6 +1114,9 @@ on('GET', '/api/favorites', async (request, env) => {
 
 on('PUT', '/api/favorites/:spreadId', async (request, env, p) => {
   const u = await requireAuth(request, env);
+  const spread = await env.DB.prepare('SELECT notebook_id, deleted_at FROM spreads WHERE id=?').bind(p.spreadId).first();
+  if (!spread || spread.deleted_at) return err(404, 'not_found');
+  await requireMembership(env, u.userId, spread.notebook_id);
   const seq = await nextSeq(env);
   await env.DB.prepare(
     `INSERT INTO user_favorites (user_id, spread_id, seq) VALUES (?,?,?)
@@ -1170,7 +1288,7 @@ on('POST', '/api/migration/register-existing-photo', async (request, env) => {
   const seq = await nextSeq(env);
   const now = nowISO();
   await env.DB.batch([
-    env.DB.prepare('UPDATE photos SET is_current=0 WHERE spread_id=? AND is_current=1').bind(body.spread_id),
+    env.DB.prepare('UPDATE photos SET is_current=0, seq=? WHERE spread_id=? AND is_current=1').bind(seq, body.spread_id),
     env.DB.prepare(
       `INSERT INTO photos (id, spread_id, version, is_current, provider, storage_object_id, telegram_message_id,
         telegram_file_id, telegram_file_unique_id, mime_type, file_size, created_by, created_at, seq)
