@@ -10,7 +10,10 @@
       return;
     }
     const rows = (await getAll('spread_notes')).filter(row => row.scope === team.scope() && row.spread_id === spread.id && (!row.deleted_at || row.pending))
-      .sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)));
+      // Newest first; seq is authoritative, created_at/id are the fallback.
+      .sort((a,b) => (Number(b.seq)||0)-(Number(a.seq)||0)
+        || String(b.created_at||'').localeCompare(String(a.created_at||''))
+        || String(b.id||'').localeCompare(String(a.id||'')));
     if (!host.isConnected) return;
     host.innerHTML = `<h3>Примечания</h3><p class="vnext-note-caption">Общие для участников блокнота · ${isOnline() ? 'загруженные записи' : 'офлайн-копия'}</p>
       <div data-note-list></div><button class="btn-secondary" data-note-add>+ Добавить примечание</button>`;

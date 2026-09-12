@@ -177,6 +177,29 @@ try {
   assert.equal(coverFlow.downloaded,true,'server cover is cached locally');
   assert.equal(coverFlow.gone,true,'cover tombstone removes the local picture');
   assert.match(coverFlow.badge,/2/,'history badge counts server unread');
+  // Cover must survive an app restart (IndexedDB state + cached blob).
+  await page.reload({waitUntil:'load'});
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof get === 'function');
+  assert.equal(await page.evaluate(async () => {
+    const notebook = await get('notebooks','nb');
+    const cached = await get('blobs', window.v340CoverBlobId('nb'));
+    return notebook.cover_state_known === true && notebook.cover_deleted_at === '2026-09-12T12:00:00.000Z' && !cached;
+  }), true, 'cover tombstone survives a restart');
+  // A live server cover must also survive a restart (blob + synced state in IndexedDB).
+  await page.evaluate(async () => {
+    settings.backend_url = location.origin; settings.user_id = 'u1'; settings.auth_token = 'fixture-only';
+    await saveSettings();
+    settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{notebook_cover:true, activity_seen:true}};
+    await applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb',cover_revision:4,deleted_at:null,seq:33}]});
+  });
+  await page.reload({waitUntil:'load'});
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof get === 'function');
+  assert.equal(await page.evaluate(async () => {
+    const notebook = await get('notebooks','nb');
+    const cached = await get('blobs', window.v340CoverBlobId('nb'));
+    const url = await getNotebookCoverUrl(notebook);
+    return notebook.cover_state_known === true && !notebook.cover_deleted_at && !!cached && typeof url === 'string' && url.startsWith('blob:');
+  }), true, 'a live cover survives a restart and renders');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, own notes, metadata, photo safety, reorder, history, viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

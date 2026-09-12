@@ -149,5 +149,13 @@ assert.match(history, /markNotebookSeen/);
 assert.match(history, /activity\/seen/);
 assert.match(history, /unread-change/);
 assert.match(history, /serverUnreadCount/);
+// BUG 3: newest first everywhere (seq DESC, created_at/id fallback) and a re-render when a cover arrives.
+assert.match(history, /\(Number\(b\.seq\)\|\|0\)-\(Number\(a\.seq\)\|\|0\)/);
+assert.match(history, /eventTime\(b\) - eventTime\(a\)/);
+assert.match(read('v3-photos.js'), /\(Number\(b\.seq\)\|\|0\)-\(Number\(a\.seq\)\|\|0\)[\s\S]{0,120}localeCompare/);
+assert.match(worker, /ORDER BY sn\.seq DESC, sn\.id DESC/);
+assert.match(worker, /ORDER BY ae\.seq DESC, ae\.id DESC/);
+assert.match(core, /BlocknotV3\.emit\('cover-change', notebook\.id\)/);
+assert.match(read('v3-ui.js'), /BlocknotV3\.on\('cover-change'/);
 
 console.log('critical-guards: PASS');

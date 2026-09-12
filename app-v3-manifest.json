@@ -1,5 +1,5 @@
 {
-  "version": "3.4.2",
+  "version": "3.4.3",
   "files": [
     {
       "path": "chunk1.txt",
@@ -23,11 +23,11 @@
     },
     {
       "path": "v3-core.js",
-      "sha256": "6a38f5cea56e5999b6b875731bdaff9bc22fc195d449e0278e88edb5561e1ed0"
+      "sha256": "339e2cb2a0e19a756fc33aaf3df48083ad058d8dc754cd380bf7691d84b5b8e7"
     },
     {
       "path": "v3-photos.js",
-      "sha256": "65b8cde8a37b724cbde3667fc4e5767faff0837a4fea5b23d9cf3b764e8f339a"
+      "sha256": "88e9314c1dec10f8683c77b2c955957b3a023e2f928aeed1f44cddfccaea3f71"
     },
     {
       "path": "v3-camera.js",
@@ -35,11 +35,11 @@
     },
     {
       "path": "v3-history.js",
-      "sha256": "84e770e72b9f0cbdf916052c995f5ad992daad2fabc8ca7a0bf4bf26f6328433"
+      "sha256": "93745eecfd5380eafa17718ee53797cf6192cb61bec42ce0750c3a6b30c455bf"
     },
     {
       "path": "v3-ui.js",
-      "sha256": "0a56d803381b03c319ae23c6263830b4b16eea1f6d4a363cbb830d140154d735"
+      "sha256": "6bd56faaebae3dfc6ed08e83d6d26bed70dbc24a96c781fca3ce1b77cbeddd55"
     }
   ]
 }

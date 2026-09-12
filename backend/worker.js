@@ -788,7 +788,7 @@ on('GET', '/api/spreads/:id/notes', async (request, env, p) => {
     `SELECT sn.*, us.display_name AS author_display_name
      FROM spread_notes sn JOIN users us ON us.id=sn.author_id
      WHERE sn.spread_id=? AND sn.deleted_at IS NULL
-     ORDER BY sn.created_at, sn.id LIMIT ?`
+    ORDER BY sn.seq DESC, sn.id DESC LIMIT ?`
   ).bind(p.id, limit).all();
   return json({ notes: rows.results });
 });

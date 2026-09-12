@@ -253,6 +253,9 @@ const secondPhone = await api(env, 'POST', '/api/spreads/s1/notes', 'token-2', {
 });
 assert.equal(secondPhone.status, 201, 'second phone creates independent note');
 assert.equal(sqlite.prepare('SELECT COUNT(*) AS c FROM spread_notes').get().c, 2);
+const notesList = await api(env, 'GET', '/api/spreads/s1/notes', 'token-1');
+assert.equal(notesList.data.notes.length, 2);
+assert.equal(notesList.data.notes[0].id, 'note-2', 'newest note first (seq DESC)');
 
 const edited = await api(env, 'PATCH', '/api/notes/note-1', 'token-1', {
   client_ref: 'phone-a:edit-1', revision: 1, body: 'Проверил муфту — всё нормально',

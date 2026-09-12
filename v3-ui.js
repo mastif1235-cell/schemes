@@ -407,6 +407,10 @@
   const teamStyle = document.createElement('style');
   teamStyle.textContent = `.vnext-order-row{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--border)}.vnext-order-row button{padding:0;min-width:44px}.v340-history-list pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.82rem}.v340-history-list summary{cursor:pointer;padding:10px 0}`;
   document.head.appendChild(teamStyle);
+  // A cover that arrives from another phone must appear without manual navigation.
+  window.BlocknotV3.on('cover-change', () => {
+    if (route.screen === 'notebooks') render();
+  });
   window.BlocknotV3.on('spread-order-saved',({notebookId}) => {
     toast('Порядок подтверждён сервером');
     if (route.screen === 'spreads' && route.notebookId === notebookId) render();

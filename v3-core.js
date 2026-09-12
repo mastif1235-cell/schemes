@@ -107,6 +107,7 @@
       await setCoverRemoved(notebook.id, true);
       await put('notebooks', {...notebook, server_id:notebook.server_id || cover.notebook_id,
         cover_state_known:true, cover_deleted_at:cover.deleted_at, cover_revision:revision, cover_updated_at:now});
+      BlocknotV3.emit('cover-change', notebook.id);
       return true;
     }
     const local = await get('blobs', blobId);
@@ -115,6 +116,7 @@
       if (!blob) {
         await put('notebooks', {...notebook, cover_state_known:true, cover_deleted_at:null,
           cover_revision:revision, cover_updated_at:now});
+        BlocknotV3.emit('cover-change', notebook.id);
         return false;
       }
       await put('blobs', {id:blobId, blob, cover_revision:revision, mime_type:blob.type || cover.mime_type || ''});
@@ -122,6 +124,7 @@
     await setCoverRemoved(notebook.id, false);
     await put('notebooks', {...notebook, cover_state_known:true, cover_deleted_at:null,
       cover_revision:revision, cover_updated_at:now});
+    BlocknotV3.emit('cover-change', notebook.id);
     return true;
   };
 

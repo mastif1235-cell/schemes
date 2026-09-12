@@ -23,7 +23,9 @@
   async function visibleRows(notebook) {
     const hiddenBefore = Number(localStorage.getItem(HIDDEN_KEY) || 0);
     const rows = notebook ? await rowsForNotebook(notebook) : await getAll('history');
-    return rows.filter(row => eventTime(row) > hiddenBefore).sort((a, b) => eventTime(b) - eventTime(a));
+    return rows.filter(row => eventTime(row) > hiddenBefore)
+      .sort((a, b) => (Number(b.seq)||0)-(Number(a.seq)||0) || eventTime(b) - eventTime(a)
+        || String(b.id||'').localeCompare(String(a.id||'')));
   }
 
   function actionLabel(action) {
@@ -146,7 +148,8 @@
     const describe = input => input === null || input === undefined ? '—' : typeof input === 'object' ? JSON.stringify(input,null,2) : String(input);
     async function draw() {
       const events = (await getAll('activity_events')).filter(row => row.scope === sessionScope && row.notebook_id === notebook.server_id)
-        .sort((a,b) => eventTime(b) - eventTime(a) || (b.seq || 0) - (a.seq || 0));
+        .sort((a,b) => (Number(b.seq)||0)-(Number(a.seq)||0) || eventTime(b) - eventTime(a)
+          || String(b.id||'').localeCompare(String(a.id||'')));
       if (!el.isConnected || team.scope() !== sessionScope) return;
       host.replaceChildren();
       if (accessDenied) return;

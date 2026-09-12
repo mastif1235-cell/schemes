@@ -4,6 +4,7 @@ import vm from 'node:vm';
 
 const swSource = fs.readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
 const indexSource = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const release = JSON.parse(fs.readFileSync(new URL('../version.json', import.meta.url), 'utf8')).version;
 
 function createWorker({failInstall = false, offline = true} = {}) {
   const handlers = {};
@@ -18,7 +19,7 @@ function createWorker({failInstall = false, offline = true} = {}) {
   };
   const caches = {
     open: async () => cache,
-    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable', 'blocknot-shell-v342-stable-1', 'blocknot-shell-v3.4.2', 'unrelated-cache'],
+    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable', 'blocknot-shell-v342-stable-1', `blocknot-shell-v${release}`, 'unrelated-cache'],
     delete: async key => { deleted.push(key); return true; },
     match: async request => {
       const key = typeof request === 'string' ? request : new URL(request.url).pathname.split('/').pop();
@@ -35,7 +36,7 @@ function createWorker({failInstall = false, offline = true} = {}) {
     self, caches, URL, Request, Response, Promise,
     importScripts:url => {
       assert.equal(url, './version.js', 'release version must come from the generated bridge');
-      self.__BLOCKNOT_VERSION__ = '3.4.2';
+      self.__BLOCKNOT_VERSION__ = release;
     },
     fetch:async request => {
       if (offline) throw new Error('offline');
