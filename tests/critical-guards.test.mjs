@@ -113,4 +113,41 @@ assert.match(sw, /c\.addAll\(SHELL\)/, 'install keeps the atomic addAll shell');
 assert.doesNotMatch(index, /unregister|getRegistrations|location\.replace/);
 assert.match(index, /blocknot_release_reload_once/, 'automatic reload is limited to one per session');
 
+// --- CROSS-DEVICE COVER + SHARED HISTORY/UNREAD (stage 4A/4B) -------------------------------
+const worker = read('backend/worker.js');
+for (const route of [
+  "on('GET', '/api/notebooks/:id/cover'",
+  "on('PUT', '/api/notebooks/:id/cover'",
+  "on('DELETE', '/api/notebooks/:id/cover'",
+  "on('GET', '/api/notebooks/:id/cover/file'",
+  "on('GET', '/api/notebooks/:id/cover/preview'",
+  "on('PUT', '/api/notebooks/:id/activity/seen'",
+]) {
+  assert.ok(worker.includes(route), `worker must expose ${route}`);
+}
+assert.match(worker, /name: 'notebook_covers'/);
+assert.match(worker, /unread\.notebooks\[row\.notebook_id\]/);
+assert.match(worker, /hasCoverSchema/, 'new tables must degrade safely before the migration is applied');
+assert.doesNotMatch(worker, /SELECT \* FROM notebook_covers WHERE notebook_id IN \(\$\{ph\}\)/, 'sync must not ship preview base64');
+const migration2 = read('backend/migrations/0002_notebook_covers_activity_seen.sql');
+assert.match(migration2, /CREATE TABLE notebook_covers/);
+assert.match(migration2, /CREATE TABLE activity_seen/);
+assert.doesNotMatch(migration2, /DROP\s|ALTER TABLE|DELETE FROM/i, 'migration must stay additive');
+
+assert.match(sync, /pushNotebookCover/);
+assert.match(sync, /item\.entity === 'notebook_cover'/);
+assert.match(sync, /changes\.notebook_covers/);
+assert.match(sync, /settings\.unread_by_notebook/);
+assert.match(sync, /pullChanges = async function/);
+assert.match(core, /v340ApplyServerCover/);
+assert.match(core, /queueCoverChange/);
+assert.match(core, /cover_state_known/);
+assert.match(core, /enabled\('notebook_cover'\)/);
+const history = read('v3-history.js');
+assert.match(history, /enabled\('activity_seen'\)/);
+assert.match(history, /markNotebookSeen/);
+assert.match(history, /activity\/seen/);
+assert.match(history, /unread-change/);
+assert.match(history, /serverUnreadCount/);
+
 console.log('critical-guards: PASS');

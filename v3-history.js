@@ -90,11 +90,40 @@
   }
 
   window.v340RefreshHistoryBadge = refreshBadge;
+  function serverUnreadCount() {
+    const map = settings.unread_by_notebook || {};
+    let count = 0;
+    for (const row of Object.values(map)) count += Number(row && row.count || 0);
+    return count;
+  }
+
+  async function markNotebookSeen(serverNotebookId) {
+    if (!window.vNextSync.enabled('activity_seen') || !serverNotebookId || !isOnline()) return false;
+    try {
+      await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:{}});
+      const map = {...(settings.unread_by_notebook || {})};
+      delete map[serverNotebookId];
+      settings.unread_by_notebook = map;
+      settings.unread_total = Object.values(map).reduce((sum, row) => sum + Number(row && row.count || 0), 0);
+      await saveSettings();
+      return true;
+    } catch (error) {
+      console.warn('History seen cursor could not be stored', error);
+      return false;
+    }
+  }
+
   async function refreshBadge() {
     const button = document.getElementById('v340HistoryButton');
     if (!button) return;
-    const seen = Number(localStorage.getItem(SEEN_KEY) || 0);
-    const count = (await visibleRows(null)).filter(row => eventTime(row) > seen).length;
+    let count;
+    if (window.vNextSync.enabled('activity_seen')) {
+      // Shared history: the server owns unread, per user, so badges match on every device.
+      count = serverUnreadCount();
+    } else {
+      const seen = Number(localStorage.getItem(SEEN_KEY) || 0);
+      count = (await visibleRows(null)).filter(row => eventTime(row) > seen).length;
+    }
     button.innerHTML = `🕘${count ? `<span class="v340-history-badge">${count > 99 ? '99+' : count}</span>` : ''}`;
     button.setAttribute('aria-label', count ? `История, новых записей: ${count}` : 'История');
   }
@@ -151,11 +180,12 @@
         before = data.next_before_seq;
         more.hidden = !data.has_more || before === null;
         state.textContent = 'Общая история участников. Старые записи показаны без деталей; загружаются последние 100 старых записей.';
+        await markNotebookSeen(notebook.server_id);
       } catch (error) {
         console.warn('Team history load failed',error);
         accessDenied = error.status === 403 || error.status === 401;
         state.textContent = 'Не удалось обновить общую историю: ' + error.message;
-      } finally { more.disabled = false; await draw(); }
+      } finally { more.disabled = false; await draw(); await refreshBadge(); }
     }
     more.onclick = load;
     await draw(); await load();
@@ -178,6 +208,7 @@
   const theme = document.getElementById('themeBtn');
   if (theme && theme.parentElement) theme.parentElement.insertBefore(historyButton, theme);
   BlocknotV3.on('history-change', refreshBadge);
+  BlocknotV3.on('unread-change', refreshBadge);
   BlocknotV3.on('db-ready', refreshBadge);
 
   const style = document.createElement('style');

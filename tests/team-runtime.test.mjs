@@ -139,6 +139,44 @@ try {
   }),false,'cover/gallery picker must not be hijacked by the page camera flow');
   assert.equal(await page.evaluate(() => typeof v3PhotoFromImage),'undefined','legacy runtime must not be loaded');
   assert.equal(await page.evaluate(() => URL.createObjectURL.toString().includes('v3BlobKeyByUrl')),false,'URL helpers must not be monkey-patched');
+  // ---- cross-device cover + server unread: mocked endpoints, real IndexedDB ------------------
+  await context.route(origin+'/api/notebooks/remote-nb/cover', async route => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({json:{cover:{notebook_id:'remote-nb',revision:1,deleted_at:null,seq:30,has_preview:true}}});
+      return;
+    }
+    await route.fulfill({status:404});
+  });
+  await context.route(origin+'/api/notebooks/remote-nb/cover/preview', route => route.fulfill({
+    status:200, headers:{'Content-Type':'image/webp'}, body:Buffer.from([1,2,3,4]),
+  }));
+  const coverFlow = await page.evaluate(async () => {
+    settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{notebook_cover:true, activity_seen:true}};
+    const notebook = await get('notebooks','nb');
+    const canvas = document.createElement('canvas'); canvas.width = 40; canvas.height = 56;
+    const blob = await new Promise(res => canvas.toBlob(res,'image/jpeg'));
+    await put('blobs',{id:window.v340CoverBlobId(notebook.id), blob});
+    await window.vNextAtomic('notebooks',notebook.id,()=>({item:{entity:'notebook_cover',local_id:notebook.id,
+      scope:window.vNextSync.scope(),status:'pending',retry_count:0,payload:{op:'put',client_ref:'fixture-cover-1'}}}));
+    await pushEntityQueue(true);
+    const afterPush = await get('notebooks','nb');
+    const queued = (await getAll('sync_queue')).find(row => row.entity === 'notebook_cover');
+    const uploaded = !!queued && queued.status === 'done' && afterPush.cover_state_known === true && afterPush.cover_revision === 1;
+    await applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb',cover_revision:2,deleted_at:null,seq:31}]});
+    const cached = await get('blobs', window.v340CoverBlobId('nb'));
+    const downloaded = !!cached && cached.cover_revision === 2;
+    await applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb',cover_revision:3,deleted_at:'2026-09-12T12:00:00.000Z',seq:32}]});
+    const afterTombstone = await get('notebooks','nb');
+    const gone = afterTombstone.cover_deleted_at === '2026-09-12T12:00:00.000Z' && !(await get('blobs', window.v340CoverBlobId('nb')));
+    settings.unread_by_notebook = {'remote-nb':{count:2,max_seq:32}};
+    await window.v340RefreshHistoryBadge();
+    const badge = (document.getElementById('v340HistoryButton')?.textContent || '').trim();
+    return {uploaded, downloaded, gone, badge};
+  });
+  assert.equal(coverFlow.uploaded,true,'local cover is uploaded through the sync queue');
+  assert.equal(coverFlow.downloaded,true,'server cover is cached locally');
+  assert.equal(coverFlow.gone,true,'cover tombstone removes the local picture');
+  assert.match(coverFlow.badge,/2/,'history badge counts server unread');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, own notes, metadata, photo safety, reorder, history, viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

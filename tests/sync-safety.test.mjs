@@ -263,6 +263,7 @@ upgrade.context.settings.sync_cursor = 9000;
 let backfills = 0;
 upgrade.setApi(async path => {
   if (path === '/api/me') return {capabilities:{team_notes:true}};
+  if (path.startsWith('/api/sync')) return {changes:{}, unread:{notebooks:{},total:0}, next_cursor:9000, has_more:false};
   assert.equal(path,'/api/notebooks/remote-nb/snapshot'); backfills++;
   return {notebook:{id:'remote-nb',title:'nb'},spreads:[{id:'sp',notebook_id:'remote-nb'}],photos:[],tags:[],spread_tags:[],favorites:[],
     spread_notes:[{id:'historic-note',notebook_id:'remote-nb',spread_id:'sp',body:'seq below old cursor',seq:10}]};
@@ -285,4 +286,24 @@ assert.equal(resolvedItem.payload.revision,3);
 assert.equal(resolvedItem.payload.body,'merged');
 assert.notEqual(resolvedItem.payload.client_ref,'previous','resolution is a new explicit operation');
 assert.equal(noteResolution.db.spread_notes.get(conflictNote.cache_id).body,'merged');
+
+// Shared cover + server unread: sync applies server cover state, but never over a pending local change.
+const coverApplied = [];
+const coverRuntime = createRuntime({notebooks:[{id:'nb-c',server_id:'remote-nb-c'}]});
+coverRuntime.context.window.v340ApplyServerCover = async (notebook, cover) => { coverApplied.push([notebook.id, cover.deleted_at]); return true; };
+coverRuntime.context.window.v340CoverBlobId = id => 'notebook_cover_' + id;
+await coverRuntime.context.applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb-c',cover_revision:2,deleted_at:null,seq:5}]});
+assert.equal(coverApplied.length,1,'server cover reaches the local notebook');
+assert.equal(coverApplied[0][1],null);
+coverRuntime.db.sync_queue.set(11,{id:11,entity:'notebook_cover',local_id:'nb-c',status:'pending',payload:{op:'put',client_ref:'x'}});
+await coverRuntime.context.applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb-c',cover_revision:3,deleted_at:'2026-09-12T00:00:00.000Z',seq:6}]});
+assert.equal(coverApplied.length,1,'a pending local cover change is not overwritten by sync');
+coverRuntime.db.sync_queue.set(11,{...coverRuntime.db.sync_queue.get(11),status:'done'});
+await coverRuntime.context.applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb-c',cover_revision:3,deleted_at:'2026-09-12T00:00:00.000Z',seq:6}]});
+assert.equal(coverApplied.length,2,'a cover tombstone is applied once the local change is done');
+assert.equal(coverApplied[1][1],'2026-09-12T00:00:00.000Z');
+coverRuntime.setApi(async () => ({changes:{}, unread:{notebooks:{'remote-nb-c':{count:2,max_seq:9}},total:2}, next_cursor:9, has_more:false}));
+coverRuntime.context.settings.sync_cursor = 0;
+await coverRuntime.context.pullChanges();
+assert.equal(coverRuntime.context.settings.unread_by_notebook['remote-nb-c'].count,2,'server unread reaches the badge state');
 console.log('sync-safety: PASS');

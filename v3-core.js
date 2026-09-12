@@ -69,6 +69,75 @@
   window.v340ValidatePhotoTarget = validatePhotoTarget;
   BlocknotV3.photoTarget = {set:setPhotoTarget, current:currentPhotoTarget, clear:clearPhotoTarget};
 
+  // ---- shared notebook cover --------------------------------------------------------------
+  const coverSyncEnabled = () => !!(window.vNextSync && window.vNextSync.enabled('notebook_cover'));
+  window.v340CoverBlobId = notebookId => COVER_PREFIX + notebookId;
+
+  async function queueCoverChange(notebook, op) {
+    if (!notebook || !notebook.id) return;
+    if (!isAuthed() || !notebook.server_id || !coverSyncEnabled()) return;
+    try {
+      await window.vNextAtomic('notebooks', notebook.id, current => {
+        const base = current || notebook;
+        const row = op === 'delete'
+          ? {...base, cover_state_known:true, cover_deleted_at:nowISO(), cover_revision:Number(base.cover_revision) || 0}
+          : {...base, ...(base.cover_state_known === true ? {cover_deleted_at:null} : {})};
+        return {row, item:{
+          entity:'notebook_cover', local_id:notebook.id, scope:window.vNextSync.scope(),
+          status:'pending', retry_count:0, payload:{op, client_ref:uid()},
+        }};
+      });
+      void fullSync();
+    } catch (error) {
+      console.warn('Cover change could not be queued for sync', error);
+      toast('Обложка сохранена локально; синхронизация повторится позже');
+    }
+  }
+
+  // Applies authoritative server cover state. A null/absent cover means "unknown", so a legacy
+  // local-only cover keeps working until the server sends a real state or a tombstone.
+  window.v340ApplyServerCover = async function (notebook, cover) {
+    if (!notebook || !notebook.id || !cover || typeof cover !== 'object') return false;
+    const blobId = COVER_PREFIX + notebook.id;
+    const now = nowISO();
+    // Cover endpoints expose `revision`; /api/sync returns the raw row with `cover_revision`.
+    const revision = Number(cover.cover_revision ?? cover.revision ?? 0);
+    if (cover.deleted_at) {
+      await del('blobs', blobId).catch(() => {});
+      await setCoverRemoved(notebook.id, true);
+      await put('notebooks', {...notebook, server_id:notebook.server_id || cover.notebook_id,
+        cover_state_known:true, cover_deleted_at:cover.deleted_at, cover_revision:revision, cover_updated_at:now});
+      return true;
+    }
+    const local = await get('blobs', blobId);
+    if (!local || !local.blob || Number(local.cover_revision) !== revision) {
+      const blob = await downloadCoverBlob(notebook.server_id || cover.notebook_id);
+      if (!blob) {
+        await put('notebooks', {...notebook, cover_state_known:true, cover_deleted_at:null,
+          cover_revision:revision, cover_updated_at:now});
+        return false;
+      }
+      await put('blobs', {id:blobId, blob, cover_revision:revision, mime_type:blob.type || cover.mime_type || ''});
+    }
+    await setCoverRemoved(notebook.id, false);
+    await put('notebooks', {...notebook, cover_state_known:true, cover_deleted_at:null,
+      cover_revision:revision, cover_updated_at:now});
+    return true;
+  };
+
+  async function downloadCoverBlob(serverNotebookId) {
+    if (!serverNotebookId || !isAuthed()) return null;
+    try {
+      const preview = await apiBlob(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/cover/preview`);
+      if (preview instanceof Blob) return preview;
+    } catch (error) { console.warn('Cover preview unavailable, trying the original', error); }
+    try {
+      const full = await apiBlob(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/cover/file`);
+      if (full instanceof Blob) return full;
+    } catch (error) { console.warn('Cover download failed', error); }
+    return null;
+  }
+
   function loadRecents() {
     try {
       const parsed = JSON.parse(localStorage.getItem(RECENTS_KEY) || '[]');
@@ -223,7 +292,8 @@
     const blob = await cropCover(file);
     await put('blobs', {id:COVER_PREFIX + notebook.id, blob});
     await setCoverRemoved(notebook.id, false);
-    toast('Обложка сохранена на этом устройстве');
+    await queueCoverChange(notebook, 'put');
+    toast(coverSyncEnabled() && notebook.server_id ? 'Обложка сохранена и отправляется участникам' : 'Обложка сохранена на этом устройстве');
     BlocknotV3.emit('cover-change', notebook.id);
     render();
   };
@@ -260,7 +330,9 @@
       button.onclick = async () => {
         await put('blobs', {id:COVER_PREFIX + notebook.id, blob:choice.blob});
         await setCoverRemoved(notebook.id, false);
-        release(); close(); render(); toast('Обложка сохранена на этом устройстве');
+        await queueCoverChange(notebook, 'put');
+        release(); close(); render();
+        toast(coverSyncEnabled() && notebook.server_id ? 'Обложка сохранена и отправляется участникам' : 'Обложка сохранена на этом устройстве');
       };
       el.querySelector('.v340-cover-grid').appendChild(button);
     }
@@ -287,13 +359,21 @@
       } else if (button.dataset.action === 'remove') {
         await del('blobs', COVER_PREFIX + notebook.id);
         await setCoverRemoved(notebook.id, true);
-        close(); render(); toast('Обложка удалена с этого устройства');
+        const fresh = await get('notebooks', notebook.id) || notebook;
+        await queueCoverChange(fresh, 'delete');
+        close(); render();
+        toast(coverSyncEnabled() && fresh.server_id ? 'Обложка удалена у всех участников' : 'Обложка удалена с этого устройства');
       }
     };
   };
 
   getNotebookCoverUrl = async function (notebook) {
-    if (!notebook || await isCoverRemoved(notebook.id)) return null;
+    if (!notebook) return null;
+    // Server state wins once it is known. Before that, a local-only (legacy) cover stays visible
+    // unless this device removed it, so an offline delete never resurrects the old picture.
+    const serverStateKnown = notebook.cover_state_known === true;
+    if (serverStateKnown && notebook.cover_deleted_at) return null;
+    if (!serverStateKnown && await isCoverRemoved(notebook.id)) return null;
     const local = await get('blobs', COVER_PREFIX + notebook.id);
     if (local && local.blob) return URL.createObjectURL(local.blob);
     // No legacy cover_photo_id fallback: a deleted cover must never come back from another field.

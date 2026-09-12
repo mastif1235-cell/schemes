@@ -19,11 +19,11 @@
     },
     {
       "path": "v3-sync.js",
-      "sha256": "c6950d1753a63206ac753785e588e4670352bcb83d216ca4868c23f567bce587"
+      "sha256": "c792932579c86e3edb9fb9ac0577ddad604e9207e2b74a1d0272e7a9a76dd3b8"
     },
     {
       "path": "v3-core.js",
-      "sha256": "c6d40d7171fd8d29566e8f16f595cf2539310c81a52159ae97ac3aa24abae21b"
+      "sha256": "6a38f5cea56e5999b6b875731bdaff9bc22fc195d449e0278e88edb5561e1ed0"
     },
     {
       "path": "v3-photos.js",
@@ -35,7 +35,7 @@
     },
     {
       "path": "v3-history.js",
-      "sha256": "96dc29951c837f83ecb5fdb15152118674af436237d47498ef8d6e904a1a86e2"
+      "sha256": "84e770e72b9f0cbdf916052c995f5ad992daad2fabc8ca7a0bf4bf26f6328433"
     },
     {
       "path": "v3-ui.js",

@@ -269,6 +269,40 @@
     return queueResult('sent');
   };
 
+  pushNotebookCover = async function (item) {
+    const notebook = await get('notebooks', item.local_id);
+    if (!notebook) return queueResult('discarded', 'local notebook no longer exists');
+    if (!isAuthed() || !enabled('notebook_cover')) return queueResult('deferred', 'cover sync unavailable');
+    if (!notebook.server_id) return queueResult('deferred', 'notebook has no server id');
+    const path = `/api/notebooks/${encodeURIComponent(notebook.server_id)}/cover`;
+    if (item.payload && item.payload.op === 'delete') {
+      const data = await api(path, {method:'DELETE', json:{client_ref:item.payload.client_ref}});
+      if (data && data.cover) await window.v340ApplyServerCover(notebook, data.cover);
+      return queueResult('sent');
+    }
+    const record = await get('blobs', window.v340CoverBlobId(notebook.id));
+    if (!record || !record.blob) return queueResult('discarded', 'local cover blob missing');
+    const form = new FormData();
+    form.append('file', record.blob, `notebook_cover_${notebook.id}.jpg`);
+    const preview = await makeThumbnail(record.blob, 300).catch(error => {
+      console.warn('Cover preview could not be prepared', error);
+      return null;
+    });
+    if (preview) form.append('preview', preview, 'cover-preview.webp');
+    form.append('client_ref', item.payload.client_ref);
+    const headers = {};
+    if (settings.auth_token) headers.Authorization = 'Bearer ' + settings.auth_token;
+    const response = await fetch(settings.backend_url.replace(/\/$/, '') + path, {method:'PUT', body:form, headers});
+    if (!response.ok) {
+      const error = new Error('backend ' + response.status);
+      error.status = response.status;
+      throw error;
+    }
+    const data = await response.json();
+    if (data && data.cover) await window.v340ApplyServerCover(notebook, data.cover);
+    return queueResult('sent');
+  };
+
   pushEntityQueue = async function (forceRetry) {
     const queue = (await getAll('sync_queue')).filter(item =>
       item.entity && item.entity !== 'photo' && retryDue(item, !!forceRetry)
@@ -283,6 +317,7 @@
         else if (item.entity === 'spread_note') result = await pushNote(item);
         else if (item.entity === 'spread_fields') result = await pushFields(item);
         else if (item.entity === 'spread_order') result = await pushOrder(item);
+        else if (item.entity === 'notebook_cover') result = await pushNotebookCover(item);
 
         if (result.status === 'sent' || result.status === 'discarded') {
           markDone(item);
@@ -413,6 +448,13 @@
       await put('notebooks', local);
     }
 
+    for (const srvCover of (changes.notebook_covers || [])) {
+      const local = notebooksAll.find(nb => nb.server_id === srvCover.notebook_id);
+      if (!local) continue;
+      if (await queueHasUnsynced(queue, 'notebook_cover', local.id)) continue;
+      await window.v340ApplyServerCover(local, srvCover);
+    }
+
     for (const srvSp of (changes.spreads || [])) {
       let local = spreadsAll.find(sp => sp.server_id === srvSp.id);
       const nb = notebooksAll.find(row => row.server_id === srvSp.notebook_id);
@@ -517,6 +559,9 @@
     }
     localNb.hidden_no_access = false;
     await put('notebooks', localNb);
+    if (data.cover && !(await queueHasUnsynced(queue, 'notebook_cover', localNb.id))) {
+      await window.v340ApplyServerCover(localNb, data.cover);
+    }
 
     const spreadIdMap = {};
     const localSpreads = await getAll('spreads');
@@ -635,4 +680,24 @@
 
   window.v340Sync = {retryDelay, retryDue, mapServerPhoto};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote};
+  // The base pull loop only knows about changes and the cursor; unread counts arrive in the same
+  // envelope, so the loop is kept here where the server response is available.
+  pullChanges = async function () {
+    let hasMore = true;
+    let guard = 0;
+    while (hasMore && guard < 20) {
+      guard++;
+      const data = await api(`/api/sync?since=${settings.sync_cursor}&limit=500`);
+      await applyChangeBatch(data.changes || {});
+      if (data.unread) {
+        settings.unread_by_notebook = data.unread.notebooks || {};
+        settings.unread_total = data.unread.total || 0;
+        await saveSettings();
+        window.BlocknotV3?.emit('unread-change');
+      }
+      settings.sync_cursor = data.next_cursor;
+      await saveSettings();
+      hasMore = !!data.has_more;
+    }
+  };
 })();
