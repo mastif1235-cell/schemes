@@ -20,6 +20,8 @@ assert.ok(!manifest.files.some(entry => entry.path === 'v3-enhancements.txt'), '
 assert.ok(!sw.includes('v3-enhancements'), 'legacy payload must not be precached');
 assert.ok(!index.includes('v3-enhancements'), 'legacy payload must not be fetched by index.html');
 assert.ok(fs.existsSync(path.join(root, 'legacy/v3-enhancements.js')), 'legacy source must be kept, not deleted');
+assert.ok(!fs.existsSync(path.join(root, 'v3-loader.js')), 'the unused legacy loader must not stay in the published root');
+assert.ok(fs.existsSync(path.join(root, 'legacy/v3-loader.js')), 'the unused legacy loader is archived, not deleted');
 
 for (const file of [...runtimeFiles, 'index.html', 'sw.js']) {
   const source = read(file);
