@@ -146,11 +146,41 @@ async function testIncrementalPhotoMappingMatchesSnapshotFields() {
   assert.equal(mapped.upload_status, 'synced');
 }
 
+async function testQueuedSpreadDeleteSurvivesSnapshot() {
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', number:1, deleted_at:'2026-09-12T10:00:00.000Z'}],
+    sync_queue:[{id:7, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0, payload:{op:'delete'}}]
+  });
+  let request = null;
+  runtime.setApi(async (path, options) => { request = {path, method:options.method}; return {ok:true}; });
+  await runtime.context.pushEntityQueue(false);
+  assert.deepEqual(request, {path:'/api/spreads/sp-server', method:'DELETE'}, 'offline delete reaches the server through the existing route');
+  assert.equal(runtime.db.sync_queue.get(7).status, 'done');
+  assert.ok(runtime.db.spreads.get('sp-local').deleted_at, 'local tombstone is kept');
+
+  const activeSnapshot = async () => ({notebook:{id:'nb-server', title:'nb'},
+    spreads:[{id:'sp-server', notebook_id:'nb-server', number:1, deleted_at:null}],
+    photos:[], tags:[], spread_tags:[], favorites:[]});
+  runtime.db.sync_queue.set(8, {id:8, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0, payload:{op:'delete'}});
+  runtime.setApi(activeSnapshot);
+  await runtime.context.applySnapshot('nb-server');
+  assert.ok(runtime.db.spreads.get('sp-local').deleted_at, 'an unsynced delete must survive a snapshot that still lists the spread');
+
+  runtime.db.sync_queue.set(8, {id:8, entity:'spread', local_id:'sp-local', status:'done'});
+  runtime.setApi(async () => ({notebook:{id:'nb-server', title:'nb'},
+    spreads:[{id:'sp-server', notebook_id:'nb-server', number:1, deleted_at:'2026-09-12T11:00:00.000Z'}],
+    photos:[], tags:[], spread_tags:[], favorites:[]}));
+  await runtime.context.applySnapshot('nb-server');
+  assert.equal(runtime.db.spreads.get('sp-local').deleted_at, '2026-09-12T11:00:00.000Z', 'confirmed server tombstone wins');
+}
+
 await testDeferredDependencyStaysPending();
 await testFailedRetryBackoffAndManualRetry();
 await testConflictIsNotMarkedDone();
 await testPullPreservesPendingLocalEdit();
 await testIncrementalPhotoMappingMatchesSnapshotFields();
+await testQueuedSpreadDeleteSurvivesSnapshot();
 
 const teamSeed = {
   notebooks:[{id:'nb',server_id:'remote-nb'}],

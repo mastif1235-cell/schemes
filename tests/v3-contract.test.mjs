@@ -33,7 +33,8 @@ assert.match(ui, /route\.screen !== 'spreads'/);
 assert.match(ui, /route = \{screen:'search', notebookId\}/);
 assert.doesNotMatch(ui, /data-scope="global"/);
 assert.match(ui, /dataset\.notebookId = notebook\.id/);
-assert.match(ui, /Блокнот-скан · v3\.4\.2 · Stable/);
+assert.match(ui, /Блокнот-скан · v' \+ \(window\.__BLOCKNOT_APP_VERSION__ \|\| ''\) \+ ' · Stable/);
+assert.doesNotMatch(ui, /v3\.4\.2 · Stable/);
 assert.doesNotMatch(ui, /v3\.4\.0 RC/);
 
 const photos = read('v3-photos.js');
@@ -58,7 +59,7 @@ assert.match(photos, /new ImageDecoder\(\{data:blob\.stream\(\), type:blob\.type
 assert.match(photos, /createImageBitmap\(blob, options\)/);
 assert.match(photos, /previous original intact/);
 assert.match(photos, /Поворот сохранён новой версией фото/);
-assert.match(photos, /attachPhoto\(spread, file\)/);
+assert.match(photos, /attachPhoto\(spread, file, \{notebookId:spread\.notebook_id, spreadId:spread\.id\}\)/);
 assert.match(photos, /data-action="rotate-left"/);
 assert.match(photos, /data-action="rotate-right"/);
 

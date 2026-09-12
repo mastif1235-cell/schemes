@@ -10,7 +10,7 @@ let html = gunzipSync(Buffer.from([1,2,3,4].map(n=>read(`chunk${n}.txt`)).join('
 const fixtureName = 'blocknot-fixture-' + randomUUID();
 html = html.replace(/DB_NAME\s*=\s*'blocknotDB'/,`DB_NAME = '${fixtureName}'`);
 if (!html.includes(fixtureName) || /DB_NAME\s*=\s*'blocknotDB'/.test(html)) throw new Error('Fixture DB isolation failed');
-const scripts = manifest.files.filter(entry=>!entry.path.startsWith('chunk')).map(entry=>entry.path==='v3-enhancements.txt' ? gunzipSync(Buffer.from(read(entry.path).trim(),'base64')).toString() : read(entry.path)).join('\n');
+const scripts = manifest.files.filter(entry=>!entry.path.startsWith('chunk')).map(entry=>read(entry.path)).join('\n');
 const fixture = readFileSync(new URL('./team-preview-fixture.js',import.meta.url),'utf8');
 html = html.replace('// ===================== INIT =====================',`const fixtureV2Open = openDB;\n${scripts}\n// ===================== INIT =====================`);
 const begin = html.indexOf('(async function init(){');

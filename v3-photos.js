@@ -1,5 +1,7 @@
 /* Blocknot Scan v3.4.0: photo state, original resolution and leak-free viewer. */
 (function () {
+  const UNSYNCED_QUEUE = new Set(['pending','syncing','failed','conflict']);
+
   async function renderNotes(host, spread) {
     if (!host?.isConnected) return;
     const team = window.vNextSync;
@@ -166,7 +168,14 @@
     if (spread) return window.v340OpenSpread(spread);
   };
 
-  attachPhoto = async function (spread, file) {
+  attachPhoto = async function (spread, file, explicitTarget) {
+    if (!spread || !file) return null;
+    const frozen = window.BlocknotV3.photoTarget && window.BlocknotV3.photoTarget.current();
+    const target = explicitTarget
+      || (frozen && frozen.notebookId ? frozen : null)
+      || {notebookId:spread.notebook_id, spreadId:spread.id};
+    const guard = window.v340ValidatePhotoTarget(spread, target);
+    if (guard) throw new Error(guard);
     const thumbBlob = await makeThumbnail(file), photoId = uid(), createdAt = nowISO();
     // Read the latest spread inside the write transaction, never a stale viewer/form copy.
     const saved = await new Promise((resolve,reject) => {
@@ -177,7 +186,8 @@
       const request = transaction.objectStore('spreads').get(spread.id);
       request.onsuccess = () => {
         latest = request.result;
-        if (!latest || latest.deleted_at) { transaction.abort(); return; }
+        const invalid = window.v340ValidatePhotoTarget(latest, target);
+        if (invalid) { transaction.abort(); reject(new Error(invalid)); return; }
         const photos = transaction.objectStore('photos');
         const previous = photos.index('spread_id').getAll(spread.id);
         previous.onsuccess = () => {
@@ -196,9 +206,11 @@
       };
     });
     Object.assign(spread,saved);
+    if (window.BlocknotV3.photoTarget) window.BlocknotV3.photoTarget.clear();
     await logHistory(spread.id,'Фото добавлено/заменено');
     // The upload route itself advances current_photo_id. No stale metadata PATCH is needed.
     void fullSync();
+    return saved;
   };
 
   openViewer = async function (spreads, initialIndex) {
@@ -406,7 +418,7 @@
             const extension = rotated.type === 'image/png' ? 'png' : 'jpg';
             const file = new File([rotated], `spread_${spread.number}_rotated.${extension}`, {type:rotated.type, lastModified:Date.now()});
             // attachPhoto creates a new normal photo revision and leaves the previous original intact.
-            await attachPhoto(spread, file);
+            await attachPhoto(spread, file, {notebookId:spread.notebook_id, spreadId:spread.id});
             toast('Поворот сохранён новой версией фото');
             draw();
           } catch (error) {
@@ -424,7 +436,7 @@
         else if (action === 'replace') {
           if (typeof window.v340CapturePhoto !== 'function') { toast('Камера недоступна'); return; }
           const file = await window.v340CapturePhoto();
-          if (file) { await attachPhoto(spread, file); draw(); }
+          if (file) { await attachPhoto(spread, file, {notebookId:spread.notebook_id, spreadId:spread.id}); draw(); }
         } else if (action === 'download') {
           if (!photo) return;
           const download = await window.v340ResolvePhotoBlob(photo, true);
@@ -437,11 +449,34 @@
           finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
         } else if (action === 'telegram' && photo && photo.telegram_link) window.open(photo.telegram_link, '_blank');
         else if (action === 'delete') {
-          confirmAction('Удалить этот разворот?', async () => {
-            spread.deleted_at = nowISO(); spread.favorite = false;
-            await put('spreads', spread); await del('user_favorites', spread.id);
-            if (isAuthed() && spread.server_id) api(`/api/spreads/${spread.server_id}`, {method:'DELETE'}).catch(error => console.warn('Remote delete failed', error));
-            finish(); route = {screen:'spreads', notebookId:spread.notebook_id}; render();
+          confirmAction('Удалить этот разворот? Запись переместится в корзину.', async () => {
+            const button = event.target.closest('[data-action="delete"]');
+            const label = button ? button.textContent : '';
+            if (button) { button.disabled = true; button.textContent = 'Удаляю…'; }
+            try {
+              const queue = await getAll('sync_queue');
+              const photoIds = new Set((await getAll('photos')).filter(row => row.spread_id === spread.id).map(row => row.id));
+              // Photos of a deleted spread can no longer be uploaded, so their outbox entries are
+              // retired instead of retrying forever. Local blobs are kept (no hard delete).
+              const retired = queue.filter(item => UNSYNCED_QUEUE.has(item.status)
+                  && ((item.entity === 'spread' && item.local_id === spread.id)
+                    || (item.entity === 'photo' && photoIds.has(item.photo_id))))
+                .map(item => ({...item, status:'done', last_error:'superseded by local spread delete'}));
+              await window.vNextAtomic('spreads', spread.id, current => {
+                if (!current) throw new Error('Разворот недоступен');
+                const now = nowISO();
+                return {row:{...current, deleted_at:current.deleted_at || now, favorite:false, updated_at:now},
+                  item:{entity:'spread', local_id:spread.id, status:'pending', retry_count:0, payload:{op:'delete'}},
+                  retired};
+              });
+              try { await del('user_favorites', spread.id); } catch (error) { console.warn('Favorite reference could not be removed', error); }
+              finish(); route = {screen:'spreads', notebookId:spread.notebook_id}; render();
+              toast('Разворот в корзине. Удаление синхронизируется.');
+            } catch (error) {
+              console.error('Spread delete failed', error);
+              if (button) { button.disabled = false; button.textContent = label; }
+              toast('Не удалось удалить: ' + (error.message || error));
+            }
           });
         } else if (action === 'server' && spread.conflict) {
           Object.assign(spread, {...spread.conflict, conflict:null});

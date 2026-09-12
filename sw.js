@@ -1,11 +1,16 @@
-// Блокнот-скан v3.4.2 — atomic offline application shell.
+// Блокнот-скан — atomic offline application shell. Release identity comes from version.json
+// through the generated version.js bridge, so the cache name always matches the release.
+importScripts('./version.js');
 const CACHE_PREFIX = 'blocknot-shell-';
-const CACHE = CACHE_PREFIX + 'v342-stable-1';
+const RELEASE = String(self.__BLOCKNOT_VERSION__ || '').replace(/[^0-9A-Za-z.]/g, '');
+if (!RELEASE) throw new Error('version.js did not provide a release version');
+const CACHE = CACHE_PREFIX + 'v' + RELEASE;
 const SHELL = [
   './', './index.html', './manifest.json', './icon.svg',
   './app-v3-manifest.json',
+  './version.json', './version.js',
   './chunk1.txt', './chunk2.txt', './chunk3.txt', './chunk4.txt',
-  './v3-enhancements.txt', './v3-sync.js', './v3-core.js', './v3-photos.js',
+  './v3-sync.js', './v3-core.js', './v3-photos.js',
   './v3-camera.js', './v3-history.js', './v3-ui.js'
 ];
 

@@ -18,7 +18,7 @@ function createWorker({failInstall = false, offline = true} = {}) {
   };
   const caches = {
     open: async () => cache,
-    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable', 'blocknot-shell-v342-stable-1', 'unrelated-cache'],
+    keys: async () => ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable', 'blocknot-shell-v342-stable-1', 'blocknot-shell-v3.4.2', 'unrelated-cache'],
     delete: async key => { deleted.push(key); return true; },
     match: async request => {
       const key = typeof request === 'string' ? request : new URL(request.url).pathname.split('/').pop();
@@ -33,6 +33,10 @@ function createWorker({failInstall = false, offline = true} = {}) {
   };
   const context = {
     self, caches, URL, Request, Response, Promise,
+    importScripts:url => {
+      assert.equal(url, './version.js', 'release version must come from the generated bridge');
+      self.__BLOCKNOT_VERSION__ = '3.4.2';
+    },
     fetch:async request => {
       if (offline) throw new Error('offline');
       return new Response('network:' + request.url);
@@ -84,7 +88,7 @@ assert.doesNotMatch(indexSource, /location\.replace\s*\(/);
 {
   const worker = createWorker();
   await dispatchWait(worker.handlers.activate);
-  assert.deepEqual(worker.deleted, ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable']);
+  assert.deepEqual(worker.deleted, ['blocknot-shell-v30', 'blocknot-shell-v340', 'blocknot-shell-v340-stable', 'blocknot-shell-v341-stable', 'blocknot-shell-v342-stable-1']);
 }
 
 console.log('sw-offline: PASS');

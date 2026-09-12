@@ -398,7 +398,7 @@
           for (const link of links.filter(row => row.tag_id === tag.id)) await del('spread_tags',link.id);
           await queueEntityChange('tag_link',spread.id,{tag_id:tag.id,op:'remove'});
         }
-        if (photoFile) await attachPhoto(await get('spreads',spread.id),photoFile);
+        if (photoFile) await attachPhoto(await get('spreads',spread.id),photoFile,{notebookId:notebookId,spreadId:spread.id});
         close(); toast('Сохранено на устройстве'); route = {screen:'spreads',notebookId}; render();
       } catch (error) { console.warn('Field edit failed',error); el.querySelector('[data-fields-error]').textContent = error.message; event.target.disabled = false; }
     };
@@ -422,7 +422,7 @@
       syncButton.insertAdjacentElement('afterend', invite);
     }
     const footer = [...screenEl.querySelectorAll('div')].find(element => /Блокнот-скан\s*·/.test(element.textContent || '') && element.children.length === 0);
-    if (footer) footer.textContent = 'Блокнот-скан · v3.4.2 · Stable';
+    if (footer) footer.textContent = 'Блокнот-скан · v' + (window.__BLOCKNOT_APP_VERSION__ || '') + ' · Stable';
     screenEl.querySelectorAll('.settings-row').forEach(row => row.classList.add('v340-settings-card'));
   };
 })();

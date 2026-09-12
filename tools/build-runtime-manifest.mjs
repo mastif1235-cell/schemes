@@ -5,14 +5,15 @@ import {fileURLToPath} from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outputPath = path.join(root, 'app-v3-manifest.json');
+const version = JSON.parse(fs.readFileSync(path.join(root, 'version.json'), 'utf8')).version;
 const runtimeFiles = [
   'chunk1.txt', 'chunk2.txt', 'chunk3.txt', 'chunk4.txt',
-  'v3-enhancements.txt', 'v3-sync.js', 'v3-core.js', 'v3-photos.js',
+  'v3-sync.js', 'v3-core.js', 'v3-photos.js',
   'v3-camera.js', 'v3-history.js', 'v3-ui.js'
 ];
 
 const manifest = {
-  version:'3.4.2',
+  version,
   files:runtimeFiles.map(file => ({
     path:file,
     sha256:crypto.createHash('sha256')

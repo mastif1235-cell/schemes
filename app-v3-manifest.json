@@ -18,24 +18,20 @@
       "sha256": "a4371144e6951960ffdcbb2bad6f4c197acb45ebc6a09cf775728ec0f97e3d20"
     },
     {
-      "path": "v3-enhancements.txt",
-      "sha256": "064ccc64578b9f58461b6fdd3cc2b243159b61daaa3677b7be32097ea822f0fe"
-    },
-    {
       "path": "v3-sync.js",
-      "sha256": "cbe700e9202122e16a692fb9503c615ffb98392b0c86aae5c4737fc07e6d605d"
+      "sha256": "c6950d1753a63206ac753785e588e4670352bcb83d216ca4868c23f567bce587"
     },
     {
       "path": "v3-core.js",
-      "sha256": "73dbe999c0e5d0a980d9b408a8186363eabecbb37b640630b433c1217b685fba"
+      "sha256": "c6d40d7171fd8d29566e8f16f595cf2539310c81a52159ae97ac3aa24abae21b"
     },
     {
       "path": "v3-photos.js",
-      "sha256": "3e69fa2bd6340b45b41d3904f8126149d5ad7ba2e3d6b018b1b5f3f1c1b3edeb"
+      "sha256": "65b8cde8a37b724cbde3667fc4e5767faff0837a4fea5b23d9cf3b764e8f339a"
     },
     {
       "path": "v3-camera.js",
-      "sha256": "07b311f6c42210ff5f9477811ab615c5a1436656e49f9765ef572f1e29217a48"
+      "sha256": "20a53b5279932a2fd39c6155ee2eb6d62a698738c3ed2993c43f631240a6fa68"
     },
     {
       "path": "v3-history.js",
@@ -43,7 +39,7 @@
     },
     {
       "path": "v3-ui.js",
-      "sha256": "fb0ba0f82d7c8be1b8705fb9171f67e0dc443143887bee43edb7b18a0a90eef6"
+      "sha256": "0a56d803381b03c319ae23c6263830b4b16eea1f6d4a363cbb830d140154d735"
     }
   ]
 }

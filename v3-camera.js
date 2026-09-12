@@ -242,8 +242,21 @@
   };
 
   startCapture = async function (notebookId) {
-    const file = await window.v340CapturePhoto();
-    if (file) await openSpreadForm(notebookId, null, file);
+    const targetNotebookId = notebookId ? String(notebookId) : null;
+    if (!targetNotebookId) { toast('Не удалось определить блокнот — повторите'); return; }
+    // Freeze the target before the first await. File picker, camera, crop, sheet close and any
+    // re-render after this point must not be able to move the photo to another notebook.
+    window.BlocknotV3.photoTarget.set({notebookId:targetNotebookId, spreadId:null});
+    try {
+      const file = await window.v340CapturePhoto();
+      if (!file) return;
+      await openSpreadForm(targetNotebookId, null, file);
+    } catch (error) {
+      console.error('Photo capture flow failed', error);
+      toast(error.message || 'Не удалось добавить фото');
+    } finally {
+      window.BlocknotV3.photoTarget.clear();
+    }
   };
 
   v3ChoosePageCapture = async function (originalInput) {

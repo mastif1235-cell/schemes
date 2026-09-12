@@ -1,39 +1,27 @@
 /* Blocknot Scan v3.4.0: consolidated core, notebook actions, recents and local covers. */
 (function () {
-  window.__BLOCKNOT_LEGACY_DISABLED__ = true;
-  v3DecoratePhotos = async function () {};
-  v3RenderRecentsIfUseful = async function () {};
   const RECENTS_KEY = 'blocknot_v3_recent_spreads';
   const COVER_PREFIX = 'notebook_cover_';
   const COVER_REMOVED_PREFIX = 'blocknot_cover_removed_';
   const LEGACY_COVER_RE = /\s*\[\[BNSCOVER:([A-Za-z0-9+/=]+)\]\]\s*/g;
   const baseOpenDB = openDB;
   let vNextOpenPromise = null;
-  const baseOpenNotebookEditor = openNotebookEditorV2 || openNotebookEditor;
+  // openNotebookEditorV2 only existed in the removed legacy layer; keep the lookup optional.
+  const baseOpenNotebookEditor = typeof openNotebookEditorV2 === 'function' ? openNotebookEditorV2 : openNotebookEditor;
 
-  function isCoverRemoved(notebookId) {
-    try { return localStorage.getItem(COVER_REMOVED_PREFIX + notebookId) === '1'; }
+  // Cover deletion is stored in IndexedDB, not localStorage: the tombstone must survive a
+  // storage wipe of unrelated keys and must not be a single point of truth outside the data model.
+  async function isCoverRemoved(notebookId) {
+    try { return !!(await get('blobs', COVER_REMOVED_PREFIX + notebookId)); }
     catch (error) { console.warn('Cannot read local cover state', notebookId, error); return false; }
   }
 
-  function setCoverRemoved(notebookId, removed) {
+  async function setCoverRemoved(notebookId, removed) {
     try {
-      if (removed) localStorage.setItem(COVER_REMOVED_PREFIX + notebookId, '1');
-      else localStorage.removeItem(COVER_REMOVED_PREFIX + notebookId);
+      if (removed) await put('blobs', {id:COVER_REMOVED_PREFIX + notebookId, removed_at:nowISO()});
+      else await del('blobs', COVER_REMOVED_PREFIX + notebookId);
     } catch (error) { console.warn('Cannot update local cover state', notebookId, error); }
   }
-
-  if (typeof v3Observer !== 'undefined') v3Observer.disconnect();
-  if (typeof v3DecorateTimer !== 'undefined') clearTimeout(v3DecorateTimer);
-  if (typeof v323Observer !== 'undefined') v323Observer.disconnect();
-  if (typeof v328Observer !== 'undefined') v328Observer.disconnect();
-  if (typeof v329Observer !== 'undefined') v329Observer.disconnect();
-  if (typeof v331Observer !== 'undefined') v331Observer.disconnect();
-  if (typeof v334Observer !== 'undefined') v334Observer.disconnect();
-  if (typeof v337Observer !== 'undefined') v337Observer.disconnect();
-  if (typeof v338CoverObserver !== 'undefined') v338CoverObserver.disconnect();
-  if (typeof v321TickInterval !== 'undefined') clearInterval(v321TickInterval);
-  if (typeof v323DecorateInterval !== 'undefined') clearInterval(v323DecorateInterval);
 
   window.BlocknotV3 = window.BlocknotV3 || {
     listeners:new Map(),
@@ -48,6 +36,38 @@
       }
     }
   };
+
+  const photoTargetState = {notebookId:null, spreadId:null, startedAt:0};
+
+  // The photo operation target is frozen when the operation starts. It must survive the file
+  // picker, the camera, crop, awaits and sheet open/close, and must never be re-read from the
+  // route, the DOM or "last notebook" state after an await.
+  function setPhotoTarget(target) {
+    photoTargetState.notebookId = target && target.notebookId ? String(target.notebookId) : null;
+    photoTargetState.spreadId = target && target.spreadId ? String(target.spreadId) : null;
+    photoTargetState.startedAt = Date.now();
+    return currentPhotoTarget();
+  }
+
+  function currentPhotoTarget() {
+    return {notebookId:photoTargetState.notebookId, spreadId:photoTargetState.spreadId, startedAt:photoTargetState.startedAt};
+  }
+
+  function clearPhotoTarget() {
+    photoTargetState.notebookId = null; photoTargetState.spreadId = null; photoTargetState.startedAt = 0;
+  }
+
+  // Pure guard, covered by tests: returns an error message, or null when the write is allowed.
+  function validatePhotoTarget(spread, target) {
+    if (!target || !target.notebookId) return 'Не определён целевой блокнот — добавьте фото заново';
+    if (!spread || spread.deleted_at) return 'Разворот удалён или недоступен — фото не сохранено';
+    if (target.spreadId && String(spread.id) !== String(target.spreadId)) return 'Разворот изменился — добавьте фото заново';
+    if (String(spread.notebook_id) !== String(target.notebookId)) return 'Фото не сохранено: разворот принадлежит другому блокноту';
+    return null;
+  }
+
+  window.v340ValidatePhotoTarget = validatePhotoTarget;
+  BlocknotV3.photoTarget = {set:setPhotoTarget, current:currentPhotoTarget, clear:clearPhotoTarget};
 
   function loadRecents() {
     try {
@@ -167,6 +187,7 @@
     return new Promise(resolve => {
       const input = document.createElement('input');
       input.type = 'file'; input.accept = 'image/*'; input.hidden = true;
+      input.dataset.v3InternalPicker = '1';
       if (capture) input.setAttribute('capture', 'environment');
       let settled = false;
       const finish = file => {
@@ -201,7 +222,7 @@
     if (!notebook || !file) return;
     const blob = await cropCover(file);
     await put('blobs', {id:COVER_PREFIX + notebook.id, blob});
-    setCoverRemoved(notebook.id, false);
+    await setCoverRemoved(notebook.id, false);
     toast('Обложка сохранена на этом устройстве');
     BlocknotV3.emit('cover-change', notebook.id);
     render();
@@ -238,7 +259,7 @@
       setTimeout(release, 30000);
       button.onclick = async () => {
         await put('blobs', {id:COVER_PREFIX + notebook.id, blob:choice.blob});
-        setCoverRemoved(notebook.id, false);
+        await setCoverRemoved(notebook.id, false);
         release(); close(); render(); toast('Обложка сохранена на этом устройстве');
       };
       el.querySelector('.v340-cover-grid').appendChild(button);
@@ -265,26 +286,36 @@
         await chooseCoverFromSpreads(notebook, close);
       } else if (button.dataset.action === 'remove') {
         await del('blobs', COVER_PREFIX + notebook.id);
-        setCoverRemoved(notebook.id, true);
+        await setCoverRemoved(notebook.id, true);
         close(); render(); toast('Обложка удалена с этого устройства');
       }
     };
   };
 
   getNotebookCoverUrl = async function (notebook) {
-    if (!notebook || isCoverRemoved(notebook.id)) return null;
+    if (!notebook || await isCoverRemoved(notebook.id)) return null;
     const local = await get('blobs', COVER_PREFIX + notebook.id);
     if (local && local.blob) return URL.createObjectURL(local.blob);
-    if (notebook.cover_photo_id) {
-      const photo = await get('blobs', notebook.cover_photo_id + '_thumb');
-      if (photo && photo.blob) return URL.createObjectURL(photo.blob);
-    }
+    // No legacy cover_photo_id fallback: a deleted cover must never come back from another field.
     return null;
   };
 
   async function migrateLegacyCoverMarkers() {
     const notebooks = await getAll('notebooks');
     for (const notebook of notebooks) {
+      try {
+        if (localStorage.getItem(COVER_REMOVED_PREFIX + notebook.id) === '1') {
+          await setCoverRemoved(notebook.id, true);
+          localStorage.removeItem(COVER_REMOVED_PREFIX + notebook.id);
+        }
+      } catch (error) { console.warn('Legacy cover tombstone could not be migrated', notebook.id, error); }
+      const hasLocalCover = !!(await get('blobs', COVER_PREFIX + notebook.id));
+      if (!hasLocalCover && !(await isCoverRemoved(notebook.id)) && notebook.cover_photo_id) {
+        const thumbnail = await get('blobs', notebook.cover_photo_id + '_thumb');
+        if (thumbnail && thumbnail.blob) {
+          await put('blobs', {id:COVER_PREFIX + notebook.id, blob:thumbnail.blob, migrated_from:notebook.cover_photo_id});
+        }
+      }
       const before = String(notebook.description || '');
       const after = before.replace(LEGACY_COVER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
       if (before === after) continue;

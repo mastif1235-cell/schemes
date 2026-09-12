@@ -205,6 +205,22 @@
   pushSpread = async function (item) {
     const sp = await get('spreads', item.local_id);
     if (!sp) return queueResult('discarded', 'local spread no longer exists');
+    if (item.payload && item.payload.op === 'delete') {
+      // A local delete must reach the server; otherwise the next snapshot restores the spread.
+      // Local-only spreads (no server id) are already deleted as far as the server is concerned.
+      const deletedAt = sp.deleted_at || nowISO();
+      const nb = await get('notebooks', sp.notebook_id);
+      if (!sp.server_id || !nb || !nb.server_id) {
+        await put('spreads', {...sp, deleted_at:deletedAt});
+        return queueResult('sent');
+      }
+      try { await api(`/api/spreads/${sp.server_id}`, {method:'DELETE'}); }
+      catch (error) {
+        if (!error || error.status !== 404) throw error;
+      }
+      await put('spreads', {...sp, deleted_at:deletedAt});
+      return queueResult('sent');
+    }
     const nb = await get('notebooks', sp.notebook_id);
     if (!nb || !nb.server_id) return queueResult('deferred', 'notebook has no server id');
     if (!sp.server_id) {

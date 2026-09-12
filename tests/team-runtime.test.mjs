@@ -118,6 +118,27 @@ try {
   await page.locator('.viewer').waitFor();
   await page.goBack();
   await page.locator('.viewer').waitFor({state:'detached'});
+  // The frozen photo target must refuse a spread that belongs to another notebook.
+  assert.equal(await page.evaluate(async () => {
+    const spread=await get('spreads','s1');
+    const canvas=document.createElement('canvas');canvas.width=16;canvas.height=8;
+    const blob=await new Promise(res=>canvas.toBlob(res,'image/png'));
+    try {
+      await attachPhoto(spread,new File([blob],'guard.png',{type:'image/png'}),{notebookId:'another-notebook',spreadId:'s1'});
+      return 'allowed';
+    } catch (error) { return error.message; }
+  }),'Фото не сохранено: разворот принадлежит другому блокноту');
+  // No global file-input hook: a plain image input must not open the page camera/crop flow.
+  assert.equal(await page.evaluate(async () => {
+    const input=document.createElement('input');input.type='file';input.accept='image/*';
+    document.body.appendChild(input);input.click();
+    await new Promise(res=>setTimeout(res,80));
+    const leaked=!!document.querySelector('.sheet-backdrop.v340-camera-sheet')||!!document.querySelector('.v340-crop-backdrop');
+    input.remove();
+    return leaked;
+  }),false,'cover/gallery picker must not be hijacked by the page camera flow');
+  assert.equal(await page.evaluate(() => typeof v3PhotoFromImage),'undefined','legacy runtime must not be loaded');
+  assert.equal(await page.evaluate(() => URL.createObjectURL.toString().includes('v3BlobKeyByUrl')),false,'URL helpers must not be monkey-patched');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, own notes, metadata, photo safety, reorder, history, viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }
