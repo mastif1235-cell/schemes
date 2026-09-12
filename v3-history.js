@@ -191,8 +191,17 @@
           <small> · ${esc(new Date(eventTime(row)).toLocaleString('ru-RU'))}</small>
           <div>${esc(notebook?.title || row.notebook_title || '')}${row.spread_number || spread ? ' · №' + esc(row.spread_number ?? spread?.number ?? '') : ''}</div>
           <div>${esc(actionLabel(row.action))}${spread && spread.deleted_at ? ' · Разворот удалён' : ''}</div></div>
-          ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open>Открыть</button>' : ''}`;
-        item.querySelector('[data-open]')?.addEventListener('click', async () => { close(); await window.v340OpenSpread(spread); });
+          ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open>Открыть</button>'
+            : (!row.spread_id && notebook?.server_id ? '<button class="btn-secondary" data-mark-notebook>Отметить прочитанным</button>' : '')}`;
+        item.querySelector('[data-open]')?.addEventListener('click', async () => {
+          close();
+          await window.v340OpenSpread(spread, {returnToHistory:true});
+        });
+        item.querySelector('[data-mark-notebook]')?.addEventListener('click', async event => {
+          event.target.disabled = true;
+          await markNotebookSeen(notebook.server_id);
+          await draw();
+        });
         host.appendChild(item);
       }
     }

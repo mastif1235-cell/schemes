@@ -83,7 +83,12 @@ async function requireMembership(env, userId, notebookId, needOwner = false) {
   const row = await env.DB.prepare(
     'SELECT role FROM notebook_members WHERE notebook_id=? AND user_id=? AND revoked_at IS NULL'
   ).bind(notebookId, userId).first();
-  if (!row) throw new HttpError(403, 'no_access');
+  if (!row) {
+    // Access must not depend on an owner row inside notebook_members.
+    const owner = await env.DB.prepare('SELECT id FROM notebooks WHERE id=? AND owner_id=?').bind(notebookId, userId).first();
+    if (!owner) throw new HttpError(403, 'no_access');
+    return 'OWNER';
+  }
   if (needOwner && row.role !== 'OWNER') throw new HttpError(403, 'owner_required');
   return row.role;
 }
@@ -262,8 +267,9 @@ async function unreadState(env, userId, notebookIds) {
 
 async function unreadForUser(env, userId) {
   const rows = await env.DB.prepare(
-    'SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL'
-  ).bind(userId).all();
+    `SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL
+     UNION SELECT id AS notebook_id FROM notebooks WHERE owner_id=? AND deleted_at IS NULL`
+  ).bind(userId, userId).all();
   return unreadState(env, userId, rows.results.map(row => row.notebook_id));
 }
 
@@ -1451,8 +1457,9 @@ on('GET', '/api/sync', async (request, env) => {
   const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 500, 1), 1000);
 
   const nbRows = await env.DB.prepare(
-    'SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL'
-  ).bind(u.userId).all();
+    `SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL
+     UNION SELECT id AS notebook_id FROM notebooks WHERE owner_id=? AND deleted_at IS NULL`
+  ).bind(u.userId, u.userId).all();
   const notebookIds = nbRows.results.map(r => r.notebook_id);
   const coverReady = await hasCoverSchema(env);
   if (notebookIds.length === 0) return json({ changes: {

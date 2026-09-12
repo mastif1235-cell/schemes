@@ -643,14 +643,22 @@
         const me = await api('/api/me');
         assertScope(sessionScope);
         settings.team_capabilities = {scope:sessionScope, flags:me.capabilities || {}};
-        await pushEntityQueue(!!manual);
-        await pushPhotoQueue(!!manual);
-        await syncMembership();
+        // One failing push step must never skip the pull: history/unread would silently stop
+        // updating (content still arrives through its own refetch), which is exactly the bug we hit.
+        try { await pushEntityQueue(!!manual); }
+        catch (error) { console.warn('Outbox push failed; continuing with pull', error); }
+        try { await pushPhotoQueue(!!manual); }
+        catch (error) { console.warn('Photo push failed; continuing with pull', error); }
+        try { await syncMembership(); }
+        catch (error) { console.warn('Membership refresh failed; continuing with pull', error); }
         if (enabled('team_notes') && settings.team_snapshot_scope !== sessionScope) {
           // Old clients already advanced the same cursor while ignoring new fields.
           // Backfill notes once without resetting that cursor or deleting local data.
           const notebooks = (await getAll('notebooks')).filter(row => row.server_id && !row.deleted_at && !row.hidden_no_access);
-          for (const notebook of notebooks) await applySnapshot(notebook.server_id);
+          for (const notebook of notebooks) {
+            try { await applySnapshot(notebook.server_id); }
+            catch (error) { console.warn('Snapshot backfill failed', notebook.server_id, error); }
+          }
           assertScope(sessionScope);
           settings.team_snapshot_scope = sessionScope;
         }

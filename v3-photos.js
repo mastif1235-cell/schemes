@@ -27,7 +27,9 @@
         || String(b.id||'').localeCompare(String(a.id||'')));
     if (!host.isConnected) return;
     host.innerHTML = `<h3>Примечания</h3><p class="vnext-note-caption">Общие для участников блокнота · ${isOnline() ? 'загруженные записи' : 'офлайн-копия'}</p>
-      <div data-note-list></div><button class="btn-secondary" data-note-add>+ Добавить примечание</button>`;
+      <div class="vnext-note-composer"><textarea data-note-input maxlength="10000" placeholder="Новое примечание"></textarea>
+      <button class="btn-secondary" data-note-add>Добавить</button></div>
+      <div data-note-list></div>`;
     const edit = note => {
       const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>${note ? 'Изменить' : 'Добавить'} примечание</h2>
         <div class="field"><label>Ваше примечание</label><textarea data-note-body maxlength="10000">${esc(note?.body || '')}</textarea></div>
@@ -38,7 +40,16 @@
         catch (error) { console.warn('Note save failed',error); el.querySelector('[data-note-error]').textContent = error.message; event.target.disabled = false; }
       };
     };
-    host.querySelector('[data-note-add]').onclick = () => edit(null);
+    host.querySelector('[data-note-add]').onclick = async () => {
+      const input = host.querySelector('[data-note-input]');
+      const body = String(input.value || '').trim();
+      if (!body) { toast('Введите примечание'); return; }
+      try {
+        await team.saveNote(spread, body, null);
+        input.value = '';
+        await renderNotes(host, spread);
+      } catch (error) { console.warn('Note save failed', error); toast(error.message); }
+    };
     for (const note of rows) {
       const conflict = note.pending && note.sync_error ? await team.noteConflict(note) : null;
       const item = document.createElement('article'); item.className = 'vnext-note';
@@ -254,6 +265,10 @@
       revokeCurrentUrl();
       window.removeEventListener('popstate', onPopState);
       overlay.remove();
+      if (window.__v340ReturnHistory) {
+        window.__v340ReturnHistory = false;
+        void window.v340OpenGlobalHistory?.();
+      }
     }
 
     function onPopState(event) {

@@ -413,7 +413,16 @@ try {
   assert.ok(db2.prepare("SELECT id FROM activity_events WHERE action='photo.added'").get());
 } finally { globalThis.fetch = nativeFetch; }
 // ---- CRITICAL A/B: shared notebook cover + per-user unread history --------------------------
-db2.prepare('UPDATE notebook_members SET revoked_at=NULL WHERE notebook_id=? AND user_id=?').run('n1', 'u2');
+  db2.prepare('UPDATE notebook_members SET revoked_at=NULL WHERE notebook_id=? AND user_id=?').run('n1', 'u2');
+  // OWNER access must not depend on an owner row inside notebook_members.
+  db2.prepare('DELETE FROM notebook_members WHERE notebook_id=? AND user_id=?').run('n1', 'u1');
+  const ownerWithoutMemberRow = await api(env2, 'GET', '/api/sync?since=0', 'token-1');
+  assert.equal(ownerWithoutMemberRow.status, 200, 'owner sync works without a notebook_members row');
+  assert.ok(ownerWithoutMemberRow.data.changes.notebooks.some(row => row.id === 'n1'), 'owner still receives the notebook');
+  assert.ok(ownerWithoutMemberRow.data.unread, 'owner still receives unread state');
+  assert.ok((await api(env2, 'GET', '/api/notebooks/n1/activity', 'token-1')).status === 200, 'owner reads history without a member row');
+  db2.prepare(`INSERT INTO notebook_members(notebook_id,user_id,role,added_at,updated_at,seq)
+    VALUES(?,?,?,?,?,?)`).run('n1', 'u1', 'OWNER', '2026-09-03T10:00:00.000Z', '2026-09-03T10:00:00.000Z', 1);
 let telegramCalls = 0;
 globalThis.fetch = async url => {
   assert.ok(String(url).startsWith('https://api.telegram.org/'), 'test must not contact external services');

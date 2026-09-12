@@ -62,9 +62,8 @@ try {
     return false;
   }),true);
   await page.evaluate(async () => window.v340OpenSpread(await get('spreads','s1')));
-  await page.getByRole('button',{name:'+ Добавить примечание',exact:true}).click();
-  await page.locator('[data-note-body]').fill('Проверил муфту — всё нормально');
-  await page.locator('[data-note-save]').click();
+  await page.locator('[data-note-input]').fill('Проверил муфту — всё нормально');
+  await page.locator('[data-note-add]').click();
   await page.getByText('Проверил муфту — всё нормально',{exact:true}).waitFor();
   assert.equal(await page.evaluate(async () => (await getAll('spread_notes')).length),1);
   await context.route(origin+'/api/spreads/remote-s1/notes',async route => {
@@ -300,6 +299,39 @@ try {
     document.querySelector('.sheet-backdrop')?.remove();
     return rows >= 1;
   }), true, 'global history is not capability-gated');
+  // Notes composer must sit above the notes list.
+  const composer = await page.evaluate(async () => {
+    settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{team_notes:true, activity:true}};
+    await window.v340OpenSpread(await get('spreads','s1'));
+    await new Promise(res => setTimeout(res, 250));
+    const host = document.querySelector('.vnext-notes');
+    const input = host?.querySelector('[data-note-input]');
+    const list = host?.querySelector('[data-note-list]');
+    const ordered = !!(input && list) && (input.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    const texts = [...(host?.querySelectorAll('[data-note-list] .vnext-note p') || [])].map(el => el.textContent);
+    document.querySelector('.viewer')?.remove();
+    return {ordered, texts};
+  });
+  assert.equal(composer.ordered,true,'notes composer is above the notes list');
+  // Back from a spread opened in History must reopen History.
+  const backToHistory = await page.evaluate(async () => {
+    settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{activity:true, activity_spread_seen:true}};
+    route = {screen:'notebooks'}; render();
+    await window.v340OpenGlobalHistory();
+    await new Promise(res => setTimeout(res, 200));
+    const row = document.querySelector('[data-server-history] [data-open]');
+    if (!row) return {opened:false};
+    row.click();
+    await new Promise(res => setTimeout(res, 200));
+    const viewerOpen = !!document.querySelector('.viewer');
+    document.querySelector('.viewer [data-action="close"]')?.click();
+    await new Promise(res => setTimeout(res, 400));
+    const historyBack = !!document.querySelector('[data-server-history]');
+    document.querySelector('.sheet-backdrop')?.remove();
+    return {opened:viewerOpen, historyBack};
+  });
+  assert.equal(backToHistory.opened,true,'history row opens the spread');
+  assert.equal(backToHistory.historyBack,true,'closing the spread returns to History');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, own notes, metadata, photo safety, reorder, history, viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

@@ -185,8 +185,9 @@
   }
   window.v340PruneRecents = pruneRecents;
 
-  window.v340OpenSpread = async function (spread) {
+  window.v340OpenSpread = async function (spread, options) {
     if (!spread || spread.deleted_at) { toast('Этот разворот больше недоступен'); return false; }
+    window.__v340ReturnHistory = !!(options && options.returnToHistory);
     v3RememberSpread(spread);
     if (typeof window.v340MarkSpreadSeen === 'function') { void window.v340MarkSpreadSeen(spread); }
     const siblings = (await getAllByIndex('spreads', 'notebook_id', spread.notebook_id))

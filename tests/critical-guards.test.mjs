@@ -178,6 +178,13 @@ assert.match(uiSource, /dataset\.spreadServerId/);
 assert.match(uiSource, /BlocknotV3\.on\('unread-change', \(\) => window\.v340RefreshBadges\(\)\)/);
 assert.match(uiSource, /window\.v340MaybeSync\?\.\(30000\)/);
 assert.match(core, /window\.v340MaybeSync = function/);
+assert.match(worker, /const owner = await env\.DB\.prepare\('SELECT id FROM notebooks WHERE id=\? AND owner_id=\?'\)/);
+assert.match(sync, /Outbox push failed; continuing with pull/);
+assert.match(read('v3-photos.js'), /vnext-note-composer/);
+assert.ok(read('v3-photos.js').indexOf('data-note-input') < read('v3-photos.js').indexOf('data-note-list'),
+  'notes composer must be rendered above the list');
+assert.match(history, /returnToHistory:true/);
+assert.match(history, /data-mark-notebook/);
 // BUG 3: newest first everywhere (seq DESC, created_at/id fallback) and a re-render when a cover arrives.
 assert.match(history, /\(Number\(b\.seq\)\|\|0\)-\(Number\(a\.seq\)\|\|0\)/);
 assert.match(history, /eventTime\(b\) - eventTime\(a\)/);
