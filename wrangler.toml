@@ -15,8 +15,11 @@
 name = "blocknot-proxy"
 main = "backend/worker.js"
 compatibility_date = "2026-09-03"
+# Keep the public surface identical to the previous script-API deployment.
+preview_urls = false
 
 [[d1_databases]]
 binding = "DB"
 database_name = "blocknot-scan-db"
-# database_id = "<paste the real id from `wrangler d1 list` here>"
+database_id = "02a1a09a-e7b3-4d2e-a52a-9b6e4e5f1098"
+migrations_dir = "backend/migrations"
