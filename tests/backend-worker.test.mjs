@@ -184,10 +184,13 @@ function tokenHash(token) {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function createFixture() {
+function createFixture({ withCover = true } = {}) {
   const sqlite = new DatabaseSync(':memory:');
   sqlite.exec(baseSchema);
   sqlite.exec(readFileSync(new URL('../backend/migrations/0001_team_history_notes.sql', import.meta.url), 'utf8'));
+  if (withCover) {
+    sqlite.exec(readFileSync(new URL('../backend/migrations/0002_notebook_covers_activity_seen.sql', import.meta.url), 'utf8'));
+  }
   const now = '2026-09-03T10:00:00.000Z';
   const expiry = '2099-01-01T00:00:00.000Z';
   const seed = sqlite.prepare.bind(sqlite);
@@ -405,6 +408,84 @@ try {
   assert.equal(db2.prepare('SELECT current_photo_id FROM spreads WHERE id=?').get('s2').current_photo_id, uploadedData.photo_id);
   assert.ok(db2.prepare("SELECT id FROM activity_events WHERE action='photo.added'").get());
 } finally { globalThis.fetch = nativeFetch; }
+// ---- CRITICAL A/B: shared notebook cover + per-user unread history --------------------------
+db2.prepare('UPDATE notebook_members SET revoked_at=NULL WHERE notebook_id=? AND user_id=?').run('n1', 'u2');
+let telegramCalls = 0;
+globalThis.fetch = async url => {
+  assert.ok(String(url).startsWith('https://api.telegram.org/'), 'test must not contact external services');
+  telegramCalls++;
+  return Response.json({ ok: true, result: { message_id: 200 + telegramCalls, document: {
+    file_id: 'cover-file-' + telegramCalls, file_unique_id: 'cover-unique-' + telegramCalls,
+    file_size: 5, mime_type: 'image/jpeg',
+  } } });
+};
+try {
+  const coverEnv = { ...env2, CHAT_ID: 'fixture-chat', BOT_TOKEN: 'fixture-only' };
+  const coverForm = new FormData();
+  coverForm.append('file', new Blob(['cover'], { type: 'image/jpeg' }), 'cover.jpg');
+  coverForm.append('preview', new Blob(['preview'], { type: 'image/webp' }), 'preview.webp');
+  coverForm.append('client_ref', 'phone-a:cover-1');
+  const coverPut = await worker.fetch(new Request('https://worker.test/api/notebooks/n1/cover', {
+    method: 'PUT', headers: { Authorization: 'Bearer token-1' }, body: coverForm,
+  }), coverEnv);
+  assert.equal(coverPut.status, 200, 'owner sets the shared cover');
+  const coverBody = await coverPut.json();
+  assert.equal(coverBody.cover.revision, 1);
+  assert.equal(coverBody.cover.deleted_at, null);
+  assert.equal(coverBody.cover.has_preview, true);
+  assert.ok(!('file_id' in coverBody.cover), 'telegram file id never leaves the worker');
+
+  const coverRetryForm = new FormData();
+  coverRetryForm.append('file', new Blob(['cover'], { type: 'image/jpeg' }), 'cover.jpg');
+  coverRetryForm.append('client_ref', 'phone-a:cover-1');
+  const coverRetry = await worker.fetch(new Request('https://worker.test/api/notebooks/n1/cover', {
+    method: 'PUT', headers: { Authorization: 'Bearer token-1' }, body: coverRetryForm,
+  }), coverEnv);
+  assert.equal((await coverRetry.json()).cover.revision, 1, 'cover retry is idempotent');
+  assert.equal(telegramCalls, 1, 'idempotent retry does not re-upload');
+
+  const preview = await worker.fetch(new Request('https://worker.test/api/notebooks/n1/cover/preview', {
+    headers: { Authorization: 'Bearer token-2' },
+  }), coverEnv);
+  assert.equal(preview.status, 200, 'member reads the shared preview');
+  assert.equal(await preview.text(), 'preview');
+  const coverFile = await worker.fetch(new Request('https://worker.test/api/notebooks/n1/cover/file', {
+    headers: { Authorization: 'Bearer token-2' },
+  }), coverEnv);
+  assert.equal(coverFile.status, 200, 'member downloads the cover through the worker');
+
+  const memberPull = await api(env2, 'GET', '/api/sync?since=0', 'token-2');
+  const coverRow = memberPull.data.changes.notebook_covers.find(row => row.notebook_id === 'n1');
+  assert.ok(coverRow && !coverRow.deleted_at, 'member receives the cover through sync');
+  assert.equal(coverRow.preview_base64, undefined, 'sync must not ship preview base64');
+  assert.ok(memberPull.data.unread.notebooks.n1.count >= 1, 'member gets an unread badge');
+  const ownerUnreadBefore = (await api(env2, 'GET', '/api/sync?since=0', 'token-1')).data.unread.notebooks.n1.count;
+
+  const seen = await api(env2, 'PUT', '/api/notebooks/n1/activity/seen', 'token-2', {});
+  assert.ok(seen.data.last_seen_seq > 0, 'seen cursor is stored server-side');
+  assert.equal((await api(env2, 'GET', '/api/sync?since=0', 'token-2')).data.unread.notebooks.n1, undefined, 'member badge clears');
+  assert.equal((await api(env2, 'GET', '/api/sync?since=0', 'token-1')).data.unread.notebooks.n1.count, ownerUnreadBefore,
+    'seen is per user: opening history on one device never clears another');
+
+  const afterSeenNote = await api(env2, 'POST', '/api/spreads/s2/notes', 'token-1', { id: 'cover-note', client_ref: 'phone-a:note-after-seen', body: 'после seen' });
+  assert.equal(afterSeenNote.status, 201, 'a new shared change is recorded after seen');
+  assert.ok((await api(env2, 'GET', '/api/sync?since=0', 'token-2')).data.unread.notebooks.n1.count >= 1,
+    'a new change raises unread again for the member');
+
+  const coverDelete = await api(env2, 'DELETE', '/api/notebooks/n1/cover', 'token-2', { client_ref: 'phone-b:cover-delete' });
+  assert.ok(coverDelete.data.cover.deleted_at, 'member can remove the cover');
+  const tombstone = (await api(env2, 'GET', '/api/sync?since=0', 'token-1')).data.changes.notebook_covers.find(row => row.notebook_id === 'n1');
+  assert.ok(tombstone.deleted_at, 'cover tombstone reaches the other device');
+  assert.equal((await worker.fetch(new Request('https://worker.test/api/notebooks/n1/cover/file', {
+    headers: { Authorization: 'Bearer token-1' },
+  }), coverEnv)).status, 404, 'removed cover is no longer downloadable');
+
+  db2.prepare('INSERT INTO users VALUES (?,?,?)').run('u9', 'Чужой', '2026-09-03T10:00:00.000Z');
+  db2.prepare('INSERT INTO sessions(id,user_id,token_hash,device_name,created_at,expires_at) VALUES(?,?,?,?,?,?)')
+    .run('session-9', 'u9', tokenHash('token-9'), 'phone-x', '2026-09-03T10:00:00.000Z', '2099-01-01T00:00:00.000Z');
+  assert.equal((await api(env2, 'GET', '/api/notebooks/n1/cover', 'token-9')).status, 403, 'cover requires membership');
+  assert.equal((await api(env2, 'PUT', '/api/notebooks/n1/activity/seen', 'token-9', {})).status, 403, 'seen requires membership');
+} finally { globalThis.fetch = nativeFetch; }
 db2.prepare('INSERT INTO history VALUES(?,?,?,?,?,?,?)').run('legacy-event', 'n1', 'spread', 's2', 'u1', 'spread_created', '2026-01-01');
 const legacyRead = await api(env2, 'GET', '/api/spreads/s2/activity');
 assert.ok(legacyRead.data.legacy_events.some(event => event.id === 'legacy-event' && event.legacy && event.old_value === null));
@@ -429,4 +510,18 @@ db2.prepare(`INSERT INTO activity_events
 const activityTie = await api(env2, 'GET', '/api/notebooks/n1/activity?limit=1');
 assert.equal(activityTie.data.events.length, 2, 'history pagination includes all seq ties');
 assert.equal(activityTie.data.next_before_seq, 2000);
-console.log('backend notes/activity/merge/reorder/photo/security compatibility tests passed (22 required scenarios + race checks)');
+
+// Deploy order is forgiving: with only migration 0001 applied the app keeps working, the new cover
+// endpoints answer 503 and the new capabilities stay hidden.
+const pre0002 = createFixture({ withCover: false });
+const preCaps = await api(pre0002.env, 'GET', '/api/me', 'token-1');
+assert.equal(preCaps.data.capabilities.notebook_cover, undefined, 'cover flag hidden before migration 0002');
+assert.equal(preCaps.data.capabilities.activity_seen, undefined, 'seen flag hidden before migration 0002');
+const preSync = await api(pre0002.env, 'GET', '/api/sync?since=0', 'token-1');
+assert.equal(preSync.status, 200, 'sync keeps working before migration 0002');
+assert.deepEqual(preSync.data.changes.notebook_covers, [], 'cover table omitted safely');
+assert.deepEqual(preSync.data.unread, { notebooks: {}, total: 0 });
+assert.equal((await api(pre0002.env, 'GET', '/api/notebooks/n1/cover', 'token-1')).status, 503);
+assert.equal((await api(pre0002.env, 'PUT', '/api/notebooks/n1/activity/seen', 'token-1', {})).status, 503);
+
+console.log('backend notes/activity/merge/reorder/photo/security tests passed (22 scenarios + race checks + cover/unread)');

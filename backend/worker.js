@@ -161,6 +161,48 @@ function publicActivity(row) {
   };
 }
 
+// Notebook cover is shared state: Telegram keeps the image, D1 keeps the reference and a small
+// preview. telegram_file_id is never exposed to clients; they download through the API.
+function publicCover(row) {
+  if (!row) return null;
+  return {
+    notebook_id: row.notebook_id,
+    revision: row.cover_revision,
+    message_id: row.telegram_message_id ?? null,
+    file_unique_id: row.telegram_file_unique_id ?? null,
+    storage_object_id: row.storage_object_id ?? null,
+    mime_type: row.mime_type ?? null,
+    file_size: row.file_size ?? null,
+    has_preview: row.preview_base64 !== undefined && row.preview_base64 !== null,
+    updated_by: row.updated_by ?? null,
+    updated_at: row.updated_at,
+    deleted_at: row.deleted_at ?? null,
+    seq: row.seq,
+  };
+}
+
+async function selectCover(env, notebookId) {
+  return env.DB.prepare('SELECT * FROM notebook_covers WHERE notebook_id=?').bind(notebookId).first();
+}
+
+// Additive migration 0002 may not be applied yet on a live database. Feature flags and sync stay
+// usable in that case instead of breaking the whole app with a 500.
+const coverSchemaCache = new WeakMap();
+async function hasCoverSchema(env) {
+  if (coverSchemaCache.has(env.DB)) return coverSchemaCache.get(env.DB);
+  let ready = false;
+  try {
+    const rows = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('notebook_covers','activity_seen')"
+    ).all();
+    ready = rows.results.length >= 2;
+  } catch (error) {
+    console.warn('Cover schema probe failed', error);
+  }
+  coverSchemaCache.set(env.DB, ready);
+  return ready;
+}
+
 async function selectNote(env, noteId) {
   return env.DB.prepare(
     `SELECT sn.*, u.display_name AS author_display_name
@@ -339,7 +381,8 @@ on('GET', '/api/me', async (request, env) => {
     'SELECT id, device_name, created_at, last_used_at, expires_at FROM sessions WHERE user_id=? AND revoked_at IS NULL ORDER BY last_used_at DESC'
   ).bind(u.userId).all();
   return json({ user: { id: u.userId, display_name: u.displayName }, devices: devices.results,
-    capabilities: { team_notes: true, activity: true, field_merge: true, spread_order: true } });
+    capabilities: { team_notes: true, activity: true, field_merge: true, spread_order: true,
+      ...(await hasCoverSchema(env) ? { notebook_cover: true, activity_seen: true } : {}) } });
 });
 
 on('DELETE', '/api/me/sessions/:id', async (request, env, p) => {
@@ -485,6 +528,7 @@ on('GET', '/api/notebooks/:id/snapshot', async (request, env, p) => {
   return json({
     notebook, spreads: spreads.results, photos: photos.results, tags: tags.results,
     spread_tags: spreadTags.results, favorites: favorites.results, members: members.results, spread_notes: notes.results,
+    cover: (await hasCoverSchema(env)) ? publicCover(await selectCover(env, p.id)) : null,
     cursor: cursorRow.m || 0,
   });
 });
@@ -940,6 +984,166 @@ on('GET', '/api/spreads/:id/activity', async (request, env, p) => {
 });
 
 // ==================================================================
+// NOTEBOOK COVER (shared, revision-aware, Telegram storage)
+// ==================================================================
+
+on('GET', '/api/notebooks/:id/cover', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  if (!(await hasCoverSchema(env))) return err(503, 'cover_not_available');
+  const notebook = await env.DB.prepare('SELECT id FROM notebooks WHERE id=?').bind(p.id).first();
+  if (!notebook) return err(404, 'not_found');
+  await requireMembership(env, u.userId, p.id);
+  return json({ cover: publicCover(await selectCover(env, p.id)) });
+});
+
+on('PUT', '/api/notebooks/:id/cover', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  if (!(await hasCoverSchema(env))) return err(503, 'cover_not_available');
+  const notebook = await env.DB.prepare('SELECT id FROM notebooks WHERE id=?').bind(p.id).first();
+  if (!notebook) return err(404, 'not_found');
+  // Any active member may set the cover, matching the existing notebook edit permission.
+  await requireMembership(env, u.userId, p.id);
+  const form = await request.formData();
+  const file = form.get('file');
+  const preview = form.get('preview');
+  const clientRef = requiredClientRef(form.get('client_ref'));
+  const existing = await env.DB.prepare(
+    'SELECT * FROM notebook_covers WHERE notebook_id=? AND client_ref=?'
+  ).bind(p.id, clientRef).first();
+  if (existing) return json({ cover: publicCover(existing) });
+  if (!file) return err(400, 'file_required');
+
+  const current = await selectCover(env, p.id);
+  const tgResult = await telegramSendDocument(env, file, `notebook_${p.id}_cover`);
+  const doc = tgResult.document;
+  const storageObjectId = encodeStorageObjectId(env.CHAT_ID, tgResult.message_id);
+  const now = nowISO();
+  const seq = await nextSeq(env);
+  let previewB64 = null, previewMime = null;
+  if (preview) {
+    const previewBuf = await preview.arrayBuffer();
+    previewB64 = btoa(String.fromCharCode(...new Uint8Array(previewBuf)));
+    previewMime = preview.type || 'image/webp';
+  }
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO notebook_covers
+        (notebook_id, cover_revision, telegram_message_id, telegram_file_id, telegram_file_unique_id,
+         storage_object_id, mime_type, file_size, preview_base64, preview_mime, updated_by, updated_at,
+         deleted_at, seq, client_ref)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)
+       ON CONFLICT(notebook_id) DO UPDATE SET
+         cover_revision=notebook_covers.cover_revision+1,
+         telegram_message_id=excluded.telegram_message_id, telegram_file_id=excluded.telegram_file_id,
+         telegram_file_unique_id=excluded.telegram_file_unique_id, storage_object_id=excluded.storage_object_id,
+         mime_type=excluded.mime_type, file_size=excluded.file_size, preview_base64=excluded.preview_base64,
+         preview_mime=excluded.preview_mime, updated_by=excluded.updated_by, updated_at=excluded.updated_at,
+         deleted_at=NULL, seq=excluded.seq, client_ref=excluded.client_ref`
+    ).bind(p.id, 1, tgResult.message_id, doc.file_id, doc.file_unique_id, storageObjectId,
+      doc.mime_type || file.type, doc.file_size ?? null, previewB64, previewMime, u.userId, now, seq, clientRef),
+    activityStatement(env, { notebookId: p.id, entity: 'notebook', entityId: p.id, actorUserId: u.userId,
+      action: 'cover.updated', revisionBefore: current?.cover_revision ?? null,
+      revisionAfter: (current?.cover_revision ?? 0) + 1,
+      oldValue: current ? { cover_revision: current.cover_revision, deleted_at: current.deleted_at } : null,
+      newValue: { cover_revision: (current?.cover_revision ?? 0) + 1, deleted_at: null },
+      payload: { operation: 'cover_upload' }, createdAt: now, seq, clientRef: 'cover-upload:' + clientRef }),
+  ]);
+  return json({ cover: publicCover(await selectCover(env, p.id)) });
+});
+
+on('DELETE', '/api/notebooks/:id/cover', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  if (!(await hasCoverSchema(env))) return err(503, 'cover_not_available');
+  const notebook = await env.DB.prepare('SELECT id FROM notebooks WHERE id=?').bind(p.id).first();
+  if (!notebook) return err(404, 'not_found');
+  await requireMembership(env, u.userId, p.id);
+  const body = await request.json().catch(() => ({}));
+  const clientRef = String(body?.client_ref || '').trim() || `cover-delete:${uuid()}`;
+  const existing = await env.DB.prepare(
+    'SELECT * FROM notebook_covers WHERE notebook_id=? AND client_ref=?'
+  ).bind(p.id, clientRef).first();
+  if (existing) return json({ cover: publicCover(existing) });
+  const current = await selectCover(env, p.id);
+  if (current && current.deleted_at) return json({ cover: publicCover(current) });
+
+  const now = nowISO();
+  const seq = await nextSeq(env);
+  const statements = [];
+  if (current) {
+    statements.push(env.DB.prepare(
+      `UPDATE notebook_covers SET deleted_at=?, cover_revision=cover_revision+1, telegram_message_id=NULL,
+       telegram_file_id=NULL, telegram_file_unique_id=NULL, storage_object_id=NULL, preview_base64=NULL,
+       preview_mime=NULL, updated_by=?, updated_at=?, seq=?, client_ref=? WHERE notebook_id=?`
+    ).bind(now, u.userId, now, seq, clientRef, p.id));
+  } else {
+    statements.push(env.DB.prepare(
+      `INSERT INTO notebook_covers (notebook_id, cover_revision, updated_by, updated_at, deleted_at, seq, client_ref)
+       VALUES (?,1,?,?,?,?,?)`
+    ).bind(p.id, u.userId, now, now, seq, clientRef));
+  }
+  statements.push(activityStatement(env, { notebookId: p.id, entity: 'notebook', entityId: p.id,
+    actorUserId: u.userId, action: 'cover.removed', revisionBefore: current?.cover_revision ?? null,
+    revisionAfter: (current?.cover_revision ?? 0) + 1,
+    oldValue: current ? { cover_revision: current.cover_revision } : null,
+    newValue: { deleted_at: now }, payload: { operation: 'cover_delete' },
+    createdAt: now, seq, clientRef: 'cover-delete:' + clientRef }));
+  await env.DB.batch(statements);
+  return json({ cover: publicCover(await selectCover(env, p.id)) });
+});
+
+on('GET', '/api/notebooks/:id/cover/file', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  if (!(await hasCoverSchema(env))) return err(503, 'cover_not_available');
+  const cover = await selectCover(env, p.id);
+  if (!cover || cover.deleted_at) return err(404, 'no_cover');
+  await requireMembership(env, u.userId, p.id);
+  if (!cover.telegram_file_id) return err(404, 'no_file');
+  const fileResp = await telegramFetchFile(env, cover.telegram_file_id);
+  return new Response(fileResp.body, {
+    headers: { 'Content-Type': cover.mime_type || 'application/octet-stream', 'Cache-Control': 'private, max-age=86400', ...cors() },
+  });
+});
+
+on('GET', '/api/notebooks/:id/cover/preview', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  if (!(await hasCoverSchema(env))) return err(503, 'cover_not_available');
+  const cover = await selectCover(env, p.id);
+  if (!cover || cover.deleted_at) return err(404, 'no_cover');
+  await requireMembership(env, u.userId, p.id);
+  if (!cover.preview_base64) return err(404, 'no_preview');
+  const bytes = Uint8Array.from(atob(cover.preview_base64), c => c.charCodeAt(0));
+  return new Response(bytes, {
+    headers: { 'Content-Type': cover.preview_mime || 'image/webp', 'Cache-Control': 'private, max-age=86400', ...cors() },
+  });
+});
+
+// Per-user read cursor for shared history. One device's "seen" never changes another user's badge.
+on('PUT', '/api/notebooks/:id/activity/seen', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  if (!(await hasCoverSchema(env))) return err(503, 'seen_not_available');
+  const notebook = await env.DB.prepare('SELECT id FROM notebooks WHERE id=?').bind(p.id).first();
+  if (!notebook) return err(404, 'not_found');
+  await requireMembership(env, u.userId, p.id);
+  const body = await request.json().catch(() => ({}));
+  const requested = Number(body?.seq);
+  let seq = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 0;
+  if (!seq) {
+    const maxRow = await env.DB.prepare('SELECT MAX(seq) AS m FROM activity_events WHERE notebook_id=?').bind(p.id).first();
+    seq = maxRow?.m || 0;
+  }
+  const now = nowISO();
+  await env.DB.prepare(
+    `INSERT INTO activity_seen (user_id, notebook_id, last_seen_seq, updated_at) VALUES (?,?,?,?)
+     ON CONFLICT(user_id, notebook_id) DO UPDATE SET
+       last_seen_seq=MAX(activity_seen.last_seen_seq, excluded.last_seen_seq), updated_at=excluded.updated_at`
+  ).bind(u.userId, p.id, seq, now).run();
+  const row = await env.DB.prepare(
+    'SELECT last_seen_seq FROM activity_seen WHERE user_id=? AND notebook_id=?'
+  ).bind(u.userId, p.id).first();
+  return json({ last_seen_seq: row?.last_seen_seq ?? 0 });
+});
+
+// ==================================================================
 // PHOTOS
 // ==================================================================
 
@@ -1163,10 +1367,11 @@ on('GET', '/api/sync', async (request, env) => {
     'SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL'
   ).bind(u.userId).all();
   const notebookIds = nbRows.results.map(r => r.notebook_id);
+  const coverReady = await hasCoverSchema(env);
   if (notebookIds.length === 0) return json({ changes: {
     notebooks: [], notebook_members: [], spreads: [], tags: [], photos: [],
-    spread_tags: [], favorites: [], spread_notes: [], activity_events: [],
-  }, next_cursor: since, has_more: false });
+    spread_tags: [], favorites: [], spread_notes: [], activity_events: [], notebook_covers: [],
+  }, unread: { notebooks: {}, total: 0 }, next_cursor: since, has_more: false });
   const ph = notebookIds.map(() => '?').join(',');
 
   const tables = [
@@ -1177,6 +1382,10 @@ on('GET', '/api/sync', async (request, env) => {
     { name: 'spread_notes', sql: `SELECT sn.*, (SELECT display_name FROM users WHERE id=sn.author_id) AS author_display_name FROM spread_notes sn WHERE notebook_id IN (${ph})`, params: notebookIds },
     { name: 'activity_events', sql: `SELECT ae.*, (SELECT display_name FROM users WHERE id=ae.actor_user_id) AS actor_display_name FROM activity_events ae WHERE notebook_id IN (${ph})`, params: notebookIds },
   ];
+  if (coverReady) {
+    // preview_base64 is intentionally excluded: the image is downloaded from /cover/preview.
+    tables.push({ name: 'notebook_covers', sql: `SELECT notebook_id, cover_revision, telegram_message_id, telegram_file_unique_id, storage_object_id, mime_type, file_size, updated_by, updated_at, deleted_at, seq, client_ref FROM notebook_covers WHERE notebook_id IN (${ph})`, params: notebookIds });
+  }
   const changes = {};
   const fullTables = [];
   let maxSeqSeen = since;
@@ -1211,7 +1420,23 @@ on('GET', '/api/sync', async (request, env) => {
     const fullMaxes = Object.values(changes).filter(arr => arr.length > 0).map(arr => Math.max(...arr.map(r => r.seq)));
     cursor = fullMaxes.length ? Math.min(...fullMaxes) : since;
   }
-  return json({ changes, next_cursor: cursor, has_more: anyFull });
+  // Unread is per user and per notebook; it never depends on another device's read state.
+  const unread = { notebooks: {}, total: 0 };
+  if (!Array.isArray(changes.notebook_covers)) changes.notebook_covers = [];
+  if (coverReady) {
+    const unreadRows = await env.DB.prepare(
+      `SELECT ae.notebook_id AS notebook_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
+       FROM activity_events ae
+       LEFT JOIN activity_seen s ON s.user_id=? AND s.notebook_id=ae.notebook_id
+       WHERE ae.notebook_id IN (${ph}) AND ae.seq > COALESCE(s.last_seen_seq,0)
+       GROUP BY ae.notebook_id`
+    ).bind(u.userId, ...notebookIds).all();
+    for (const row of unreadRows.results) {
+      unread.notebooks[row.notebook_id] = { count: row.count, max_seq: row.max_seq };
+      unread.total += row.count;
+    }
+  }
+  return json({ changes, unread, next_cursor: cursor, has_more: anyFull });
 });
 
 // ==================================================================
