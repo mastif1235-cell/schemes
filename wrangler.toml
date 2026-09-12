@@ -1,0 +1,22 @@
+# Minimal deploy config for the blocknot-proxy Worker.
+#
+# Secrets are NOT stored here. BOT_TOKEN, CHAT_ID and BOOTSTRAP_SECRET are Worker secrets
+# (`wrangler secret list` must still show them after a deploy).
+#
+# database_id MUST be taken from Cloudflare and never invented:
+#   wrangler login
+#   wrangler d1 list           # copy the id of blocknot-scan-db
+#   # paste it below, then:
+#   wrangler d1 migrations list blocknot-scan-db --remote
+#   wrangler d1 migrations apply blocknot-scan-db --remote
+#   wrangler deploy
+# A deploy with a missing database_id fails loudly instead of silently dropping the DB binding.
+
+name = "blocknot-proxy"
+main = "backend/worker.js"
+compatibility_date = "2026-09-03"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "blocknot-scan-db"
+# database_id = "<paste the real id from `wrangler d1 list` here>"
