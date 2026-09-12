@@ -1,0 +1,3 @@
+# Local build and test artifacts (never published: GitHub Pages uploads the repo tree)
+node_modules/
+rollback/
