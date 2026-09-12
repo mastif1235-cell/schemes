@@ -190,6 +190,7 @@ function createFixture({ withCover = true } = {}) {
   sqlite.exec(readFileSync(new URL('../backend/migrations/0001_team_history_notes.sql', import.meta.url), 'utf8'));
   if (withCover) {
     sqlite.exec(readFileSync(new URL('../backend/migrations/0002_notebook_covers_activity_seen.sql', import.meta.url), 'utf8'));
+    sqlite.exec(readFileSync(new URL('../backend/migrations/0003_activity_spread_seen.sql', import.meta.url), 'utf8'));
   }
   const now = '2026-09-03T10:00:00.000Z';
   const expiry = '2099-01-01T00:00:00.000Z';
@@ -483,6 +484,17 @@ try {
     headers: { Authorization: 'Bearer token-1' },
   }), coverEnv)).status, 404, 'removed cover is no longer downloadable');
 
+  // Per-spread unread: opening one spread clears only that spread, for the current user only.
+  const spreadUnreadBefore = (await api(env2, 'GET', '/api/sync?since=0', 'token-2')).data.unread.spreads.s2?.count || 0;
+  assert.ok(spreadUnreadBefore >= 1, 'per-spread unread is reported');
+  const spreadSeen = await api(env2, 'PUT', '/api/spreads/s2/activity/seen', 'token-2', {});
+  assert.ok(spreadSeen.data.last_seen_seq > 0, 'spread seen cursor stored');
+  const afterSpreadSeen = await api(env2, 'GET', '/api/sync?since=0', 'token-2');
+  assert.equal(afterSpreadSeen.data.unread.spreads.s2, undefined, 'only the opened spread is cleared');
+  assert.ok((afterSpreadSeen.data.unread.notebooks.n1?.count || 0) >= 1, 'notebook unread stays until the notebook is marked seen');
+  assert.ok(((await api(env2, 'GET', '/api/sync?since=0', 'token-1')).data.unread.spreads.s2?.count || 0) >= 1,
+    'spread seen is isolated per user');
+
   db2.prepare('INSERT INTO users VALUES (?,?,?)').run('u9', 'Чужой', '2026-09-03T10:00:00.000Z');
   db2.prepare('INSERT INTO sessions(id,user_id,token_hash,device_name,created_at,expires_at) VALUES(?,?,?,?,?,?)')
     .run('session-9', 'u9', tokenHash('token-9'), 'phone-x', '2026-09-03T10:00:00.000Z', '2099-01-01T00:00:00.000Z');
@@ -523,7 +535,8 @@ assert.equal(preCaps.data.capabilities.activity_seen, undefined, 'seen flag hidd
 const preSync = await api(pre0002.env, 'GET', '/api/sync?since=0', 'token-1');
 assert.equal(preSync.status, 200, 'sync keeps working before migration 0002');
 assert.deepEqual(preSync.data.changes.notebook_covers, [], 'cover table omitted safely');
-assert.deepEqual(preSync.data.unread, { notebooks: {}, total: 0 });
+assert.deepEqual(preSync.data.unread, { notebooks: {}, spreads: {}, total: 0 });
+assert.equal(preCaps.data.capabilities.activity_spread_seen, undefined, 'spread seen flag hidden before migration 0003');
 assert.equal((await api(pre0002.env, 'GET', '/api/notebooks/n1/cover', 'token-1')).status, 503);
 assert.equal((await api(pre0002.env, 'PUT', '/api/notebooks/n1/activity/seen', 'token-1', {})).status, 503);
 

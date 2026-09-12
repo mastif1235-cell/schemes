@@ -73,6 +73,27 @@ const objectsBefore = database.prepare(`SELECT type,name,tbl_name,sql FROM sqlit
 const trackedTables = [...legacyTables, 'spread_notes', 'activity_events'];
 const rowsBefore = new Map(trackedTables.map(table => [table, snapshot(table)]));
 database.exec(readFileSync(new URL('../backend/migrations/0002_notebook_covers_activity_seen.sql', import.meta.url), 'utf8'));
+const before0003 = database.prepare(`SELECT type,name,tbl_name,sql FROM sqlite_master
+  WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`).all();
+const rowsBefore0003 = new Map(trackedTables.map(table => [table, snapshot(table)]));
+database.exec(readFileSync(new URL('../backend/migrations/0003_activity_spread_seen.sql', import.meta.url), 'utf8'));
+const after0003 = database.prepare(`SELECT type,name,tbl_name,sql FROM sqlite_master
+  WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`).all();
+for (const before of before0003) {
+  assert.deepEqual(after0003.find(row => row.type === before.type && row.name === before.name), before,
+    `migration 0003 altered ${before.name}`);
+}
+for (const table of trackedTables) assert.deepEqual(snapshot(table), rowsBefore0003.get(table), `migration 0003 changed rows in ${table}`);
+for (const name of ['activity_spread_seen', 'idx_activity_spread_seen_spread']) {
+  assert.ok(database.prepare('SELECT 1 FROM sqlite_master WHERE name=?').get(name), `missing migrated object ${name}`);
+}
+database.prepare('INSERT INTO activity_spread_seen(user_id,spread_id,last_seen_seq,updated_at) VALUES(?,?,?,?)').run('u1', 'spread', 21, now);
+database.prepare(`INSERT INTO activity_spread_seen(user_id,spread_id,last_seen_seq,updated_at) VALUES(?,?,?,?)
+  ON CONFLICT(user_id,spread_id) DO UPDATE SET
+    last_seen_seq=MAX(activity_spread_seen.last_seen_seq, excluded.last_seen_seq), updated_at=excluded.updated_at`)
+  .run('u1', 'spread', 19, now);
+assert.equal(database.prepare('SELECT last_seen_seq FROM activity_spread_seen WHERE user_id=? AND spread_id=?').get('u1', 'spread').last_seen_seq, 21,
+  'spread seen cursor never moves backwards');
 const objectsAfter = database.prepare(`SELECT type,name,tbl_name,sql FROM sqlite_master
   WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`).all();
 for (const before of objectsBefore) {

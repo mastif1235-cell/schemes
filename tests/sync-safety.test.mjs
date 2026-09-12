@@ -302,8 +302,9 @@ coverRuntime.db.sync_queue.set(11,{...coverRuntime.db.sync_queue.get(11),status:
 await coverRuntime.context.applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb-c',cover_revision:3,deleted_at:'2026-09-12T00:00:00.000Z',seq:6}]});
 assert.equal(coverApplied.length,2,'a cover tombstone is applied once the local change is done');
 assert.equal(coverApplied[1][1],'2026-09-12T00:00:00.000Z');
-coverRuntime.setApi(async () => ({changes:{}, unread:{notebooks:{'remote-nb-c':{count:2,max_seq:9}},total:2}, next_cursor:9, has_more:false}));
+coverRuntime.setApi(async () => ({changes:{}, unread:{notebooks:{'remote-nb-c':{count:2,max_seq:9}},spreads:{'remote-sp':{count:1,max_seq:9}},total:2}, next_cursor:9, has_more:false}));
 coverRuntime.context.settings.sync_cursor = 0;
 await coverRuntime.context.pullChanges();
 assert.equal(coverRuntime.context.settings.unread_by_notebook['remote-nb-c'].count,2,'server unread reaches the badge state');
+assert.equal(coverRuntime.context.settings.unread_spreads['remote-sp'].count,1,'per-spread unread reaches the client');
 console.log('sync-safety: PASS');

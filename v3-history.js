@@ -92,6 +92,108 @@
   }
 
   window.v340RefreshHistoryBadge = refreshBadge;
+  function cacheKeyFor(scope, event) { return scope + '|' + (event.legacy ? 'legacy:' : '') + event.id; }
+
+  async function cacheServerEvents(events, scope) {
+    for (const event of events) {
+      const cache_id = cacheKeyFor(scope, event);
+      await window.vNextAtomic('activity_events', cache_id, () => ({row:{...event, scope, cache_id}}));
+    }
+  }
+
+  async function refreshNotebookActivity(notebook) {
+    if (!notebook.server_id || !window.vNextSync.enabled('activity') || !isOnline()) return;
+    const data = await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/activity?limit=100`);
+    await cacheServerEvents([...(data.events || []), ...(data.legacy_events || [])], window.vNextSync.scope());
+  }
+
+  async function markAllSeen(notebooks) {
+    const spreads = await getAll('spreads');
+    if (window.vNextSync.enabled('activity_seen')) {
+      for (const notebook of notebooks.filter(row => row.server_id)) {
+        try { await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/activity/seen`, {method:'PUT', json:{}}); }
+        catch (error) { console.warn('Notebook seen could not be stored', error); }
+      }
+    }
+    if (window.vNextSync.enabled('activity_spread_seen')) {
+      for (const serverId of Object.keys(settings.unread_spreads || {})) {
+        if (!spreads.some(row => row.server_id === serverId)) continue;
+        try { await api(`/api/spreads/${encodeURIComponent(serverId)}/activity/seen`, {method:'PUT', json:{}}); }
+        catch (error) { console.warn('Spread seen could not be stored', error); }
+      }
+    }
+    settings.unread_spreads = {}; settings.unread_by_notebook = {}; settings.unread_total = 0;
+    await saveSettings(); refreshBadge(); window.BlocknotV3.emit('unread-change');
+  }
+
+  // Opening one spread clears only that spread's unread for the current user.
+  window.v340MarkSpreadSeen = async function (spread) {
+    if (!spread || !spread.server_id || !window.vNextSync.enabled('activity_spread_seen')) return;
+    const entry = (settings.unread_spreads || {})[spread.server_id];
+    if (!entry || !entry.count || !isOnline()) return;
+    try { await api(`/api/spreads/${encodeURIComponent(spread.server_id)}/activity/seen`, {method:'PUT', json:{seq:entry.max_seq}}); }
+    catch (error) { console.warn('Spread seen could not be stored', error); return; }
+    const spreadMap = {...(settings.unread_spreads || {})};
+    delete spreadMap[spread.server_id];
+    settings.unread_spreads = spreadMap;
+    const notebook = await get('notebooks', spread.notebook_id);
+    if (notebook && notebook.server_id) {
+      const notebookMap = {...(settings.unread_by_notebook || {})};
+      const current = notebookMap[notebook.server_id];
+      if (current) {
+        const count = Math.max(0, Number(current.count || 0) - Number(entry.count || 0));
+        if (count) notebookMap[notebook.server_id] = {...current, count};
+        else delete notebookMap[notebook.server_id];
+        settings.unread_by_notebook = notebookMap;
+      }
+    }
+    settings.unread_total = Object.values(settings.unread_by_notebook || {})
+      .reduce((sum, row) => sum + Number(row && row.count || 0), 0);
+    await saveSettings(); refreshBadge(); window.BlocknotV3.emit('unread-change');
+  };
+
+  async function openServerHistory() {
+    const scope = window.vNextSync.scope();
+    const {el, close} = openSheet(`<div class="sheet-handle"></div><div class="v340-history-head"><h2>🕘 История</h2>
+      <button class="btn-ghost" data-mark-all>Отметить всё прочитанным</button></div>
+      <p class="v340-caption">Общая история всех блокнотов. Записи видят все участники, отметка «прочитано» — только вы.</p>
+      <div class="v340-history-list" data-server-history></div>`);
+    const host = el.querySelector('[data-server-history]');
+    const notebooks = (await getAll('notebooks')).filter(row => !row.deleted_at && !row.hidden_no_access);
+    const byServer = new Map(notebooks.filter(row => row.server_id).map(row => [row.server_id, row]));
+    async function draw() {
+      const events = (await getAll('activity_events'))
+        .filter(row => row.scope === scope && !row.legacy)
+        .sort((a, b) => (Number(b.seq) || 0) - (Number(a.seq) || 0) || eventTime(b) - eventTime(a)
+          || String(b.id || '').localeCompare(String(a.id || '')));
+      const spreads = await getAll('spreads');
+      host.replaceChildren();
+      if (!events.length) { host.innerHTML = '<div class="empty-state">Общих событий пока нет.</div>'; return; }
+      for (const row of events.slice(0, 200)) {
+        const notebook = byServer.get(row.notebook_id) || null;
+        const spread = spreads.find(item => item.server_id === row.spread_id);
+        const item = document.createElement('article');
+        item.className = 'v340-history-row';
+        item.innerHTML = `<div><strong>${esc(row.actor?.display_name || row.actor_display_name || 'Участник')}</strong>
+          <small> · ${esc(new Date(eventTime(row)).toLocaleString('ru-RU'))}</small>
+          <div>${esc(notebook?.title || row.notebook_title || '')}${row.spread_number || spread ? ' · №' + esc(row.spread_number ?? spread?.number ?? '') : ''}</div>
+          <div>${esc(actionLabel(row.action))}${spread && spread.deleted_at ? ' · Разворот удалён' : ''}</div></div>
+          ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open>Открыть</button>' : ''}`;
+        item.querySelector('[data-open]')?.addEventListener('click', async () => { close(); await window.v340OpenSpread(spread); });
+        host.appendChild(item);
+      }
+    }
+    el.querySelector('[data-mark-all]').onclick = async event => {
+      event.target.disabled = true;
+      try { await markAllSeen(notebooks); toast('Отмечено прочитанным'); await draw(); }
+      finally { event.target.disabled = false; }
+    };
+    await draw();
+    for (const notebook of notebooks) {
+      try { await refreshNotebookActivity(notebook); } catch (error) { console.warn('History refresh failed', error); }
+    }
+    await draw();
+  }
   function serverUnreadCount() {
     const map = settings.unread_by_notebook || {};
     let count = 0;
@@ -196,6 +298,7 @@
 
   window.openNotebookHistory = notebook => openTeamHistory(notebook);
   window.v340OpenGlobalHistory = async () => {
+    if (window.vNextSync.enabled('activity')) return openServerHistory();
     const notebook = route.screen === 'spreads' && route.notebookId ? await get('notebooks',route.notebookId) : null;
     return notebook ? openTeamHistory(notebook) : openHistory(null);
   };

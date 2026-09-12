@@ -203,6 +203,22 @@ async function hasCoverSchema(env) {
   return ready;
 }
 
+const spreadSeenSchemaCache = new WeakMap();
+async function hasSpreadSeenSchema(env) {
+  if (spreadSeenSchemaCache.has(env.DB)) return spreadSeenSchemaCache.get(env.DB);
+  let ready = false;
+  try {
+    const rows = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_spread_seen'"
+    ).all();
+    ready = rows.results.length === 1;
+  } catch (error) {
+    console.warn('Spread seen schema probe failed', error);
+  }
+  spreadSeenSchemaCache.set(env.DB, ready);
+  return ready;
+}
+
 async function selectNote(env, noteId) {
   return env.DB.prepare(
     `SELECT sn.*, u.display_name AS author_display_name
@@ -382,7 +398,8 @@ on('GET', '/api/me', async (request, env) => {
   ).bind(u.userId).all();
   return json({ user: { id: u.userId, display_name: u.displayName }, devices: devices.results,
     capabilities: { team_notes: true, activity: true, field_merge: true, spread_order: true,
-      ...(await hasCoverSchema(env) ? { notebook_cover: true, activity_seen: true } : {}) } });
+      ...(await hasCoverSchema(env) ? { notebook_cover: true, activity_seen: true } : {}),
+      ...(await hasSpreadSeenSchema(env) ? { activity_spread_seen: true } : {}) } });
 });
 
 on('DELETE', '/api/me/sessions/:id', async (request, env, p) => {
@@ -1143,6 +1160,28 @@ on('PUT', '/api/notebooks/:id/activity/seen', async (request, env, p) => {
   return json({ last_seen_seq: row?.last_seen_seq ?? 0 });
 });
 
+// Per-spread read cursor: opening one spread clears only that spread's unread.
+on('PUT', '/api/spreads/:id/activity/seen', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  if (!(await hasSpreadSeenSchema(env))) return err(503, 'spread_seen_not_available');
+  const spread = await env.DB.prepare('SELECT notebook_id FROM spreads WHERE id=?').bind(p.id).first();
+  if (!spread) return err(404, 'not_found');
+  await requireMembership(env, u.userId, spread.notebook_id);
+  const body = await request.json().catch(() => ({}));
+  const requested = Number(body?.seq);
+  let seq = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 0;
+  if (!seq) {
+    const maxRow = await env.DB.prepare('SELECT MAX(seq) AS m FROM activity_events WHERE spread_id=?').bind(p.id).first();
+    seq = maxRow?.m || 0;
+  }
+  await env.DB.prepare(
+    `INSERT INTO activity_spread_seen (user_id, spread_id, last_seen_seq, updated_at) VALUES (?,?,?,?)
+     ON CONFLICT(user_id, spread_id) DO UPDATE SET
+       last_seen_seq=MAX(activity_spread_seen.last_seen_seq, excluded.last_seen_seq), updated_at=excluded.updated_at`
+  ).bind(u.userId, p.id, seq, nowISO()).run();
+  return json({ last_seen_seq: seq });
+});
+
 // ==================================================================
 // PHOTOS
 // ==================================================================
@@ -1371,7 +1410,7 @@ on('GET', '/api/sync', async (request, env) => {
   if (notebookIds.length === 0) return json({ changes: {
     notebooks: [], notebook_members: [], spreads: [], tags: [], photos: [],
     spread_tags: [], favorites: [], spread_notes: [], activity_events: [], notebook_covers: [],
-  }, unread: { notebooks: {}, total: 0 }, next_cursor: since, has_more: false });
+  }, unread: { notebooks: {}, spreads: {}, total: 0 }, next_cursor: since, has_more: false });
   const ph = notebookIds.map(() => '?').join(',');
 
   const tables = [
@@ -1421,7 +1460,7 @@ on('GET', '/api/sync', async (request, env) => {
     cursor = fullMaxes.length ? Math.min(...fullMaxes) : since;
   }
   // Unread is per user and per notebook; it never depends on another device's read state.
-  const unread = { notebooks: {}, total: 0 };
+  const unread = { notebooks: {}, spreads: {}, total: 0 };
   if (!Array.isArray(changes.notebook_covers)) changes.notebook_covers = [];
   if (coverReady) {
     const unreadRows = await env.DB.prepare(
@@ -1435,6 +1474,16 @@ on('GET', '/api/sync', async (request, env) => {
       unread.notebooks[row.notebook_id] = { count: row.count, max_seq: row.max_seq };
       unread.total += row.count;
     }
+  }
+  if (await hasSpreadSeenSchema(env)) {
+    const spreadUnreadRows = await env.DB.prepare(
+      `SELECT ae.spread_id AS spread_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
+       FROM activity_events ae
+       LEFT JOIN activity_spread_seen ss ON ss.user_id=? AND ss.spread_id=ae.spread_id
+       WHERE ae.notebook_id IN (${ph}) AND ae.spread_id IS NOT NULL AND ae.seq > COALESCE(ss.last_seen_seq,0)
+       GROUP BY ae.spread_id`
+    ).bind(u.userId, ...notebookIds).all();
+    for (const row of spreadUnreadRows.results) unread.spreads[row.spread_id] = { count: row.count, max_seq: row.max_seq };
   }
   return json({ changes, unread, next_cursor: cursor, has_more: anyFull });
 });

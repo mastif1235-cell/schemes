@@ -72,6 +72,13 @@
 
   async function decorateSpreadCard(card, spread, queue) {
     card.dataset.spreadId = spread.id;
+    const spreadUnread = Number(settings.unread_spreads?.[spread.server_id]?.count || 0);
+    if (spreadUnread > 0) {
+      const dot = document.createElement('span');
+      dot.className = 'v340-unread-dot';
+      dot.textContent = spreadUnread > 99 ? '99+' : String(spreadUnread);
+      card.appendChild(dot);
+    }
     const photo = spread.current_photo_id ? await get('photos', spread.current_photo_id) : null;
     const image = card.querySelector('img.thumb');
     if (image) { image.dataset.photoId = photo ? photo.id : ''; releaseImageUrl(image); }
@@ -133,6 +140,13 @@
       card.innerHTML = `<div class="title">${esc(notebook.title)}</div>
         ${notebook.description ? `<div class="desc">${esc(notebook.description)}</div>` : ''}
         <div class="meta"><span>${spreads.length} разворотов</span><span>изм. ${new Date(last).toLocaleDateString('ru-RU')}</span></div>`;
+      const notebookUnread = Number(settings.unread_by_notebook?.[notebook.server_id]?.count || 0);
+      if (notebookUnread > 0) {
+        const badge = document.createElement('span');
+        badge.className = 'v340-unread-badge';
+        badge.textContent = notebookUnread > 99 ? '99+' : String(notebookUnread);
+        card.appendChild(badge);
+      }
       card.onclick = event => {
         if (card.dataset.suppressClick) { delete card.dataset.suppressClick; return; }
         if (event.defaultPrevented) return;
@@ -405,7 +419,7 @@
   };
 
   const teamStyle = document.createElement('style');
-  teamStyle.textContent = `.vnext-order-row{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--border)}.vnext-order-row button{padding:0;min-width:44px}.v340-history-list pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.82rem}.v340-history-list summary{cursor:pointer;padding:10px 0}`;
+  teamStyle.textContent = `.vnext-order-row{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--border)}.vnext-order-row button{padding:0;min-width:44px}.v340-history-list pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.82rem}.v340-history-list summary{cursor:pointer;padding:10px 0}.v340-unread-badge{position:absolute;right:10px;top:10px;min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:var(--danger);color:#fff;font:700 11px/20px var(--font-sans);text-align:center}.v340-unread-dot{position:absolute;left:8px;top:8px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--danger);color:#fff;font:700 10px/18px var(--font-sans);text-align:center;z-index:4}`;
   document.head.appendChild(teamStyle);
   // A cover that arrives from another phone must appear without manual navigation.
   window.BlocknotV3.on('cover-change', () => {

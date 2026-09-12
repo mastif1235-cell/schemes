@@ -179,6 +179,7 @@
   window.v340OpenSpread = async function (spread) {
     if (!spread || spread.deleted_at) { toast('Этот разворот больше недоступен'); return false; }
     v3RememberSpread(spread);
+    if (typeof window.v340MarkSpreadSeen === 'function') { void window.v340MarkSpreadSeen(spread); }
     const siblings = (await getAllByIndex('spreads', 'notebook_id', spread.notebook_id))
       .filter(row => !row.deleted_at)
       .sort((a, b) => Number(a.number) - Number(b.number) || String(a.number).localeCompare(String(b.number)));
@@ -407,6 +408,37 @@
       if (isAuthed()) await queueEntityChange('notebook', notebook.id);
     }
   }
+
+  // Legacy local-only covers: publish once, OWNER only, never over an existing server cover and
+  // never after a server tombstone. Idempotent through cover_migrated_at.
+  window.v340MigrateLegacyCovers = async function () {
+    if (!coverSyncEnabled() || !isAuthed()) return;
+    const notebooks = (await getAll('notebooks')).filter(row => row.server_id && !row.deleted_at && !row.hidden_no_access);
+    for (const notebook of notebooks) {
+      if (notebook.cover_state_known === true || notebook.cover_migrated_at) continue;
+      const local = await get('blobs', COVER_PREFIX + notebook.id);
+      if (!local || !local.blob) continue;
+      if (await isCoverRemoved(notebook.id)) continue;
+      let role = null, serverCover = null;
+      try {
+        const members = await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/members`);
+        role = (members.members || []).find(row => row.user_id === settings.user_id)?.role || null;
+        if (role !== 'OWNER') {
+          await put('notebooks', {...notebook, cover_migrated_at:nowISO(), cover_migration:'member-skip'});
+          continue;
+        }
+        const state = await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/cover`);
+        serverCover = state.cover || null;
+      } catch (error) {
+        console.warn('Legacy cover migration check failed', error);
+        continue;
+      }
+      const fresh = await get('notebooks', notebook.id) || notebook;
+      await put('notebooks', {...fresh, cover_migrated_at:nowISO()});
+      if (serverCover) { await window.v340ApplyServerCover(fresh, serverCover); continue; }
+      await queueCoverChange(fresh, 'put');
+    }
+  };
 
   openDB = async function () {
     if (db && db.version >= 3) return db;

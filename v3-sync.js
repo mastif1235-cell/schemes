@@ -655,6 +655,7 @@
           settings.team_snapshot_scope = sessionScope;
         }
         await pullChanges();
+        void window.v340MigrateLegacyCovers?.();
       } else {
         await pushPhotoQueue(!!manual);
       }
@@ -691,6 +692,7 @@
       await applyChangeBatch(data.changes || {});
       if (data.unread) {
         settings.unread_by_notebook = data.unread.notebooks || {};
+        settings.unread_spreads = data.unread.spreads || {};
         settings.unread_total = data.unread.total || 0;
         await saveSettings();
         window.BlocknotV3?.emit('unread-change');

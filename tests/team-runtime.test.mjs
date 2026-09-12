@@ -177,6 +177,11 @@ try {
   assert.equal(coverFlow.downloaded,true,'server cover is cached locally');
   assert.equal(coverFlow.gone,true,'cover tombstone removes the local picture');
   assert.match(coverFlow.badge,/2/,'history badge counts server unread');
+  await page.waitForFunction(async () => {
+    const notebook = await get('notebooks','nb');
+    const cached = await get('blobs', window.v340CoverBlobId('nb'));
+    return notebook.cover_state_known === true && notebook.cover_deleted_at === '2026-09-12T12:00:00.000Z' && !cached;
+  }, null, {timeout:10000});
   // Cover must survive an app restart (IndexedDB state + cached blob).
   await page.reload({waitUntil:'load'});
   await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof get === 'function');
@@ -200,6 +205,74 @@ try {
     const url = await getNotebookCoverUrl(notebook);
     return notebook.cover_state_known === true && !notebook.cover_deleted_at && !!cached && typeof url === 'string' && url.startsWith('blob:');
   }), true, 'a live cover survives a restart and renders');
+  // ---- global server history + unread levels + legacy cover migration -------------------------
+  await context.route(origin+'/api/spreads/remote-s1/activity/seen', route => route.fulfill({json:{last_seen_seq:8}}));
+  await context.route(origin+'/api/notebooks/remote-nb/cover', async route => route.fulfill({
+    json:{cover: route.request().method() === 'GET' ? null : {notebook_id:'remote-nb',revision:1,deleted_at:null,seq:40}}}));
+  let memberRole = 'OWNER';
+  await context.route(origin+'/api/notebooks/remote-nb/members', route => route.fulfill({
+    json:{members:[{user_id:'u1',display_name:'Артём',role:memberRole}]}}));
+  const levels = await page.evaluate(async () => {
+    try {
+      settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{activity:true, activity_seen:true, activity_spread_seen:true, notebook_cover:true}};
+      settings.unread_by_notebook = {'remote-nb':{count:1,max_seq:9}};
+      settings.unread_spreads = {'remote-s1':{count:1,max_seq:9}};
+      settings.unread_total = 1;
+      await saveSettings();
+      route = {screen:'notebooks'}; render();
+      await new Promise(res => setTimeout(res,60));
+      const notebookBadge = (document.querySelector('.v340-unread-badge')?.textContent || '').trim();
+      route = {screen:'spreads', notebookId:'nb'}; render();
+      await new Promise(res => setTimeout(res,80));
+      const spreadDot = (document.querySelector('.v340-unread-dot')?.textContent || '').trim();
+      let historyError = null, rows = 0;
+      try {
+        await window.v340OpenGlobalHistory();
+        await new Promise(res => setTimeout(res,150));
+        rows = document.querySelectorAll('[data-server-history] .v340-history-row').length;
+      } catch (error) { historyError = String(error && error.message || error); }
+      await window.v340MarkSpreadSeen(await get('spreads','s1'));
+      const result = {notebookBadge, spreadDot, rows, historyError,
+        afterSeen:{...settings.unread_spreads}, notebookCount:settings.unread_by_notebook['remote-nb']?.count ?? null};
+      document.querySelector('.sheet-backdrop')?.remove();
+      return result;
+    } catch (error) { return {fatal:String(error && error.stack || error)}; }
+  });
+  assert.ok(!levels.fatal, 'levels flow failed: ' + levels.fatal);
+  assert.ok(!levels.historyError, 'global history failed: ' + levels.historyError);
+  assert.equal(levels.notebookBadge,'1','per-notebook unread badge renders');
+  assert.match(levels.spreadDot,/1/,'per-spread unread dot renders');
+  assert.ok(levels.rows >= 1, 'global history lists server activity, rows=' + levels.rows);
+  assert.deepEqual(levels.afterSeen,{},'opening a spread clears only that spread');
+  assert.ok(levels.notebookCount === null || levels.notebookCount === 0,'notebook unread decreases with the spread');
+  const migration = await page.evaluate(async () => {
+    try {
+      const notebook = await get('notebooks','nb');
+      await put('notebooks',{...notebook, cover_state_known:false, cover_migrated_at:null, cover_migration:null});
+      const canvas = document.createElement('canvas'); canvas.width = 40; canvas.height = 56;
+      await put('blobs',{id:window.v340CoverBlobId('nb'), blob:await new Promise(res => canvas.toBlob(res,'image/jpeg'))});
+      await window.v340MigrateLegacyCovers();
+      const owner = await get('notebooks','nb');
+      return {migrated:!!owner.cover_migrated_at, skipped:owner.cover_migration || null};
+    } catch (error) { return {fatal:String(error && error.message || error)}; }
+  });
+  assert.ok(!migration.fatal, 'migration flow failed: ' + migration.fatal);
+  assert.equal(migration.migrated,true,'OWNER legacy cover migration is recorded and queued');
+  assert.equal(migration.skipped,null);
+  memberRole = 'MEMBER';
+  const memberSkip = await page.evaluate(async () => {
+    try {
+      const notebook = await get('notebooks','nb');
+      await put('notebooks',{...notebook, cover_state_known:false, cover_migrated_at:null, cover_migration:null});
+      const before = (await getAll('sync_queue')).filter(row => row.entity === 'notebook_cover' && row.status === 'pending').length;
+      await window.v340MigrateLegacyCovers();
+      const after = (await getAll('sync_queue')).filter(row => row.entity === 'notebook_cover' && row.status === 'pending').length;
+      return {before, after, skipped:(await get('notebooks','nb')).cover_migration || null};
+    } catch (error) { return {fatal:String(error && error.message || error)}; }
+  });
+  assert.ok(!memberSkip.fatal, 'member migration flow failed: ' + memberSkip.fatal);
+  assert.equal(memberSkip.after,memberSkip.before,'MEMBER does not auto-publish a legacy cover');
+  assert.equal(memberSkip.skipped,'member-skip');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, own notes, metadata, photo safety, reorder, history, viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }
