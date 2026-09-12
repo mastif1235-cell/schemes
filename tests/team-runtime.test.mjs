@@ -207,7 +207,8 @@ try {
     return notebook.cover_state_known === true && !notebook.cover_deleted_at && !!cached && typeof url === 'string' && url.startsWith('blob:');
   }), true, 'a live cover survives a restart and renders');
   // ---- global server history + unread levels + legacy cover migration -------------------------
-  await context.route(origin+'/api/spreads/remote-s1/activity/seen', route => route.fulfill({json:{last_seen_seq:8}}));
+  await context.route(origin+'/api/spreads/remote-s1/activity/seen', route => route.fulfill({json:{last_seen_seq:8,
+    unread:{notebooks:{},spreads:{},total:0}}}));
   await context.route(origin+'/api/notebooks/remote-nb/cover', async route => route.fulfill({
     json:{cover: route.request().method() === 'GET' ? null : {notebook_id:'remote-nb',revision:1,deleted_at:null,seq:40}}}));
   let memberRole = 'OWNER';
@@ -233,8 +234,9 @@ try {
         rows = document.querySelectorAll('[data-server-history] .v340-history-row').length;
       } catch (error) { historyError = String(error && error.message || error); }
       await window.v340MarkSpreadSeen(await get('spreads','s1'));
+      const dotAfterSeen = !!document.querySelector('.spread-card[data-spread-server-id="remote-s1"] .v340-unread-dot');
       const result = {notebookBadge, spreadDot, rows, historyError,
-        afterSeen:{...settings.unread_spreads}, notebookCount:settings.unread_by_notebook['remote-nb']?.count ?? null};
+        dotAfterSeen, afterSeen:{...settings.unread_spreads}, notebookCount:settings.unread_by_notebook['remote-nb']?.count ?? null};
       document.querySelector('.sheet-backdrop')?.remove();
       return result;
     } catch (error) { return {fatal:String(error && error.stack || error)}; }
@@ -245,6 +247,7 @@ try {
   assert.match(levels.spreadDot,/1/,'per-spread unread dot renders');
   assert.ok(levels.rows >= 1, 'global history lists server activity, rows=' + levels.rows);
   assert.deepEqual(levels.afterSeen,{},'opening a spread clears only that spread');
+  assert.equal(levels.dotAfterSeen,false,'the spread dot disappears without a reload');
   assert.ok(levels.notebookCount === null || levels.notebookCount === 0,'notebook unread decreases with the spread');
   const migration = await page.evaluate(async () => {
     try {

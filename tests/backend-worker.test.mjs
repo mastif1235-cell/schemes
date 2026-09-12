@@ -498,6 +498,10 @@ try {
   assert.equal(notebookSum, spreadSum + levelSum, 'notebook unread equals spread unread plus notebook-level unread');
   const spreadSeen = await api(env2, 'PUT', '/api/spreads/s2/activity/seen', 'token-2', {});
   assert.ok(spreadSeen.data.last_seen_seq > 0, 'spread seen cursor stored');
+  assert.ok(spreadSeen.data.unread, 'spread seen returns the fresh canonical unread state');
+  assert.equal(spreadSeen.data.unread.total,
+    Object.values(spreadSeen.data.unread.notebooks).reduce((sum, row) => sum + row.count, 0),
+    'seen response keeps global equal to the notebook sum');
   const afterSpreadSeen = await api(env2, 'GET', '/api/sync?since=0', 'token-2');
   assert.equal(afterSpreadSeen.data.unread.spreads.s2, undefined, 'only the opened spread is cleared');
   const afterNotebookSum = Object.values(afterSpreadSeen.data.unread.notebooks).reduce((sum, row) => sum + row.count, 0);
@@ -505,6 +509,8 @@ try {
   assert.ok((afterSpreadSeen.data.unread.notebooks.n1?.count || 0) < notebookSum, 'notebook unread decreases with the spread');
   assert.ok(((await api(env2, 'GET', '/api/sync?since=0', 'token-1')).data.unread.spreads.s2?.count || 0) >= 1,
     'spread seen is isolated per user');
+  const notebookSeenResponse = await api(env2, 'PUT', '/api/notebooks/n1/activity/seen', 'token-2', {});
+  assert.ok(notebookSeenResponse.data.unread, 'notebook seen returns the fresh canonical unread state');
 
   db2.prepare('INSERT INTO users VALUES (?,?,?)').run('u9', 'Чужой', '2026-09-03T10:00:00.000Z');
   db2.prepare('INSERT INTO sessions(id,user_id,token_hash,device_name,created_at,expires_at) VALUES(?,?,?,?,?,?)')

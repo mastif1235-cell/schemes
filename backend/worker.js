@@ -219,6 +219,54 @@ async function hasSpreadSeenSchema(env) {
   return ready;
 }
 
+// Canonical read state for one user over the given notebooks: spread events use the spread
+// cursor, notebook-level events (no spread_id) use the notebook cursor, a notebook is the sum of
+// both and the total is the sum of notebooks. Used by /api/sync and by the seen endpoints so the
+// client always receives one authoritative state.
+async function unreadState(env, userId, notebookIds) {
+  const unread = { notebooks: {}, spreads: {}, total: 0 };
+  if (!notebookIds.length) return unread;
+  const ph = notebookIds.map(() => '?').join(',');
+  const coverReady = await hasCoverSchema(env);
+  if (!coverReady) return unread;
+  const spreadReady = await hasSpreadSeenSchema(env);
+  const levelRows = await env.DB.prepare(
+    `SELECT ae.notebook_id AS notebook_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
+     FROM activity_events ae
+     LEFT JOIN activity_seen s ON s.user_id=? AND s.notebook_id=ae.notebook_id
+     WHERE ae.notebook_id IN (${ph})${spreadReady ? ' AND ae.spread_id IS NULL' : ''}
+       AND ae.seq > COALESCE(s.last_seen_seq,0)
+     GROUP BY ae.notebook_id`
+  ).bind(userId, ...notebookIds).all();
+  for (const row of levelRows.results) {
+    unread.notebooks[row.notebook_id] = {count: row.count, max_seq: row.max_seq, level: row.count};
+  }
+  if (spreadReady) {
+    const spreadRows = await env.DB.prepare(
+      `SELECT ae.notebook_id AS notebook_id, ae.spread_id AS spread_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
+       FROM activity_events ae
+       LEFT JOIN activity_spread_seen ss ON ss.user_id=? AND ss.spread_id=ae.spread_id
+       WHERE ae.notebook_id IN (${ph}) AND ae.spread_id IS NOT NULL AND ae.seq > COALESCE(ss.last_seen_seq,0)
+       GROUP BY ae.spread_id`
+    ).bind(userId, ...notebookIds).all();
+    for (const row of spreadRows.results) {
+      unread.spreads[row.spread_id] = {count: row.count, max_seq: row.max_seq};
+      const current = unread.notebooks[row.notebook_id] || {count:0, max_seq:0, level:0};
+      unread.notebooks[row.notebook_id] = {count: current.count + row.count,
+        max_seq: Math.max(Number(current.max_seq) || 0, Number(row.max_seq) || 0), level: current.level || 0};
+    }
+  }
+  unread.total = Object.values(unread.notebooks).reduce((sum, row) => sum + Number(row.count || 0), 0);
+  return unread;
+}
+
+async function unreadForUser(env, userId) {
+  const rows = await env.DB.prepare(
+    'SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL'
+  ).bind(userId).all();
+  return unreadState(env, userId, rows.results.map(row => row.notebook_id));
+}
+
 async function selectNote(env, noteId) {
   return env.DB.prepare(
     `SELECT sn.*, u.display_name AS author_display_name
@@ -1157,7 +1205,7 @@ on('PUT', '/api/notebooks/:id/activity/seen', async (request, env, p) => {
   const row = await env.DB.prepare(
     'SELECT last_seen_seq FROM activity_seen WHERE user_id=? AND notebook_id=?'
   ).bind(u.userId, p.id).first();
-  return json({ last_seen_seq: row?.last_seen_seq ?? 0 });
+  return json({ last_seen_seq: row?.last_seen_seq ?? 0, unread: await unreadForUser(env, u.userId) });
 });
 
 // Per-spread read cursor: opening one spread clears only that spread's unread.
@@ -1179,7 +1227,7 @@ on('PUT', '/api/spreads/:id/activity/seen', async (request, env, p) => {
      ON CONFLICT(user_id, spread_id) DO UPDATE SET
        last_seen_seq=MAX(activity_spread_seen.last_seen_seq, excluded.last_seen_seq), updated_at=excluded.updated_at`
   ).bind(u.userId, p.id, seq, nowISO()).run();
-  return json({ last_seen_seq: seq });
+  return json({ last_seen_seq: seq, unread: await unreadForUser(env, u.userId) });
 });
 
 // ==================================================================
@@ -1459,43 +1507,8 @@ on('GET', '/api/sync', async (request, env) => {
     const fullMaxes = Object.values(changes).filter(arr => arr.length > 0).map(arr => Math.max(...arr.map(r => r.seq)));
     cursor = fullMaxes.length ? Math.min(...fullMaxes) : since;
   }
-  // Unread is per user and per notebook; it never depends on another device's read state.
-  const unread = { notebooks: {}, spreads: {}, total: 0 };
   if (!Array.isArray(changes.notebook_covers)) changes.notebook_covers = [];
-  // Canonical unread: spread events use the spread cursor, notebook-level events (no spread_id)
-  // use the notebook cursor. A notebook is the sum of both, the global total is the sum of
-  // notebooks, and no event is counted twice.
-  let spreadSeenReady = false;
-  if (coverReady) {
-    spreadSeenReady = await hasSpreadSeenSchema(env);
-    const levelRows = await env.DB.prepare(
-      `SELECT ae.notebook_id AS notebook_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
-       FROM activity_events ae
-       LEFT JOIN activity_seen s ON s.user_id=? AND s.notebook_id=ae.notebook_id
-       WHERE ae.notebook_id IN (${ph})${spreadSeenReady ? ' AND ae.spread_id IS NULL' : ''}
-         AND ae.seq > COALESCE(s.last_seen_seq,0)
-       GROUP BY ae.notebook_id`
-    ).bind(u.userId, ...notebookIds).all();
-    for (const row of levelRows.results) {
-      unread.notebooks[row.notebook_id] = { count: row.count, max_seq: row.max_seq, level: row.count };
-    }
-  }
-  if (spreadSeenReady) {
-    const spreadUnreadRows = await env.DB.prepare(
-      `SELECT ae.notebook_id AS notebook_id, ae.spread_id AS spread_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
-       FROM activity_events ae
-       LEFT JOIN activity_spread_seen ss ON ss.user_id=? AND ss.spread_id=ae.spread_id
-       WHERE ae.notebook_id IN (${ph}) AND ae.spread_id IS NOT NULL AND ae.seq > COALESCE(ss.last_seen_seq,0)
-       GROUP BY ae.spread_id`
-    ).bind(u.userId, ...notebookIds).all();
-    for (const row of spreadUnreadRows.results) {
-      unread.spreads[row.spread_id] = { count: row.count, max_seq: row.max_seq };
-      const current = unread.notebooks[row.notebook_id] || {count:0, max_seq:0, level:0};
-      unread.notebooks[row.notebook_id] = {count: current.count + row.count,
-        max_seq: Math.max(Number(current.max_seq) || 0, Number(row.max_seq) || 0), level: current.level || 0};
-    }
-  }
-  unread.total = Object.values(unread.notebooks).reduce((sum, row) => sum + Number(row.count || 0), 0);
+  const unread = await unreadState(env, u.userId, notebookIds);
   return json({ changes, unread, next_cursor: cursor, has_more: anyFull });
 });
 

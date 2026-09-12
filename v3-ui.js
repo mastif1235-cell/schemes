@@ -72,6 +72,7 @@
 
   async function decorateSpreadCard(card, spread, queue) {
     card.dataset.spreadId = spread.id;
+    card.dataset.spreadServerId = spread.server_id || '';
     const spreadUnread = Number(settings.unread_spreads?.[spread.server_id]?.count || 0);
     if (spreadUnread > 0) {
       const dot = document.createElement('span');
@@ -135,6 +136,7 @@
       const card = document.createElement('div');
       card.className = 'notebook-card' + (notebook.archived ? ' archived' : '');
       card.dataset.notebookId = notebook.id;
+      card.dataset.notebookServerId = notebook.server_id || '';
       const dates = spreads.map(row => +new Date(row.updated_at)).filter(Number.isFinite);
       const last = dates.length ? Math.max(...dates) : +new Date(notebook.updated_at);
       card.innerHTML = `<div class="title">${esc(notebook.title)}</div>
@@ -199,6 +201,7 @@
   renderSpreads = async function () {
     const notebook = await get('notebooks', route.notebookId);
     if (!notebook) { route = {screen:'notebooks'}; return render(); }
+    window.v340MaybeSync?.(30000);
     topTitle.textContent = notebook.title;
     const spreads = (await getAllByIndex('spreads', 'notebook_id', notebook.id)).filter(row => !row.deleted_at)
       .sort((a, b) => Number(a.number) - Number(b.number));
@@ -425,6 +428,27 @@
   const unreadStyle = document.createElement('style');
   unreadStyle.textContent = '.v340-unread-badge{z-index:6!important;box-shadow:0 0 0 2px var(--card)}';
   document.head.appendChild(unreadStyle);
+  // Single place that pushes the canonical unread state into the DOM (no full re-render).
+  window.v340RefreshBadges = function () {
+    for (const card of document.querySelectorAll('.notebook-card[data-notebook-server-id]')) {
+      const serverId = card.dataset.notebookServerId;
+      const count = serverId ? Number(settings.unread_by_notebook?.[serverId]?.count || 0) : 0;
+      let badge = card.querySelector('.v340-unread-badge');
+      if (!count) { if (badge) badge.remove(); continue; }
+      if (!badge) { badge = document.createElement('span'); badge.className = 'v340-unread-badge'; card.appendChild(badge); }
+      badge.textContent = count > 99 ? '99+' : String(count);
+    }
+    for (const card of document.querySelectorAll('.spread-card[data-spread-server-id]')) {
+      const serverId = card.dataset.spreadServerId;
+      const count = serverId ? Number(settings.unread_spreads?.[serverId]?.count || 0) : 0;
+      let dot = card.querySelector('.v340-unread-dot');
+      if (!count) { if (dot) dot.remove(); continue; }
+      if (!dot) { dot = document.createElement('span'); dot.className = 'v340-unread-dot'; card.appendChild(dot); }
+      dot.textContent = count > 99 ? '99+' : String(count);
+    }
+    if (typeof window.v340RefreshHistoryBadge === 'function') window.v340RefreshHistoryBadge();
+  };
+  window.BlocknotV3.on('unread-change', () => window.v340RefreshBadges());
   // A cover that arrives from another phone must appear without manual navigation.
   window.BlocknotV3.on('cover-change', () => {
     if (route.screen === 'notebooks') render();

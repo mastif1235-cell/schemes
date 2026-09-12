@@ -72,6 +72,15 @@
   // ---- shared notebook cover --------------------------------------------------------------
   const coverSyncEnabled = () => !!(window.vNextSync && window.vNextSync.enabled('notebook_cover'));
   window.v340CoverBlobId = notebookId => COVER_PREFIX + notebookId;
+  // Lightweight sync request with a throttle: opening a screen may ask for fresh data, but never
+  // builds a polling loop.
+  window.v340MaybeSync = function (minIntervalMs = 30000) {
+    if (!isAuthed() || !isOnline()) return;
+    const last = Number(window.__v340LastSyncRequest || 0);
+    if (Date.now() - last < minIntervalMs) return;
+    window.__v340LastSyncRequest = Date.now();
+    void fullSync();
+  };
 
   async function queueCoverChange(notebook, op) {
     if (!notebook || !notebook.id) return;

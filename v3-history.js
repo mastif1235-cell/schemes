@@ -92,6 +92,15 @@
   }
 
   window.v340RefreshHistoryBadge = refreshBadge;
+  // One canonical client unread state: the server response is authoritative, badges derive from it.
+  window.v340ApplyUnread = async function (unread) {
+    if (!unread) return;
+    settings.unread_by_notebook = unread.notebooks || {};
+    settings.unread_spreads = unread.spreads || {};
+    settings.unread_total = Number(unread.total || 0);
+    await saveSettings();
+    window.BlocknotV3.emit('unread-change');
+  };
   function cacheKeyFor(scope, event) { return scope + '|' + (event.legacy ? 'legacy:' : '') + event.id; }
 
   async function cacheServerEvents(events, scope) {
@@ -133,8 +142,10 @@
     if (!spread || !spread.server_id || !window.vNextSync.enabled('activity_spread_seen')) return;
     const entry = (settings.unread_spreads || {})[spread.server_id];
     if (!entry || !entry.count || !isOnline()) return;
-    try { await api(`/api/spreads/${encodeURIComponent(spread.server_id)}/activity/seen`, {method:'PUT', json:{seq:entry.max_seq}}); }
+    let seenResponse = null;
+    try { seenResponse = await api(`/api/spreads/${encodeURIComponent(spread.server_id)}/activity/seen`, {method:'PUT', json:{seq:entry.max_seq}}); }
     catch (error) { console.warn('Spread seen could not be stored', error); return; }
+    if (seenResponse && seenResponse.unread) { await window.v340ApplyUnread(seenResponse.unread); return; }
     const spreadMap = {...(settings.unread_spreads || {})};
     delete spreadMap[spread.server_id];
     settings.unread_spreads = spreadMap;
@@ -206,12 +217,15 @@
   async function markNotebookSeen(serverNotebookId) {
     if (!window.vNextSync.enabled('activity_seen') || !serverNotebookId || !isOnline()) return false;
     try {
-      await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:{}});
-      const map = {...(settings.unread_by_notebook || {})};
-      delete map[serverNotebookId];
-      settings.unread_by_notebook = map;
-      settings.unread_total = Object.values(map).reduce((sum, row) => sum + Number(row && row.count || 0), 0);
-      await saveSettings();
+      const data = await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:{}});
+      if (data && data.unread) await window.v340ApplyUnread(data.unread);
+      else {
+        const map = {...(settings.unread_by_notebook || {})};
+        delete map[serverNotebookId];
+        settings.unread_by_notebook = map;
+        settings.unread_total = Object.values(map).reduce((sum, row) => sum + Number(row && row.count || 0), 0);
+        await saveSettings();
+      }
       return true;
     } catch (error) {
       console.warn('History seen cursor could not be stored', error);

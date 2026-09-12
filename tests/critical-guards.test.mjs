@@ -168,6 +168,16 @@ assert.match(history, /const hasServerNotebook = isAuthed\(\)/);
 assert.match(read('v3-ui.js'), /v340-unread-badge\{z-index:6!important/);
 assert.match(worker, /ae\.spread_id IS NULL/);
 assert.match(worker, /unread\.total = Object\.values\(unread\.notebooks\)/);
+assert.match(worker, /async function unreadState\(env/);
+assert.match(worker, /unread: await unreadForUser\(env, u\.userId\)/);
+assert.match(history, /window\.v340ApplyUnread = async function/);
+const uiSource = read('v3-ui.js');
+assert.match(uiSource, /window\.v340RefreshBadges = function/);
+assert.match(uiSource, /dataset\.notebookServerId/);
+assert.match(uiSource, /dataset\.spreadServerId/);
+assert.match(uiSource, /BlocknotV3\.on\('unread-change', \(\) => window\.v340RefreshBadges\(\)\)/);
+assert.match(uiSource, /window\.v340MaybeSync\?\.\(30000\)/);
+assert.match(core, /window\.v340MaybeSync = function/);
 // BUG 3: newest first everywhere (seq DESC, created_at/id fallback) and a re-render when a cover arrives.
 assert.match(history, /\(Number\(b\.seq\)\|\|0\)-\(Number\(a\.seq\)\|\|0\)/);
 assert.match(history, /eventTime\(b\) - eventTime\(a\)/);
