@@ -68,6 +68,7 @@ try {
   await page.getByText('Проверил муфту — всё нормально',{exact:true}).waitFor();
   assert.equal(await page.evaluate(async () => (await getAll('spread_notes')).length),1);
   await context.route(origin+'/api/spreads/remote-s1/notes',async route => {
+    if (route.request().method() === 'GET') { await route.fulfill({json:{notes:[]}}); return; }
     const body=route.request().postDataJSON();
     await route.fulfill({json:{note:{id:body.id,spread_id:'remote-s1',author_id:'u1',author_display_name:'Артём',body:body.body,revision:1,created_at:'2026-09-03T10:42:00Z'}}});
   });
@@ -273,6 +274,29 @@ try {
   assert.ok(!memberSkip.fatal, 'member migration flow failed: ' + memberSkip.fatal);
   assert.equal(memberSkip.after,memberSkip.before,'MEMBER does not auto-publish a legacy cover');
   assert.equal(memberSkip.skipped,'member-skip');
+  // B→A notes: opening a spread must fetch the server copy even when the local cache is empty.
+  await context.route(origin+'/api/spreads/remote-s1/notes', route => route.fulfill({json:{notes:[{
+    id:'remote-note-b', spread_id:'remote-s1', notebook_id:'remote-nb', author_id:'u2',
+    author_display_name:'Петя', body:'Заметка с телефона B', revision:1, created_at:'2026-09-12T13:00:00.000Z'}]}}));
+  const noteFlow = await page.evaluate(async () => {
+    settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{team_notes:true, activity:true, activity_spread_seen:true}};
+    await window.v340OpenSpread(await get('spreads','s1'));
+    await new Promise(res => setTimeout(res, 250));
+    const text = document.querySelector('.vnext-notes')?.textContent || '';
+    document.querySelector('.viewer')?.remove();
+    return text;
+  });
+  assert.match(noteFlow,/Заметка с телефона B/,'owner sees a note created on the other phone');
+  // History list must render server activity even with no capability flags set.
+  assert.equal(await page.evaluate(async () => {
+    settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{}};
+    route = {screen:'notebooks'}; render();
+    await window.v340OpenGlobalHistory();
+    await new Promise(res => setTimeout(res, 250));
+    const rows = document.querySelectorAll('[data-server-history] .v340-history-row').length;
+    document.querySelector('.sheet-backdrop')?.remove();
+    return rows >= 1;
+  }), true, 'global history is not capability-gated');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, own notes, metadata, photo safety, reorder, history, viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

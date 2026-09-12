@@ -421,6 +421,10 @@
   const teamStyle = document.createElement('style');
   teamStyle.textContent = `.vnext-order-row{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--border)}.vnext-order-row button{padding:0;min-width:44px}.v340-history-list pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.82rem}.v340-history-list summary{cursor:pointer;padding:10px 0}.v340-unread-badge{position:absolute;right:10px;top:10px;min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:var(--danger);color:#fff;font:700 11px/20px var(--font-sans);text-align:center}.v340-unread-dot{position:absolute;left:8px;top:8px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--danger);color:#fff;font:700 10px/18px var(--font-sans);text-align:center;z-index:4}`;
   document.head.appendChild(teamStyle);
+  // Unread badge must stay above the notebook cover image.
+  const unreadStyle = document.createElement('style');
+  unreadStyle.textContent = '.v340-unread-badge{z-index:6!important;box-shadow:0 0 0 2px var(--card)}';
+  document.head.appendChild(unreadStyle);
   // A cover that arrives from another phone must appear without manual navigation.
   window.BlocknotV3.on('cover-change', () => {
     if (route.screen === 'notebooks') render();

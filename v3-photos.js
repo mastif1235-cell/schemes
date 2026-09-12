@@ -5,6 +5,17 @@
   async function renderNotes(host, spread) {
     if (!host?.isConnected) return;
     const team = window.vNextSync;
+    // Always refresh the server copy when a spread is opened: a note added on another phone must
+    // appear here even if this device's sync cursor already passed it.
+    if (spread?.server_id && isAuthed() && isOnline()) {
+      try {
+        const data = await api(`/api/spreads/${encodeURIComponent(spread.server_id)}/notes`);
+        for (const note of (data.notes || [])) await team.cacheNote(note, spread, true);
+      } catch (error) {
+        console.warn('Server notes could not be refreshed', error);
+      }
+      if (!host.isConnected) return;
+    }
     if (!team.enabled('team_notes')) {
       host.innerHTML = '<h3>Примечания</h3><p>Общие примечания станут доступны после обновления сервера.</p>';
       return;

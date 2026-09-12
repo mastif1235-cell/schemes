@@ -1,5 +1,5 @@
 {
-  "version": "3.4.4",
+  "version": "3.4.5",
   "files": [
     {
       "path": "chunk1.txt",
@@ -27,7 +27,7 @@
     },
     {
       "path": "v3-photos.js",
-      "sha256": "88e9314c1dec10f8683c77b2c955957b3a023e2f928aeed1f44cddfccaea3f71"
+      "sha256": "c89578a36d4f44fa0837cb91db12f4a35bb798a9a2f785a8567d3b15b5990d10"
     },
     {
       "path": "v3-camera.js",
@@ -35,11 +35,11 @@
     },
     {
       "path": "v3-history.js",
-      "sha256": "177febff7eb17eb587063054e0d48e4570babc4b98b54d647f2524f9f61bc3ed"
+      "sha256": "63ddff515e188c903f6c79e43e8fea595410516a8dadac8fee95d15f332c06ff"
     },
     {
       "path": "v3-ui.js",
-      "sha256": "dababeb4f1690dfb914e5111f7f87071e10a4850d3777e22784ec4095dd83e8b"
+      "sha256": "80c138ad97f1039435fb5ac1ac0ac3e993869533736f63085a6feeffcbe3ef6e"
     }
   ]
 }

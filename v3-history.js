@@ -102,7 +102,9 @@
   }
 
   async function refreshNotebookActivity(notebook) {
-    if (!notebook.server_id || !window.vNextSync.enabled('activity') || !isOnline()) return;
+    // Server history is fetched whenever the backend is reachable: the journal must be the same for
+    // Owner and MEMBER and must not depend on capability flags or on what this device cached before.
+    if (!notebook.server_id || !isAuthed() || !isOnline()) return;
     const data = await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/activity?limit=100`);
     await cacheServerEvents([...(data.events || []), ...(data.legacy_events || [])], window.vNextSync.scope());
   }
@@ -298,7 +300,9 @@
 
   window.openNotebookHistory = notebook => openTeamHistory(notebook);
   window.v340OpenGlobalHistory = async () => {
-    if (window.vNextSync.enabled('activity')) return openServerHistory();
+    const hasServerNotebook = isAuthed()
+      && (await getAll('notebooks')).some(row => row.server_id && !row.deleted_at && !row.hidden_no_access);
+    if (hasServerNotebook) return openServerHistory();
     const notebook = route.screen === 'spreads' && route.notebookId ? await get('notebooks',route.notebookId) : null;
     return notebook ? openTeamHistory(notebook) : openHistory(null);
   };

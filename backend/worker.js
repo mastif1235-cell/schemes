@@ -1462,29 +1462,40 @@ on('GET', '/api/sync', async (request, env) => {
   // Unread is per user and per notebook; it never depends on another device's read state.
   const unread = { notebooks: {}, spreads: {}, total: 0 };
   if (!Array.isArray(changes.notebook_covers)) changes.notebook_covers = [];
+  // Canonical unread: spread events use the spread cursor, notebook-level events (no spread_id)
+  // use the notebook cursor. A notebook is the sum of both, the global total is the sum of
+  // notebooks, and no event is counted twice.
+  let spreadSeenReady = false;
   if (coverReady) {
-    const unreadRows = await env.DB.prepare(
+    spreadSeenReady = await hasSpreadSeenSchema(env);
+    const levelRows = await env.DB.prepare(
       `SELECT ae.notebook_id AS notebook_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
        FROM activity_events ae
        LEFT JOIN activity_seen s ON s.user_id=? AND s.notebook_id=ae.notebook_id
-       WHERE ae.notebook_id IN (${ph}) AND ae.seq > COALESCE(s.last_seen_seq,0)
+       WHERE ae.notebook_id IN (${ph})${spreadSeenReady ? ' AND ae.spread_id IS NULL' : ''}
+         AND ae.seq > COALESCE(s.last_seen_seq,0)
        GROUP BY ae.notebook_id`
     ).bind(u.userId, ...notebookIds).all();
-    for (const row of unreadRows.results) {
-      unread.notebooks[row.notebook_id] = { count: row.count, max_seq: row.max_seq };
-      unread.total += row.count;
+    for (const row of levelRows.results) {
+      unread.notebooks[row.notebook_id] = { count: row.count, max_seq: row.max_seq, level: row.count };
     }
   }
-  if (await hasSpreadSeenSchema(env)) {
+  if (spreadSeenReady) {
     const spreadUnreadRows = await env.DB.prepare(
-      `SELECT ae.spread_id AS spread_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
+      `SELECT ae.notebook_id AS notebook_id, ae.spread_id AS spread_id, COUNT(*) AS count, MAX(ae.seq) AS max_seq
        FROM activity_events ae
        LEFT JOIN activity_spread_seen ss ON ss.user_id=? AND ss.spread_id=ae.spread_id
        WHERE ae.notebook_id IN (${ph}) AND ae.spread_id IS NOT NULL AND ae.seq > COALESCE(ss.last_seen_seq,0)
        GROUP BY ae.spread_id`
     ).bind(u.userId, ...notebookIds).all();
-    for (const row of spreadUnreadRows.results) unread.spreads[row.spread_id] = { count: row.count, max_seq: row.max_seq };
+    for (const row of spreadUnreadRows.results) {
+      unread.spreads[row.spread_id] = { count: row.count, max_seq: row.max_seq };
+      const current = unread.notebooks[row.notebook_id] || {count:0, max_seq:0, level:0};
+      unread.notebooks[row.notebook_id] = {count: current.count + row.count,
+        max_seq: Math.max(Number(current.max_seq) || 0, Number(row.max_seq) || 0), level: current.level || 0};
+    }
   }
+  unread.total = Object.values(unread.notebooks).reduce((sum, row) => sum + Number(row.count || 0), 0);
   return json({ changes, unread, next_cursor: cursor, has_more: anyFull });
 });
 

@@ -162,6 +162,12 @@ assert.match(core, /cover_migration:'member-skip'/);
 assert.match(core, /cover_migrated_at:nowISO\(\)/);
 assert.match(read('v3-ui.js'), /v340-unread-badge/);
 assert.match(read('v3-ui.js'), /v340-unread-dot/);
+assert.match(photos, /Server notes could not be refreshed/);
+assert.match(photos, /team\.cacheNote\(note, spread, true\)/);
+assert.match(history, /const hasServerNotebook = isAuthed\(\)/);
+assert.match(read('v3-ui.js'), /v340-unread-badge\{z-index:6!important/);
+assert.match(worker, /ae\.spread_id IS NULL/);
+assert.match(worker, /unread\.total = Object\.values\(unread\.notebooks\)/);
 // BUG 3: newest first everywhere (seq DESC, created_at/id fallback) and a re-render when a cover arrives.
 assert.match(history, /\(Number\(b\.seq\)\|\|0\)-\(Number\(a\.seq\)\|\|0\)/);
 assert.match(history, /eventTime\(b\) - eventTime\(a\)/);

@@ -467,7 +467,10 @@ try {
 
   const seen = await api(env2, 'PUT', '/api/notebooks/n1/activity/seen', 'token-2', {});
   assert.ok(seen.data.last_seen_seq > 0, 'seen cursor is stored server-side');
-  assert.equal((await api(env2, 'GET', '/api/sync?since=0', 'token-2')).data.unread.notebooks.n1, undefined, 'member badge clears');
+  const afterNotebookSeen = (await api(env2, 'GET', '/api/sync?since=0', 'token-2')).data.unread;
+  assert.ok(afterNotebookSeen.notebooks.n1, 'spread unread keeps the notebook badge until the spread is opened');
+  assert.equal(afterNotebookSeen.notebooks.n1.level, 0, 'notebook-level (no spread) events are marked seen');
+  assert.ok(Object.values(afterNotebookSeen.spreads).reduce((sum, row) => sum + row.count, 0) > 0, 'spread events stay unread');
   assert.equal((await api(env2, 'GET', '/api/sync?since=0', 'token-1')).data.unread.notebooks.n1.count, ownerUnreadBefore,
     'seen is per user: opening history on one device never clears another');
 
@@ -487,11 +490,19 @@ try {
   // Per-spread unread: opening one spread clears only that spread, for the current user only.
   const spreadUnreadBefore = (await api(env2, 'GET', '/api/sync?since=0', 'token-2')).data.unread.spreads.s2?.count || 0;
   assert.ok(spreadUnreadBefore >= 1, 'per-spread unread is reported');
+  const canonical = (await api(env2, 'GET', '/api/sync?since=0', 'token-2')).data.unread;
+  const notebookSum = Object.values(canonical.notebooks).reduce((sum, row) => sum + row.count, 0);
+  const spreadSum = Object.values(canonical.spreads).reduce((sum, row) => sum + row.count, 0);
+  const levelSum = Object.values(canonical.notebooks).reduce((sum, row) => sum + (row.level || 0), 0);
+  assert.equal(canonical.total, notebookSum, 'global unread equals the sum of notebook unread');
+  assert.equal(notebookSum, spreadSum + levelSum, 'notebook unread equals spread unread plus notebook-level unread');
   const spreadSeen = await api(env2, 'PUT', '/api/spreads/s2/activity/seen', 'token-2', {});
   assert.ok(spreadSeen.data.last_seen_seq > 0, 'spread seen cursor stored');
   const afterSpreadSeen = await api(env2, 'GET', '/api/sync?since=0', 'token-2');
   assert.equal(afterSpreadSeen.data.unread.spreads.s2, undefined, 'only the opened spread is cleared');
-  assert.ok((afterSpreadSeen.data.unread.notebooks.n1?.count || 0) >= 1, 'notebook unread stays until the notebook is marked seen');
+  const afterNotebookSum = Object.values(afterSpreadSeen.data.unread.notebooks).reduce((sum, row) => sum + row.count, 0);
+  assert.equal(afterSpreadSeen.data.unread.total, afterNotebookSum, 'global still equals the notebook sum after spread seen');
+  assert.ok((afterSpreadSeen.data.unread.notebooks.n1?.count || 0) < notebookSum, 'notebook unread decreases with the spread');
   assert.ok(((await api(env2, 'GET', '/api/sync?since=0', 'token-1')).data.unread.spreads.s2?.count || 0) >= 1,
     'spread seen is isolated per user');
 
