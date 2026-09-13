@@ -32,6 +32,176 @@
       failed:queue.filter(item => item.status === 'failed').length, errors, coverPending};
   }
 
+  function diagnosticScope(item) {
+    return String(item.scope || '(legacy: scope отсутствует)');
+  }
+
+  function conflictGroupKey(item) {
+    return [diagnosticScope(item), String(item.entity || ''), String(item.local_id || item.photo_id || '')].join('\n');
+  }
+
+  function selectedFields(value) {
+    if (!value || typeof value !== 'object') return null;
+    const selected = {};
+    for (const key of FIELD_NAMES) if (Object.hasOwn(value, key)) selected[key] = value[key];
+    return Object.keys(selected).length ? selected : null;
+  }
+
+  function storedServerCopy(item) {
+    return item.server_copy || item.conflicts?.server_copy || item.conflicts?.server_note || null;
+  }
+
+  function storedConflicts(item) {
+    const source = item.conflicts?.conflicts || item.conflicts;
+    if (!source || typeof source !== 'object') return null;
+    if (item.entity === 'spread_fields') {
+      const result = {};
+      for (const key of FIELD_NAMES) {
+        const conflict = source[key];
+        if (conflict && typeof conflict === 'object') {
+          result[key] = {base:conflict.base, mine:conflict.mine, server:conflict.server};
+        }
+      }
+      return Object.keys(result).length ? result : null;
+    }
+    if (item.entity === 'spread_note' && item.conflicts?.server_note) {
+      const note = item.conflicts.server_note;
+      return {server_note:{id:note.id, revision:note.revision, body:note.body,
+        deleted_at:note.deleted_at || null, updated_at:note.updated_at || null}};
+    }
+    return null;
+  }
+
+  function conflictReason(entity, items) {
+    if (entity === 'spread_fields') {
+      const fields = new Set();
+      for (const item of items) for (const key of Object.keys(storedConflicts(item) || {})) fields.add(key);
+      return fields.size
+        ? `Поля ${[...fields].join(', ')} отличаются от сохранённой базы и локального значения.`
+        : 'Сервер отклонил field merge; подробности ответа не сохранены.';
+    }
+    if (entity === 'spread') return 'Legacy PATCH использовал устаревшую revision. Кнопка «Повторить» conflict-записи не отправляет.';
+    if (entity === 'spread_note') return 'Revision примечания изменилась на другом устройстве.';
+    return items.find(item => item.last_error)?.last_error || 'Сервер вернул конфликт; автоматический retry отключён.';
+  }
+
+  async function conflictGroups() {
+    const conflicts = (await getAll('sync_queue')).filter(item => item.status === 'conflict');
+    const grouped = new Map();
+    for (const item of conflicts) {
+      const key = conflictGroupKey(item);
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(item);
+    }
+    const groups = [];
+    for (const [key, items] of grouped) {
+      const first = items[0];
+      let spread = null;
+      if (first.entity === 'spread' || first.entity === 'spread_fields') spread = await get('spreads', first.local_id);
+      else if (first.spread_id) spread = await get('spreads', first.spread_id);
+      else if (first.photo_id) {
+        const photo = await get('photos', first.photo_id);
+        if (photo?.spread_id) spread = await get('spreads', photo.spread_id);
+      }
+      const storedServer = [...items].reverse().map(storedServerCopy).find(Boolean) || null;
+      groups.push({
+        key,
+        scope:diagnosticScope(first),
+        entity:first.entity || '(не указан)',
+        localId:first.local_id || first.photo_id || '(не указан)',
+        kind:first.entity === 'spread' ? 'legacy spread' : first.entity === 'spread_fields' ? 'spread_fields' : first.entity || 'unknown',
+        spread:spread ? {id:spread.id, server_id:spread.server_id || null, number:spread.number,
+          title:spread.title || '', revision:spread.revision, values:metadata(spread)} : null,
+        server:storedServer ? {id:storedServer.id || null, revision:storedServer.revision,
+          deleted_at:storedServer.deleted_at || null, values:selectedFields(storedServer)} : null,
+        reason:conflictReason(first.entity, items),
+        items:items.sort((a,b) => Number(a.id || 0) - Number(b.id || 0)).map(item => ({
+          id:item.id,
+          status:item.status,
+          retry_count:Number(item.retry_count || 0),
+          last_error:item.last_error || null,
+          method_or_op:item.method || item.op || item.payload?.op || null,
+          revision:item.payload?.revision ?? null,
+          base_revision:item.payload?.base_revision ?? null,
+          changes:selectedFields(item.payload?.changes),
+          base_values:selectedFields(item.payload?.base_values),
+          server_conflicts:storedConflicts(item),
+          server_copy:storedServerCopy(item) ? {
+            id:storedServerCopy(item).id || null,
+            revision:storedServerCopy(item).revision,
+            deleted_at:storedServerCopy(item).deleted_at || null,
+            values:selectedFields(storedServerCopy(item))
+          } : null
+        }))
+      });
+    }
+    return groups.sort((a,b) => a.kind.localeCompare(b.kind) || String(a.spread?.number ?? '').localeCompare(String(b.spread?.number ?? '')));
+  }
+
+  function sameSpreadValues(left, right) {
+    return JSON.stringify(metadata(left)) === JSON.stringify(metadata(right));
+  }
+
+  // Prepared for an explicit future action. Diagnostics and sync never call this function.
+  // It performs one read-only server GET and writes only when every metadata value already matches.
+  async function safeResolveDuplicateSpreadConflicts(groupOrKey) {
+    const requestedKey = typeof groupOrKey === 'string' ? groupOrKey : groupOrKey?.key;
+    const group = (await conflictGroups()).find(item => item.key === requestedKey);
+    if (!group || group.entity !== 'spread') return {resolved:false, reason:'not_legacy_spread'};
+    if (!group.items.length || group.items.some(item => item.status !== 'conflict' || item.method_or_op === 'delete')) {
+      return {resolved:false, reason:'unsupported_group'};
+    }
+    const local = await get('spreads', group.localId);
+    if (!local?.server_id || local.deleted_at || !isOnline() || !isAuthed()) return {resolved:false, reason:'server_check_unavailable'};
+    const expectedScope = scope();
+    if (group.scope !== '(legacy: scope отсутствует)' && group.scope !== expectedScope) return {resolved:false, reason:'scope_mismatch'};
+    const response = await api(`/api/spreads/${encodeURIComponent(local.server_id)}`);
+    assertScope(expectedScope);
+    const server = response?.spread;
+    if (!server || server.id !== local.server_id || !sameSpreadValues(local, server)) {
+      return {resolved:false, reason:'values_differ'};
+    }
+    const queue = await getAll('sync_queue');
+    const ids = new Set(group.items.map(item => item.id));
+    const currentItems = queue.filter(item => ids.has(item.id));
+    if (currentItems.length !== ids.size || currentItems.some(item => item.status !== 'conflict' || conflictGroupKey(item) !== group.key)) {
+      return {resolved:false, reason:'group_changed'};
+    }
+    await window.vNextAtomic('spreads', group.localId, current => {
+      if (!current || current.server_id !== server.id || !sameSpreadValues(current, server)) throw new Error('Конфликт изменился; ничего не закрыто');
+      return {
+        row:{...current, revision:server.revision, updated_at:server.updated_at || current.updated_at,
+          metadata_base:metadata(server), conflict:null},
+        retired:currentItems.map(item => ({...item, status:'done', last_error:'server already equals local metadata', server_copy:null}))
+      };
+    });
+    return {resolved:true, count:currentItems.length};
+  }
+
+  async function openConflictDiagnostics() {
+    const groups = await conflictGroups();
+    const {el} = openSheet(`<div class="sheet-handle"></div><h2>Диагностика конфликтов</h2>
+      <p class="warn-box">Только чтение. Записи со статусом conflict не повторяются кнопкой «Повторить».</p>
+      <p class="v340-caption">Экран не запускает синхронизацию, не отправляет PATCH и не изменяет очередь.</p>
+      <div data-conflict-diagnostics></div>`);
+    const host = el.querySelector('[data-conflict-diagnostics]');
+    if (!groups.length) { host.innerHTML = '<div class="empty-state">Конфликтов в очереди нет.</div>'; return; }
+    for (const group of groups) {
+      const card = document.createElement('article');
+      card.className = 'v350-conflict-diagnostic';
+      const local = group.spread ? group.spread.values : null;
+      card.innerHTML = `<h3>${esc(group.kind)} · ${group.items.length > 1 ? `${group.items.length} дублей` : '1 запись'}</h3>
+        <p><strong>Разворот:</strong> ${esc(group.spread ? `№${group.spread.number} ${group.spread.title || ''}` : 'не определён')}</p>
+        <p><strong>local_id:</strong> <code>${esc(group.localId)}</code></p>
+        <p><strong>scope:</strong> <code>${esc(group.scope)}</code></p>
+        <p><strong>Причина:</strong> ${esc(group.reason)}</p>
+        <details open><summary>Локально · revision ${esc(group.spread?.revision ?? '—')}</summary><pre>${esc(JSON.stringify(local, null, 2))}</pre></details>
+        <details open><summary>С сервера · revision ${esc(group.server?.revision ?? '—')}</summary><pre>${esc(JSON.stringify(group.server?.values || group.items.map(item => item.server_conflicts).filter(Boolean), null, 2))}</pre></details>
+        <details><summary>Queue items: ${group.items.map(item => '#' + item.id).join(', ')}</summary><pre>${esc(JSON.stringify(group.items, null, 2))}</pre></details>`;
+      host.appendChild(card);
+    }
+  }
+
   function notebookValues(row) {
     return {title:String(row?.title || ''), description:String(row?.description || ''), archived:!!row?.archived};
   }
@@ -132,9 +302,11 @@
       const {el:sheet, close} = openSheet(`<div class="sheet-handle"></div><h2>Синхронизация</h2>
         <p data-sync-diagnostic>${esc(fresh.label)}</p><p>Ожидает отправки: ${fresh.pending}. Конфликтов: ${fresh.conflicts}.</p>
         ${fresh.notebookConflicts ? '<button class="btn-secondary" data-notebook-conflicts>Разобрать конфликты блокнотов</button>' : ''}
+        ${fresh.conflicts ? '<button class="btn-secondary" data-conflict-diagnostics>Показать конфликты</button>' : ''}
         <button class="btn-primary" data-sync-retry>Повторить</button>`);
       sheet.querySelector('[data-sync-retry]').onclick = () => { close(); void fullSync(true); };
       sheet.querySelector('[data-notebook-conflicts]')?.addEventListener('click', () => { close(); void openNotebookConflicts(); });
+      sheet.querySelector('[data-conflict-diagnostics]')?.addEventListener('click', () => { close(); void openConflictDiagnostics(); });
     };
     el.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); el.click(); } };
   };
@@ -863,7 +1035,8 @@
     if (refreshRequested) { refreshRequested = false; setTimeout(() => void fullSync(), 0); }
   };
 
-  window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts};
+  window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics, conflictGroups, openConflictDiagnostics,
+    safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
   const baseQueueEntityChange = typeof queueEntityChange === 'function' ? queueEntityChange : async (entity, localId, extra = {}) => {
     await put('sync_queue', {entity, local_id:localId, status:'pending', retry_count:0, ...extra});
@@ -907,4 +1080,13 @@
       hasMore = !!data.has_more;
     }
   };
+
+  if (document.head && typeof document.createElement === 'function') {
+    const diagnosticStyle = document.createElement('style');
+    diagnosticStyle.textContent = `.v350-conflict-diagnostic{margin:12px 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
+      .v350-conflict-diagnostic h3{margin:0 0 10px}.v350-conflict-diagnostic p{overflow-wrap:anywhere}
+      .v350-conflict-diagnostic details{margin-top:8px}.v350-conflict-diagnostic summary{cursor:pointer;font-weight:600}
+      .v350-conflict-diagnostic pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:8px;border-radius:8px;background:var(--surface-2);font-size:.78rem}`;
+    document.head.appendChild(diagnosticStyle);
+  }
 })();

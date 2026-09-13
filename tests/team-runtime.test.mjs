@@ -360,6 +360,31 @@ try {
   });
   assert.equal(backToHistory.opened,true,'history row opens the spread');
   assert.equal(backToHistory.historyBack,true,'closing the spread returns to History');
+  // Conflict diagnostics must expose only the requested fields and leave IndexedDB untouched.
+  const diagnostic = await page.evaluate(async () => {
+    document.querySelectorAll('.sheet-backdrop,.viewer').forEach(node=>node.remove());
+    route={screen:'notebooks'};await render();
+    const server={id:'remote-s1',number:1,title:'Сервер',status:'Актуально',note_short:'server short',note_full:'server full',revision:8};
+    await put('sync_queue',{id:901,entity:'spread',local_id:'s1',status:'conflict',retry_count:2,last_error:'revision conflict',server_copy:server});
+    await put('sync_queue',{id:902,entity:'spread',local_id:'s1',status:'conflict',retry_count:3,last_error:'revision conflict',server_copy:server});
+    const before=JSON.stringify((await getAll('sync_queue')).filter(row=>row.id===901||row.id===902));
+    let syncCalls=0;fullSync=async()=>{syncCalls++;};
+    document.getElementById('syncDot').click();
+    await new Promise(res=>setTimeout(res,30));
+    const button=document.querySelector('[data-conflict-diagnostics]');
+    button?.click();await new Promise(res=>setTimeout(res,30));
+    const text=document.querySelector('[data-conflict-diagnostics]')?.textContent||'';
+    const after=JSON.stringify((await getAll('sync_queue')).filter(row=>row.id===901||row.id===902));
+    document.querySelector('.sheet-backdrop')?.remove();
+    await del('sync_queue',901);await del('sync_queue',902);
+    return {hasButton:!!button,text,unchanged:before===after,syncCalls};
+  });
+  assert.equal(diagnostic.hasButton,true,'sync sheet exposes conflict diagnostics');
+  assert.match(diagnostic.text,/legacy spread/);
+  assert.match(diagnostic.text,/2 дублей/);
+  assert.match(diagnostic.text,/не отправляет/,'diagnostics explains that Retry skips conflicts');
+  assert.equal(diagnostic.unchanged,true,'opening diagnostics does not write IndexedDB');
+  assert.equal(diagnostic.syncCalls,0,'opening diagnostics does not start fullSync');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

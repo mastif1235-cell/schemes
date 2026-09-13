@@ -109,7 +109,9 @@ async function testConflictIsNotMarkedDone() {
     spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', title:'local', revision:1}],
     sync_queue:[{id:3, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0}]
   });
+  let calls = 0;
   runtime.setApi(async () => {
+    calls++;
     const error = new Error('conflict');
     error.status = 409;
     error.data = {server_copy:{title:'remote', revision:2}};
@@ -119,6 +121,58 @@ async function testConflictIsNotMarkedDone() {
   assert.equal(runtime.db.sync_queue.get(3).status, 'conflict');
   assert.equal(runtime.db.spreads.get('sp-local').title, 'local');
   assert.equal(runtime.db.spreads.get('sp-local').conflict.title, 'remote');
+
+  await runtime.context.pushEntityQueue(true);
+  assert.equal(runtime.db.sync_queue.get(3).status, 'conflict');
+  assert.equal(calls, 1, 'manual retry must not retry conflict rows');
+}
+
+async function testReadOnlyConflictDiagnosticsAndPreparedSafeResolution() {
+  const local = {id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', number:7,
+    title:'Одинаково', status:'Актуально', note_short:'коротко', note_full:'полностью', revision:2};
+  const server = {id:'sp-server', notebook_id:'nb-server', number:7,
+    title:'Одинаково', status:'Актуально', note_short:'коротко', note_full:'полностью', revision:9,
+    updated_at:'2026-09-13T20:00:00.000Z'};
+  const runtime = createRuntime({spreads:[local],sync_queue:[
+    {id:31,entity:'spread',local_id:'sp-local',status:'conflict',retry_count:1,last_error:'revision conflict',server_copy:server},
+    {id:32,entity:'spread',local_id:'sp-local',status:'conflict',retry_count:2,last_error:'revision conflict',server_copy:server},
+    {id:33,entity:'spread_fields',local_id:'sp-local',scope:'https://example.test|u1',status:'conflict',retry_count:0,
+      payload:{changes:{title:'Телефон'},base_values:{title:'База'},client_ref:'hidden-client-ref',auth_token:'must-not-leak'},
+      conflicts:{conflicts:{title:{base:'База',mine:'Телефон',server:'Сервер'}},server_copy:{...server,title:'Сервер'}}}
+  ]});
+  const before = structuredClone([...runtime.db.sync_queue.values()]);
+  const groups = await runtime.context.window.v340Sync.conflictGroups();
+  assert.equal(groups.length,2);
+  const legacy = groups.find(group=>group.entity==='spread');
+  const fields = groups.find(group=>group.entity==='spread_fields');
+  assert.equal(legacy.kind,'legacy spread');
+  assert.equal(legacy.items.length,2);
+  assert.equal(legacy.spread.number,7);
+  assert.match(legacy.reason,/не отправляет/);
+  assert.deepEqual(JSON.parse(JSON.stringify(fields.items[0].changes)),{title:'Телефон'});
+  assert.deepEqual(JSON.parse(JSON.stringify(fields.items[0].base_values)),{title:'База'});
+  assert.deepEqual(JSON.parse(JSON.stringify(fields.items[0].server_conflicts)),{title:{base:'База',mine:'Телефон',server:'Сервер'}});
+  assert.doesNotMatch(JSON.stringify(groups),/must-not-leak|hidden-client-ref/,'diagnostics omit auth and idempotency values');
+  assert.deepEqual([...runtime.db.sync_queue.values()],before,'diagnostics must not change IndexedDB');
+
+  let requests = [];
+  runtime.setApi(async (path, options) => { requests.push([path,options]); return {spread:server}; });
+  const result = await runtime.context.window.v340Sync.safeResolveDuplicateSpreadConflicts(legacy.key);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)),{resolved:true,count:2});
+  assert.deepEqual(requests,[['/api/spreads/sp-server',undefined]],'prepared resolver uses one read-only GET');
+  assert.deepEqual([runtime.db.sync_queue.get(31).status,runtime.db.sync_queue.get(32).status],['done','done']);
+  assert.equal(runtime.db.sync_queue.get(33).status,'conflict','unrelated field conflict stays untouched');
+  assert.equal(runtime.db.spreads.get('sp-local').revision,9);
+
+  const mismatch = createRuntime({spreads:[local],sync_queue:[
+    {id:41,entity:'spread',local_id:'sp-local',status:'conflict',server_copy:{...server,title:'Сервер'}}
+  ]});
+  mismatch.setApi(async () => ({spread:{...server,title:'Сервер'}}));
+  const mismatchGroup = (await mismatch.context.window.v340Sync.conflictGroups())[0];
+  assert.deepEqual(JSON.parse(JSON.stringify(await mismatch.context.window.v340Sync.safeResolveDuplicateSpreadConflicts(mismatchGroup))),
+    {resolved:false,reason:'values_differ'});
+  assert.equal(mismatch.db.sync_queue.get(41).status,'conflict');
+  assert.equal(mismatch.db.spreads.get('sp-local').title,'Одинаково');
 }
 
 async function testPullPreservesPendingLocalEdit() {
@@ -178,6 +232,7 @@ async function testQueuedSpreadDeleteSurvivesSnapshot() {
 await testDeferredDependencyStaysPending();
 await testFailedRetryBackoffAndManualRetry();
 await testConflictIsNotMarkedDone();
+await testReadOnlyConflictDiagnosticsAndPreparedSafeResolution();
 await testPullPreservesPendingLocalEdit();
 await testIncrementalPhotoMappingMatchesSnapshotFields();
 await testQueuedSpreadDeleteSurvivesSnapshot();
