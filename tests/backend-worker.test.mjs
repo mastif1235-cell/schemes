@@ -268,19 +268,40 @@ assert.equal(edited.status, 200, 'edit own note');
 assert.equal(edited.data.note.revision, 2);
 
 const editForeign = await api(env, 'PATCH', '/api/notes/note-1', 'token-2', {
-  client_ref: 'phone-b:edit-foreign', revision: 2, body: 'Нельзя',
+  client_ref: 'phone-b:edit-foreign', revision: 2, body: 'Участник исправил текст',
 });
-assert.equal(editForeign.status, 403, 'cannot edit foreign note');
+assert.equal(editForeign.status, 200, 'MEMBER edits another author note');
+assert.equal(editForeign.data.note.author_id, 'u1', 'original note author is preserved');
+assert.equal(editForeign.data.note.revision, 3);
+const editEvent = sqlite.prepare("SELECT actor_user_id FROM activity_events WHERE action='note.updated' ORDER BY seq DESC LIMIT 1").get();
+assert.equal(editEvent.actor_user_id, 'u2', 'activity records the actual editor');
 
-const deleted = await api(env, 'DELETE', '/api/notes/note-1', 'token-1', {
-  client_ref: 'phone-a:delete-1', revision: 2,
+const staleEdit = await api(env, 'PATCH', '/api/notes/note-1', 'token-1', {
+  client_ref: 'phone-a:stale-edit', revision: 2, body: 'Устаревшая версия',
 });
-assert.equal(deleted.status, 200, 'soft delete note');
+assert.equal(staleEdit.status, 409, 'two users editing the same revision still conflict');
+
+sqlite.prepare('INSERT INTO users VALUES (?,?,?)').run('u9', 'Чужой', '2026-09-03T10:00:00.000Z');
+sqlite.prepare('INSERT INTO sessions(id,user_id,token_hash,device_name,created_at,expires_at) VALUES(?,?,?,?,?,?)')
+  .run('session-9', 'u9', tokenHash('token-9'), 'phone-x', '2026-09-03T10:00:00.000Z', '2099-01-01T00:00:00.000Z');
+assert.equal((await api(env, 'PATCH', '/api/notes/note-1', 'token-9', {
+  client_ref:'outsider-edit', revision:3, body:'Нет доступа',
+})).status, 403, 'outsider cannot edit a note');
+assert.equal((await api(env, 'DELETE', '/api/notes/note-1', 'token-9', {
+  client_ref:'outsider-delete', revision:3,
+})).status, 403, 'outsider cannot delete a note');
+
+const deleted = await api(env, 'DELETE', '/api/notes/note-1', 'token-2', {
+  client_ref: 'phone-b:delete-1', revision: 3,
+});
+assert.equal(deleted.status, 200, 'MEMBER soft-deletes another author note');
 assert.ok(deleted.data.note.deleted_at);
+assert.equal(deleted.data.note.author_id, 'u1', 'soft delete preserves original author');
 assert.equal(sqlite.prepare('SELECT COUNT(*) AS c FROM spread_notes WHERE id=?').get('note-1').c, 1);
 
-const deleteEvent = sqlite.prepare("SELECT old_value FROM activity_events WHERE action='note.deleted'").get();
-assert.equal(JSON.parse(deleteEvent.old_value).body, 'Проверил муфту — всё нормально');
+const deleteEvent = sqlite.prepare("SELECT actor_user_id,old_value FROM activity_events WHERE action='note.deleted'").get();
+assert.equal(deleteEvent.actor_user_id, 'u2', 'activity records the actual deleter');
+assert.equal(JSON.parse(deleteEvent.old_value).body, 'Участник исправил текст');
 
 const activityForMember = await api(env, 'GET', '/api/notebooks/n1/activity', 'token-2');
 assert.equal(activityForMember.status, 200, 'activity visible to second member');

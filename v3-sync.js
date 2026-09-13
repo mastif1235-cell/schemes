@@ -28,7 +28,94 @@
       : failed ? 'Ошибка: ' + name(failed) : coverPending ? 'Ожидает загрузки: covers'
       : queue.length ? 'Ожидает отправки: ' + queue.length : settings.sync_status === 'error' ? 'Ошибка синхронизации' : 'Синхронизировано';
     return {label, pending:queue.length, conflicts:queue.filter(item => item.status === 'conflict').length,
+      notebookConflicts:queue.filter(item => item.entity === 'notebook' && item.status === 'conflict').length,
       failed:queue.filter(item => item.status === 'failed').length, errors, coverPending};
+  }
+
+  function notebookValues(row) {
+    return {title:String(row?.title || ''), description:String(row?.description || ''), archived:!!row?.archived};
+  }
+
+  function sameNotebookValues(left, right) {
+    return JSON.stringify(notebookValues(left)) === JSON.stringify(notebookValues(right));
+  }
+
+  async function notebookConflictGroups(refresh = true) {
+    const queue = await getAll('sync_queue');
+    const conflicts = queue.filter(item => item.entity === 'notebook' && (!item.scope || item.scope === scope()) && item.status === 'conflict');
+    const groups = [];
+    for (const localId of new Set(conflicts.map(item => item.local_id))) {
+      const items = conflicts.filter(item => item.local_id === localId);
+      const local = await get('notebooks', localId);
+      let server = items.find(item => item.server_copy)?.server_copy || null;
+      if (refresh && local?.server_id && isOnline()) {
+        try { server = (await api(`/api/notebooks/${encodeURIComponent(local.server_id)}`)).notebook || server; }
+        catch (error) { console.warn('Notebook conflict refresh failed', error); }
+      }
+      groups.push({localId, local, server, items});
+    }
+    return groups;
+  }
+
+  async function resolveNotebookConflict(group, choice) {
+    if (!group?.local || !group?.server || !group.items?.length) throw new Error('Версии блокнота недоступны');
+    const server = group.server;
+    const sorted = [...group.items].sort((a,b) => Number(a.id || 0) - Number(b.id || 0));
+    await window.vNextAtomic('notebooks', group.localId, current => {
+      if (!current) throw new Error('Локальный блокнот не найден');
+      const row = choice === 'server'
+        ? {...current, ...notebookValues(server), revision:server.revision, updated_at:server.updated_at, conflict:null}
+        : {...current, revision:server.revision, conflict:null};
+      const keep = sorted[sorted.length - 1];
+      const retired = sorted.map(item => choice === 'local' && item.id === keep.id
+        ? {...item, scope:scope(), status:'pending', retry_count:0, last_error:null, next_attempt_at:null, server_copy:null}
+        : {...item, status:'done', last_error:'superseded by notebook conflict resolution', server_copy:null});
+      return {row, retired};
+    });
+    return choice === 'local';
+  }
+
+  async function reconcileNotebookConflicts() {
+    let resolved = 0;
+    for (const group of await notebookConflictGroups(true)) {
+      if (!group.local) {
+        for (const item of group.items) await put('sync_queue', {...item,status:'done',last_error:'local notebook no longer exists'});
+        resolved += group.items.length;
+      } else if (group.server && sameNotebookValues(group.local, group.server)) {
+        await resolveNotebookConflict(group, 'server');
+        resolved += group.items.length;
+      }
+    }
+    return resolved;
+  }
+
+  async function openNotebookConflicts() {
+    await reconcileNotebookConflicts();
+    const groups = (await notebookConflictGroups(true)).filter(group => group.local && group.server);
+    if (!groups.length) { toast('Конфликты блокнотов разрешены'); await updateSyncIndicator(); return; }
+    const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>Конфликты блокнотов</h2>
+      <p class="v340-caption">Выберите итоговую версию. Все старые дубли этого блокнота будут закрыты.</p><div data-notebook-conflicts></div>`);
+    const host = el.querySelector('[data-notebook-conflicts]');
+    for (const group of groups) {
+      const card = document.createElement('article'); card.className = 'v340-notebook-conflict';
+      card.innerHTML = `<h3>${esc(group.local.title || group.server.title || 'Блокнот')}</h3>
+        <div class="v340-conflict-compare"><div><strong>На телефоне</strong><p>${esc(group.local.title || '')}</p><small>${esc(group.local.description || 'Без описания')}</small></div>
+        <div><strong>На сервере</strong><p>${esc(group.server.title || '')}</p><small>${esc(group.server.description || 'Без описания')}</small></div></div>
+        <p class="v340-caption">Старых записей: ${group.items.length}. Ревизии: телефон ${esc(group.local.revision ?? '—')}, сервер ${esc(group.server.revision ?? '—')}.</p>
+        <div class="btn-row"><button class="btn-secondary" data-choice="server">Версия сервера</button><button class="btn-primary" data-choice="local">Версия телефона</button></div>`;
+      card.onclick = async event => {
+        const button = event.target.closest('[data-choice]'); if (!button) return;
+        card.querySelectorAll('button').forEach(item => { item.disabled = true; });
+        try {
+          const needsPush = await resolveNotebookConflict(group, button.dataset.choice);
+          card.remove();
+          if (needsPush) void fullSync(true);
+          if (!host.children.length) { close(); toast('Конфликты блокнотов разрешены'); }
+          await updateSyncIndicator();
+        } catch (error) { toast(error.message); card.querySelectorAll('button').forEach(item => { item.disabled = false; }); }
+      };
+      host.appendChild(card);
+    }
   }
 
   updateSyncIndicator = async function () {
@@ -44,8 +131,10 @@
       const fresh = await diagnostics();
       const {el:sheet, close} = openSheet(`<div class="sheet-handle"></div><h2>Синхронизация</h2>
         <p data-sync-diagnostic>${esc(fresh.label)}</p><p>Ожидает отправки: ${fresh.pending}. Конфликтов: ${fresh.conflicts}.</p>
+        ${fresh.notebookConflicts ? '<button class="btn-secondary" data-notebook-conflicts>Разобрать конфликты блокнотов</button>' : ''}
         <button class="btn-primary" data-sync-retry>Повторить</button>`);
       sheet.querySelector('[data-sync-retry]').onclick = () => { close(); void fullSync(true); };
+      sheet.querySelector('[data-notebook-conflicts]')?.addEventListener('click', () => { close(); void openNotebookConflicts(); });
     };
     el.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); el.click(); } };
   };
@@ -87,10 +176,11 @@
     const id = existing?.id || uid(), cache_id = scope() + '|' + id;
     await window.vNextAtomic('spread_notes', cache_id, current => {
       if (current?.pending) throw new Error('Сначала синхронизируйте предыдущее изменение примечания');
-      if (existing && (!current || current.author_id !== settings.user_id || current.deleted_at)) throw new Error('Можно изменить только своё доступное примечание');
+      if (existing && (!current || current.deleted_at)) throw new Error('Примечание недоступно');
       const now = nowISO();
       const row = {...current, id, cache_id, scope:scope(), spread_id:spread.id, notebook_id:spread.notebook_id,
-        author_id:settings.user_id, author_display_name:settings.user_display_name,
+        author_id:current?.author_id || settings.user_id,
+        author_display_name:current?.author_display_name || settings.user_display_name,
         body:remove ? current.body : body.trim(), created_at:current?.created_at || now, updated_at:now,
         deleted_at:remove ? now : null, pending:true, sync_error:null};
       return {row, item:{entity:'spread_note', local_id:cache_id, scope:scope(), spread_id:spread.id,
@@ -118,7 +208,7 @@
 
   async function resolveNote(note, choice, body) {
     const previous = await noteConflict(note), server = previous?.conflicts?.server_note;
-    if (!previous || !server || note.author_id !== settings.user_id) throw new Error('Нет доступной серверной версии; повторите синхронизацию');
+    if (!previous || !server) throw new Error('Нет доступной серверной версии; повторите синхронизацию');
     const {id: previousId, ...requeued} = previous;
     if (choice !== 'server' && server.deleted_at) throw new Error('Примечание удалено на сервере; новый текст можно добавить отдельным примечанием');
     if (choice !== 'server' && previous.method !== 'DELETE' && (!body.trim() || body.trim().length > 10000)) throw new Error('Введите примечание до 10000 символов');
@@ -720,6 +810,8 @@
         // One failing push step must never skip the pull: history/unread would silently stop
         // updating (content still arrives through its own refetch), which is exactly the bug we hit.
         if (sessionVerified) {
+          try { await reconcileNotebookConflicts(); }
+          catch (error) { recordFailure('notebook conflicts', error); console.warn('Notebook conflicts could not be reconciled', error); }
           try { await pushEntityQueue(!!manual); }
           catch (error) { recordFailure('outbox', error); console.warn('Outbox push failed; continuing with pull', error); }
           assertScope(sessionScope);
@@ -771,8 +863,26 @@
     if (refreshRequested) { refreshRequested = false; setTimeout(() => void fullSync(), 0); }
   };
 
-  window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics};
+  window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
+  const baseQueueEntityChange = typeof queueEntityChange === 'function' ? queueEntityChange : async (entity, localId, extra = {}) => {
+    await put('sync_queue', {entity, local_id:localId, status:'pending', retry_count:0, ...extra});
+  };
+  queueEntityChange = async function (entity, localId, extra = {}) {
+    if (entity !== 'notebook') return baseQueueEntityChange(entity, localId, extra);
+    const queue = await getAll('sync_queue');
+    const same = queue.filter(item => item.entity === 'notebook' && item.local_id === localId
+      && (!item.scope || item.scope === scope()) && UNSYNCED.has(item.status));
+    const reusable = same.find(item => item.status === 'pending' || item.status === 'failed');
+    if (reusable) {
+      await put('sync_queue', {...reusable, ...extra, scope:scope(), status:'pending', retry_count:0,
+        last_error:null, next_attempt_at:null});
+    } else if (!same.some(item => item.status === 'conflict')) {
+      await baseQueueEntityChange(entity, localId, {...extra, scope:scope()});
+      return;
+    }
+    void fullSync();
+  };
   // The base pull loop only knows about changes and the cursor; unread counts arrive in the same
   // envelope, so the loop is kept here where the server response is available.
   pullChanges = async function () {

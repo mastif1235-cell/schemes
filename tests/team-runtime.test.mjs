@@ -78,7 +78,8 @@ try {
     window.BlocknotV3.emit('sync-complete');
   });
   await page.getByText('Примечание Пети',{exact:true}).waitFor();
-  assert.equal(await page.locator('[data-note-edit]').count(),1,'only own note editable');
+  assert.equal(await page.locator('[data-note-edit]').count(),2,'all active members can edit notebook notes');
+  assert.equal(await page.locator('[data-note-delete]').count(),2,'all active members can delete notebook notes');
   const icon = await page.locator('.viewer-top [data-action="close"]').evaluate(el => ({width:el.getBoundingClientRect().width,color:getComputedStyle(el).color}));
   assert.ok(icon.width>=43.9);assert.equal(icon.color,'rgb(255, 255, 255)');
   assert.equal(await page.locator('.v340-zoom-controls button').count(),6);
@@ -208,6 +209,8 @@ try {
   // ---- global server history + unread levels + legacy cover migration -------------------------
   await context.route(origin+'/api/spreads/remote-s1/activity/seen', route => route.fulfill({json:{last_seen_seq:8,
     unread:{notebooks:{},spreads:{},total:0}}}));
+  await context.route(origin+'/api/activity/unread', route => route.fulfill({json:{unread:{
+    notebooks:{'remote-nb':{count:1,max_seq:9}},spreads:{'remote-s1':{count:1,max_seq:9}},total:1}}}));
   await context.route(origin+'/api/notebooks/remote-nb/cover', async route => route.fulfill({
     json:{cover: route.request().method() === 'GET' ? null : {notebook_id:'remote-nb',revision:1,deleted_at:null,seq:40}}}));
   let memberRole = 'OWNER';
@@ -285,10 +288,12 @@ try {
     await window.v340OpenSpread(await get('spreads','s1'));
     await new Promise(res => setTimeout(res, 250));
     const text = document.querySelector('.vnext-notes')?.textContent || '';
+    const unread = settings.unread_total;
     document.querySelector('.viewer')?.remove();
-    return text;
+    return {text, unread};
   });
-  assert.match(noteFlow,/Заметка с телефона B/,'owner sees a note created on the other phone');
+  assert.match(noteFlow.text,/Заметка с телефона B/,'owner sees a note created on the other phone');
+  assert.equal(noteFlow.unread,0,'opening the spread clears the freshly fetched server unread state');
   // History list must render server activity even with no capability flags set.
   assert.equal(await page.evaluate(async () => {
     settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{}};
@@ -306,13 +311,36 @@ try {
     await new Promise(res => setTimeout(res, 250));
     const host = document.querySelector('.vnext-notes');
     const input = host?.querySelector('[data-note-input]');
+    const add = host?.querySelector('[data-note-add]');
     const list = host?.querySelector('[data-note-list]');
     const ordered = !!(input && list) && (input.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     const texts = [...(host?.querySelectorAll('[data-note-list] .vnext-note p') || [])].map(el => el.textContent);
+    const inputBox=input?.getBoundingClientRect(), addBox=add?.getBoundingClientRect(), hostBox=host?.getBoundingClientRect();
+    const fullWidth=!!(inputBox&&addBox&&hostBox)&&Math.abs(inputBox.width-hostBox.width)<2&&Math.abs(addBox.width-hostBox.width)<2;
+    const minHeight=inputBox?.height || 0;
+    const foreignActions=host?.querySelectorAll('.vnext-note .v342-note-actions').length || 0;
     document.querySelector('.viewer')?.remove();
-    return {ordered, texts};
+    return {ordered, texts, fullWidth, minHeight, foreignActions};
   });
   assert.equal(composer.ordered,true,'notes composer is above the notes list');
+  assert.equal(composer.fullWidth,true,'notes textarea and add button use full width');
+  assert.ok(composer.minHeight>=80,'notes textarea remains comfortably tall');
+  assert.ok(composer.foreignActions>=1,'active member sees edit/delete actions on another author note');
+  const fullscreen = await page.evaluate(async () => {
+    settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{team_notes:true,activity_spread_seen:true}};
+    await window.v340OpenSpread(await get('spreads','s1'));
+    await new Promise(res=>setTimeout(res,150));
+    const detail=document.querySelector('.v340-viewer'); detail.scrollTop=17;
+    detail.querySelector('[data-image]')?.click(); await new Promise(res=>setTimeout(res,150));
+    const full=document.querySelector('.v342-photo-fullscreen');
+    const pure=!!full&&!full.querySelector('.vnext-notes')&&!full.textContent.includes('Примечания');
+    const navBelow=!!full?.querySelector('.v342-photo-nav')&&full.querySelector('[data-full-stage]').compareDocumentPosition(full.querySelector('.v342-photo-nav'))&Node.DOCUMENT_POSITION_FOLLOWING;
+    full?.querySelector('[data-full-close]')?.click(); await new Promise(res=>setTimeout(res,50));
+    const restored=!!document.querySelector('.v340-viewer')&&!document.querySelector('.v342-photo-fullscreen');
+    document.querySelector('.v340-viewer')?.remove();
+    return {pure,navBelow:!!navBelow,restored};
+  });
+  assert.deepEqual(fullscreen,{pure:true,navBelow:true,restored:true},'fullscreen is photo-only and returns to the same spread detail');
   // Back from a spread opened in History must reopen History.
   const backToHistory = await page.evaluate(async () => {
     settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{activity:true, activity_spread_seen:true}};
@@ -333,5 +361,5 @@ try {
   assert.equal(backToHistory.opened,true,'history row opens the spread');
   assert.equal(backToHistory.historyBack,true,'closing the spread returns to History');
   assert.deepEqual(errors,[]);
-  console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, own notes, metadata, photo safety, reorder, history, viewer Back; Chromium mobile viewport)');
+  console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

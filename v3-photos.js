@@ -11,8 +11,11 @@
       try {
         const data = await api(`/api/spreads/${encodeURIComponent(spread.server_id)}/notes`);
         for (const note of (data.notes || [])) await team.cacheNote(note, spread);
-        // Content refresh must also refresh the server-owned activity/unread envelope.
-        window.vNextSync.requestRemoteRefresh();
+        // Refresh the authoritative per-user cursor before marking this spread seen. Otherwise a
+        // direct open can fetch a new note while an older local unread map has no entry to clear.
+        const unread = await api('/api/activity/unread');
+        if (unread?.unread && window.v340ApplyUnread) await window.v340ApplyUnread(unread.unread);
+        if (window.v340MarkSpreadSeen) await window.v340MarkSpreadSeen(spread);
       } catch (error) {
         console.warn('Server notes could not be refreshed', error);
       }
@@ -58,8 +61,8 @@
       item.innerHTML = `<strong>${esc(note.author_display_name || (note.author_id === settings.user_id ? 'Вы' : 'Участник'))}</strong>
         <small> · ${esc(new Date(note.updated_at || note.created_at).toLocaleString('ru-RU'))}</small>
         <p>${esc(note.body)}</p>${note.pending ? `<small>${note.sync_error ? '⚠ ' + esc(note.sync_error) : note.deleted_at ? 'Удаление ожидает синхронизации' : '⏳ Ожидает синхронизации'}</small>` : ''}
-        ${note.author_id === settings.user_id && !note.pending ? '<div class="btn-row"><button data-note-edit>Изменить</button><button data-note-delete>Удалить</button></div>' : ''}
-        ${conflict && note.author_id === settings.user_id ? '<button data-note-conflict>Сравнить примечания</button>' : ''}`;
+        ${!note.pending ? '<div class="v342-note-actions"><button data-note-edit>Изменить</button><button data-note-delete>Удалить</button></div>' : ''}
+        ${conflict ? '<button data-note-conflict>Сравнить примечания</button>' : ''}`;
       item.querySelector('[data-note-conflict]')?.addEventListener('click',() => {
         const server = conflict.conflicts?.server_note;
         const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>Примечание изменено на другом устройстве</h2>
@@ -77,7 +80,7 @@
         el.querySelector('[data-resolve-mine]').onclick=()=>resolve('mine');
       });
       item.querySelector('[data-note-edit]')?.addEventListener('click',() => edit(note));
-      item.querySelector('[data-note-delete]')?.addEventListener('click',() => confirmAction('Удалить ваше примечание?',async () => {
+      item.querySelector('[data-note-delete]')?.addEventListener('click',() => confirmAction('Удалить это примечание?',async () => {
         try { await team.saveNote(spread,'',note,true); await renderNotes(host,spread); }
         catch (error) { console.warn('Note delete failed',error); toast(error.message); }
       }));
@@ -195,6 +198,68 @@
     if (spread) return window.v340OpenSpread(spread);
   };
 
+  async function openPhotoFullscreen(spreads, initialIndex) {
+    let index = initialIndex, objectUrl = null, closed = false;
+    const overlay = document.createElement('div');
+    overlay.className = 'viewer v342-photo-fullscreen';
+    document.body.appendChild(overlay);
+    const result = new Promise(resolve => { overlay.__resolveIndex = resolve; });
+    const revoke = () => { if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; } };
+    const close = () => {
+      if (closed) return;
+      closed = true; revoke(); overlay.remove(); overlay.__resolveIndex(index);
+    };
+    async function draw() {
+      revoke();
+      const spread = spreads[index];
+      const photo = spread.current_photo_id ? await get('photos', spread.current_photo_id) : null;
+      const resolved = photo ? await window.v340ResolvePhotoBlob(photo, true) : {blob:null};
+      if (closed) return;
+      if (resolved.blob) objectUrl = URL.createObjectURL(resolved.blob);
+      overlay.innerHTML = `<div class="viewer-top"><button class="icon-btn" data-full-close aria-label="Закрыть">✕</button>
+        <span class="num">№${esc(spread.number)} · ${index + 1}/${spreads.length}</span></div>
+        <div class="viewer-stage" data-full-stage>${objectUrl ? `<img data-full-image src="${objectUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}</div>
+        ${spreads.length > 1 ? '<div class="v342-photo-nav"><button data-full-nav="prev" aria-label="Предыдущее фото">← Предыдущее</button><button data-full-nav="next" aria-label="Следующее фото">Следующее →</button></div>' : ''}
+        <div class="v340-zoom-controls"><button data-full-zoom="minus">−</button><button data-full-zoom="reset">100%</button><button data-full-zoom="plus">+</button></div>`;
+      const stage = overlay.querySelector('[data-full-stage]');
+      const image = overlay.querySelector('[data-full-image]');
+      const reset = overlay.querySelector('[data-full-zoom="reset"]');
+      const gesture = {scale:1,x:0,y:0,pointers:new Map(),startScale:1,startDistance:0,startX:0,startY:0,lastTap:0};
+      const apply = () => {
+        if (!image) return;
+        if (gesture.scale <= 1) { gesture.scale=1; gesture.x=0; gesture.y=0; }
+        image.style.transform=`translate(${gesture.x}px,${gesture.y}px) scale(${gesture.scale})`;
+        reset.textContent=Math.round(gesture.scale*100)+'%';
+      };
+      const scale = value => { gesture.scale=Math.max(1,Math.min(6,value)); apply(); };
+      stage?.addEventListener('pointerdown', event => {
+        stage.setPointerCapture(event.pointerId); gesture.pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+        if (gesture.pointers.size === 1) { gesture.startX=event.clientX; gesture.startY=event.clientY; }
+        if (gesture.pointers.size === 2) { const p=[...gesture.pointers.values()]; gesture.startDistance=Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y); gesture.startScale=gesture.scale; }
+      });
+      stage?.addEventListener('pointermove', event => {
+        const previous=gesture.pointers.get(event.pointerId); if (!previous) return;
+        gesture.pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+        if (gesture.pointers.size === 2) { const p=[...gesture.pointers.values()]; const distance=Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y); scale(gesture.startScale*distance/(gesture.startDistance||distance)); }
+        else if (gesture.scale > 1) { gesture.x += event.clientX-previous.x; gesture.y += event.clientY-previous.y; apply(); }
+      });
+      stage?.addEventListener('pointerup', event => {
+        const dx=event.clientX-gesture.startX, dy=event.clientY-gesture.startY;
+        gesture.pointers.delete(event.pointerId);
+        if (gesture.scale <= 1.001 && Math.abs(dx)>60 && Math.abs(dx)>Math.abs(dy)) { index=(index+(dx<0?1:-1)+spreads.length)%spreads.length; void draw(); return; }
+        if (Math.hypot(dx,dy)<10) { const now=Date.now(); if(now-gesture.lastTap<320) scale(gesture.scale===1?2.5:1); gesture.lastTap=now; }
+      });
+      stage?.addEventListener('pointercancel', event => gesture.pointers.delete(event.pointerId));
+      overlay.querySelector('[data-full-close]').onclick=close;
+      overlay.querySelectorAll('[data-full-nav]').forEach(button => button.onclick=()=>{index=(index+(button.dataset.fullNav==='next'?1:-1)+spreads.length)%spreads.length;void draw();});
+      overlay.querySelector('[data-full-zoom="minus"]').onclick=()=>scale(gesture.scale-.5);
+      overlay.querySelector('[data-full-zoom="plus"]').onclick=()=>scale(gesture.scale+.5);
+      reset.onclick=()=>scale(1);
+    }
+    await draw();
+    return result;
+  }
+
   attachPhoto = async function (spread, file, explicitTarget) {
     if (!spread || !file) return null;
     const frozen = window.BlocknotV3.photoTarget && window.BlocknotV3.photoTarget.current();
@@ -307,8 +372,8 @@
         <button class="icon-btn" data-action="edit" aria-label="Редактировать">✎</button></div>
         <div class="viewer-stage" data-stage>
           ${currentUrl ? `<img data-image src="${currentUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}
-          ${spreads.length > 1 ? '<button class="viewer-nav prev v341-nav-zone" data-nav="prev" aria-label="Предыдущее фото">←</button><button class="viewer-nav next v341-nav-zone" data-nav="next" aria-label="Следующее фото">→</button>' : ''}
         </div>
+        ${spreads.length > 1 ? '<div class="v342-photo-nav"><button data-nav="prev" aria-label="Предыдущее фото">← Предыдущее</button><button data-nav="next" aria-label="Следующее фото">Следующее →</button></div>' : ''}
         <div class="v340-zoom-controls"><button data-action="minus">−</button><button data-action="reset">100%</button><button data-action="plus">+</button><button data-action="rotate-left" aria-label="Повернуть влево на 90 градусов">↺ 90°</button><button data-action="rotate-right" aria-label="Повернуть вправо на 90 градусов">↻ 90°</button><button data-action="download">⬇</button></div>
         ${spread.field_conflicts ? '<div class="warn-box v340-conflict">⚠ Одно поле изменено на двух устройствах <button data-action="edit">Сравнить поля</button></div>' : spread.conflict ? '<div class="warn-box v340-conflict">⚠ Конфликт версий<div class="btn-row"><button class="btn-secondary" data-action="server">Версия сервера</button><button class="btn-primary" data-action="mine">Сохранить мою</button></div></div>' : ''}
         <div class="viewer-bottom"><div class="t">${esc(spread.title || 'Без названия')}</div>
@@ -397,7 +462,7 @@
         stage.addEventListener('pointerup', endPointer);
         stage.addEventListener('pointercancel', event => gesture.pointers.delete(event.pointerId));
 
-        for (const nav of stage.querySelectorAll('[data-nav]')) {
+        for (const nav of overlay.querySelectorAll('[data-nav]')) {
           let press = null;
           nav.addEventListener('pointerdown', event => {
             event.stopPropagation();
@@ -428,6 +493,13 @@
           });
         }
       }
+
+      image?.addEventListener('click', async event => {
+        if (gesture.scale > 1.001 || gesture.moved || event.detail > 1) return;
+        const scrollTop = overlay.scrollTop;
+        const selected = await openPhotoFullscreen(spreads, index);
+        if (selected !== index) { index = selected; await draw(); overlay.scrollTop = scrollTop; }
+      });
 
       overlay.onclick = async event => {
         const button = event.target.closest('[data-action]');
@@ -528,9 +600,9 @@
   };
 
   const extraStyle = document.createElement('style');
-  extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img{will-change:transform;transform-origin:center}.v341-nav-zone{position:absolute;top:12%;bottom:12%;height:auto;width:min(24vw,128px);z-index:3;border:0;background:transparent;color:#ffffff99;font-size:2rem;touch-action:none}.v341-nav-zone.prev{left:0;text-align:left;padding-left:14px}.v341-nav-zone.next{right:0;text-align:right;padding-right:14px}.viewer-stage.v341-zoomed .v341-nav-zone{pointer-events:none;opacity:0}`;
+  extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img,.v342-photo-fullscreen img{will-change:transform;transform-origin:center}.v342-photo-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px;background:#171717}.v342-photo-nav button{min-height:44px;color:#fff;background:#ffffff18;border:1px solid #ffffff38}.v342-photo-fullscreen{z-index:130;background:#080808}.v342-photo-fullscreen .viewer-stage{flex:1;min-height:0}.v342-photo-fullscreen .viewer-top{flex:0 0 auto}`;
   document.head.appendChild(extraStyle);
   const teamStyle = document.createElement('style');
-  teamStyle.textContent = `.sheet-backdrop{z-index:120}.v340-viewer .viewer-top .icon-btn{color:#fff;background:rgba(255,255,255,.18);border:1px solid #ffffff38;width:44px;height:44px;min-width:44px;min-height:44px;border-radius:50%;padding:0}.v340-viewer .viewer-actions{display:flex;gap:8px}.v340-viewer .viewer-actions button{min-height:44px;flex:1;padding:8px 10px}.vnext-notes{margin-top:12px;border-top:1px solid #ffffff38;padding-top:10px}.vnext-note{padding:10px 0;border-bottom:1px solid #ffffff28}.vnext-note p{white-space:pre-wrap;overflow-wrap:anywhere}.vnext-note-caption,.vnext-note small{font-size:.8rem;opacity:.8}.vnext-notes button{color:inherit;background:#ffffff18;border:1px solid #ffffff38}`;
+  teamStyle.textContent = `.sheet-backdrop{z-index:120}.v340-viewer .viewer-top .icon-btn,.v342-photo-fullscreen .viewer-top .icon-btn{color:#fff;background:rgba(255,255,255,.18);border:1px solid #ffffff38;width:44px;height:44px;min-width:44px;min-height:44px;border-radius:50%;padding:0}.v340-viewer .viewer-actions{display:flex;gap:8px}.v340-viewer .viewer-actions button{min-height:44px;flex:1;padding:8px 10px}.vnext-notes{margin-top:12px;border-top:1px solid #ffffff38;padding-top:10px}.vnext-note{padding:10px 0;border-bottom:1px solid #ffffff28}.vnext-note p{white-space:pre-wrap;overflow-wrap:anywhere}.vnext-note-caption,.vnext-note small{font-size:.8rem;opacity:.8}.vnext-notes button{color:inherit;background:#ffffff18;border:1px solid #ffffff38}.vnext-note-composer{display:grid;grid-template-columns:1fr;gap:8px;width:100%}.vnext-note-composer textarea{display:block;width:100%;min-height:96px;box-sizing:border-box;resize:vertical}.vnext-note-composer [data-note-add]{display:block;width:100%;min-height:44px}.v342-note-actions{display:flex;gap:6px;justify-content:flex-end}.v342-note-actions button{min-height:36px;padding:6px 10px;font-size:.86rem}`;
   document.head.appendChild(teamStyle);
 })();

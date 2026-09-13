@@ -216,7 +216,13 @@ assert.equal(team.db.spread_notes.size, 2, 'independent notes retained');
 assert.equal(team.db.activity_events.size, 1);
 await assert.rejects(c.window.vNextSync.applyTeamChanges({spread_notes:[{id:'orphan',spread_id:'missing'}]}), /ожидает/);
 const foreign = [...team.db.spread_notes.values()].find(row => row.author_id === 'u2');
-await assert.rejects(c.window.vNextSync.saveNote(teamSeed.spreads[0], 'attack', foreign), /своё/);
+const memberEdit = createRuntime({notebooks:teamSeed.notebooks,spreads:teamSeed.spreads,spread_notes:[foreign]});
+memberEdit.context.settings.team_capabilities = {scope:memberEdit.context.window.vNextSync.scope(),flags:{team_notes:true}};
+memberEdit.context.fullSync = async () => {};
+await memberEdit.context.window.vNextSync.saveNote(teamSeed.spreads[0], 'Исправлено участником', foreign);
+const editedForeign = memberEdit.db.spread_notes.get(foreign.cache_id);
+assert.equal(editedForeign.author_id, 'u2', 'member edit preserves original author');
+assert.equal([...memberEdit.db.sync_queue.values()].find(row=>row.entity==='spread_note').method,'PATCH');
 await c.window.vNextSync.saveFields(team.db.spreads.get('sp'), {title:'mine'}, {title:'B text'});
 team.setApi(async () => { const error = new Error('field_conflict'); error.status = 409;
   error.data = {conflicts:{title:{base:'B text',mine:'mine',server:'other'}}}; throw error; });
@@ -286,6 +292,32 @@ assert.equal(resolvedItem.payload.revision,3);
 assert.equal(resolvedItem.payload.body,'merged');
 assert.notEqual(resolvedItem.payload.client_ref,'previous','resolution is a new explicit operation');
 assert.equal(noteResolution.db.spread_notes.get(conflictNote.cache_id).body,'merged');
+
+// Legacy notebook conflicts: identical server state closes every stale duplicate without PATCH.
+const notebookSame = createRuntime({notebooks:[{id:'nb',server_id:'remote-nb',title:'Общий',description:'',archived:false,revision:1}],sync_queue:[
+  {id:1,entity:'notebook',local_id:'nb',status:'conflict',server_copy:{title:'Старое',revision:2}},
+  {id:2,entity:'notebook',local_id:'nb',status:'conflict',server_copy:{title:'Старое',revision:2}}
+]});
+let notebookCalls=0;
+notebookSame.setApi(async path=>{notebookCalls++;assert.equal(path,'/api/notebooks/remote-nb');return {notebook:{id:'remote-nb',title:'Общий',description:'',archived:0,revision:7}};});
+assert.equal(await notebookSame.context.window.v340Sync.reconcileNotebookConflicts(),2);
+assert.equal(notebookSame.db.notebooks.get('nb').revision,7);
+assert.deepEqual([...notebookSame.db.sync_queue.values()].map(row=>row.status),['done','done']);
+assert.equal(notebookCalls,1,'one server refresh per conflicted notebook');
+
+// A genuine difference keeps one user choice and collapses all old outbox duplicates.
+const notebookDifferent = createRuntime({notebooks:[{id:'nb',server_id:'remote-nb',title:'Телефон',description:'локально',archived:false,revision:1}],sync_queue:[
+  {id:1,entity:'notebook',local_id:'nb',status:'conflict'}, {id:2,entity:'notebook',local_id:'nb',status:'conflict'}
+]});
+notebookDifferent.setApi(async()=>({notebook:{id:'remote-nb',title:'Сервер',description:'удалённо',archived:0,revision:5}}));
+const [notebookGroup] = await notebookDifferent.context.window.v340Sync.notebookConflictGroups(true);
+await notebookDifferent.context.window.v340Sync.resolveNotebookConflict(notebookGroup,'local');
+assert.equal(notebookDifferent.db.notebooks.get('nb').title,'Телефон');
+assert.equal(notebookDifferent.db.notebooks.get('nb').revision,5);
+assert.equal([...notebookDifferent.db.sync_queue.values()].filter(row=>row.status==='pending').length,1);
+assert.equal([...notebookDifferent.db.sync_queue.values()].filter(row=>row.status==='done').length,1);
+await notebookDifferent.context.queueEntityChange('notebook','nb');
+assert.equal(notebookDifferent.db.sync_queue.size,2,'new notebook edits reuse the one pending outbox row');
 
 // Shared cover + server unread: sync applies server cover state, but never over a pending local change.
 const coverApplied = [];

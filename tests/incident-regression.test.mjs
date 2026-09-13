@@ -49,12 +49,16 @@ try{
     fullSync=async()=>{};
     await window.vNextSync.saveNote(await get('spreads','sp'),'local unsent');
     const note=(await getAll('spread_notes'))[0];
-    let refreshes=0;window.vNextSync.requestRemoteRefresh=()=>{refreshes++;};
-    api=async path=>path.endsWith('/notes')?{notes:[{...note,body:'stale remote',pending:false}]}:{events:[],legacy_events:[]};
+    let unreadFetches=0;
+    api=async path=>{
+      if(path.endsWith('/notes'))return {notes:[{...note,body:'stale remote',pending:false}]};
+      if(path==='/api/activity/unread'){unreadFetches++;return {unread:{notebooks:{},spreads:{},total:0}};}
+      return {events:[],legacy_events:[]};
+    };
     await window.v340OpenSpread(await get('spreads','sp'));
     await new Promise(done=>setTimeout(done,100));
     const preserved=await get('spread_notes',note.cache_id);
-    const refreshBefore=refreshes;
+    const refreshBefore=unreadFetches;
     window.BlocknotV3.emit('sync-complete');
     await new Promise(done=>setTimeout(done,100));
     document.querySelector('.viewer')?.remove();
@@ -80,12 +84,12 @@ try{
     await new Promise(done=>setTimeout(done,100));
     return {failedRevision:failed.cover_revision,retry:failed.cover_retry,previous,newRevision:retried.cover_revision,current,
       deleted:deleted.cover_deleted_at,removed,preserved:preserved.body,pending:preserved.pending,
-      refreshBefore,refreshAfter:refreshes,seenCalls,readAll,failedSeenCount:settings.unread_total};
+      refreshBefore,refreshAfter:unreadFetches,seenCalls,readAll,failedSeenCount:settings.unread_total};
   });
   assert.equal(result.failedRevision,1);assert.equal(result.retry,true);assert.equal(result.previous,'old');
   assert.equal(result.newRevision,2);assert.equal(result.current,'new');assert.ok(result.deleted);assert.equal(result.removed,true);
   assert.equal(result.preserved,'local unsent');assert.equal(result.pending,true);
-  assert.equal(result.refreshBefore,1);assert.equal(result.refreshAfter,1,'sync rendering must not cause refetch loop');
+  assert.equal(result.refreshBefore,1);assert.equal(result.refreshAfter,1,'sync rendering must not cause unread refetch loop');
   assert.deepEqual(result.seenCalls,[{all_spreads:true}]);assert.equal(result.readAll,0);assert.equal(result.failedSeenCount,1);
   assert.deepEqual(errors,[]);
   await context.close();

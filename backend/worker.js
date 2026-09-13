@@ -940,7 +940,6 @@ on('PATCH', '/api/notes/:id', async (request, env, p) => {
   const current = await selectNote(env, p.id);
   if (!current) return err(404, 'not_found');
   await requireMembership(env, u.userId, current.notebook_id);
-  if (current.author_id !== u.userId) return err(403, 'note_author_required');
   const body = await request.json();
   const clientRef = requiredClientRef(body.client_ref);
   const noteBody = requiredText(body.body, 'body');
@@ -959,8 +958,8 @@ on('PATCH', '/api/notes/:id', async (request, env, p) => {
     env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
     env.DB.prepare(
       `UPDATE spread_notes SET body=?, updated_at=?, revision=?, seq=(SELECT MAX(seq) FROM change_seq)
-       WHERE id=? AND author_id=? AND revision=? AND deleted_at IS NULL`
-    ).bind(noteBody, now, nextRevision, p.id, u.userId, current.revision),
+       WHERE id=? AND revision=? AND deleted_at IS NULL`
+    ).bind(noteBody, now, nextRevision, p.id, current.revision),
     activityStatement(env, {
       notebookId: current.notebook_id, spreadId: current.spread_id,
       entity: 'spread_note', entityId: p.id, actorUserId: u.userId,
@@ -980,7 +979,6 @@ on('DELETE', '/api/notes/:id', async (request, env, p) => {
   const current = await selectNote(env, p.id);
   if (!current) return err(404, 'not_found');
   await requireMembership(env, u.userId, current.notebook_id);
-  if (current.author_id !== u.userId) return err(403, 'note_author_required');
   const body = await request.json();
   const clientRef = requiredClientRef(body.client_ref);
   const priorEvent = await activityRetry(env, u.userId, clientRef, 'spread_note', p.id, 'note.deleted', null);
@@ -996,8 +994,8 @@ on('DELETE', '/api/notes/:id', async (request, env, p) => {
     env.DB.prepare('INSERT INTO change_seq(at) VALUES (?)').bind(now),
     env.DB.prepare(
       `UPDATE spread_notes SET deleted_at=?, updated_at=?, revision=?, seq=(SELECT MAX(seq) FROM change_seq)
-       WHERE id=? AND author_id=? AND revision=? AND deleted_at IS NULL`
-    ).bind(now, now, nextRevision, p.id, u.userId, current.revision),
+       WHERE id=? AND revision=? AND deleted_at IS NULL`
+    ).bind(now, now, nextRevision, p.id, current.revision),
     activityStatement(env, {
       notebookId: current.notebook_id, spreadId: current.spread_id,
       entity: 'spread_note', entityId: p.id, actorUserId: u.userId,
