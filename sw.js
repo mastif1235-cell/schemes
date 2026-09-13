@@ -17,7 +17,21 @@ const SHELL = [
 self.addEventListener('install', (e) => {
   // addAll is intentionally atomic at the Service Worker lifecycle level: if any
   // required file is unavailable, this worker never replaces the previous one.
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
+  e.waitUntil(caches.open(CACHE).then(async c => {
+    await c.addAll(SHELL.map(url => new Request(new URL(url, self.location.href), {cache:'reload'})));
+    const version = await (await c.match('./version.json')).json();
+    const manifest = await (await c.match('./app-v3-manifest.json')).json();
+    if (version.version !== RELEASE || manifest.version !== RELEASE || !Array.isArray(manifest.files)) {
+      throw new Error('Mixed release in offline cache');
+    }
+    for (const entry of manifest.files) {
+      const response = await c.match('./' + entry.path);
+      if (!response) throw new Error('Incomplete offline cache');
+      const bytes = new TextEncoder().encode((await response.text()).replace(/\r\n?/g, '\n'));
+      const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2,'0')).join('');
+      if (hash !== entry.sha256) throw new Error('Mixed runtime in offline cache: ' + entry.path);
+    }
+  }));
 });
 
 self.addEventListener('message', (e) => {
@@ -28,9 +42,8 @@ self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys().then(keys => Promise.all(
       keys.filter(k => k.startsWith(CACHE_PREFIX) && k !== CACHE).map(k => caches.delete(k))
-    ))
+    )).then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
 self.addEventListener('fetch', (e) => {
@@ -39,7 +52,7 @@ self.addEventListener('fetch', (e) => {
 
   if (e.request.mode === 'navigate' || url.pathname.endsWith('/index.html')) {
     e.respondWith(
-      caches.match('./index.html').then(cached => cached || fetch(e.request, {cache:'no-store'}))
+      caches.open(CACHE).then(c => c.match('./index.html')).then(cached => cached || fetch(e.request, {cache:'no-store'}))
     );
     return;
   }
@@ -53,8 +66,8 @@ self.addEventListener('fetch', (e) => {
   });
 
   e.respondWith(
-    caches.match(normalized).then(cached => cached || caches.match(e.request).then(exact =>
+    caches.open(CACHE).then(c => c.match(normalized).then(cached => cached || c.match(e.request).then(exact =>
       exact || fetch(normalized, {cache:'no-store'})
-    ))
+    )))
   );
 });

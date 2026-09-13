@@ -24,7 +24,9 @@ class TestPreparedStatement {
   }
   async run() { return this.runSync(); }
   runSync() {
-    const info = this.owner.sqlite.prepare(this.sql).run(...this.params);
+    const statement = this.owner.sqlite.prepare(this.sql);
+    if (statement.columns().length) return {success:true,results:statement.all(...this.params),meta:{changes:0}};
+    const info = statement.run(...this.params);
     return {
       success: true,
       results: [],
@@ -40,6 +42,7 @@ class TestD1 {
   constructor(sqlite) { this.sqlite = sqlite; }
   prepare(sql) { return new TestPreparedStatement(this, sql); }
   async batch(statements) {
+    this.lastBatchSql = statements.map(statement => statement.sql);
     assert.ok(statements.length <= 40, 'leave room for auth/read queries on D1 Free');
     if (this.beforeBatch) { const hook = this.beforeBatch; this.beforeBatch = null; hook(); }
     this.sqlite.exec('BEGIN IMMEDIATE');
@@ -539,6 +542,7 @@ const largeItems = large.sqlite.prepare('SELECT * FROM spreads ORDER BY number D
   ({spread_id:row.id, expected_revision:row.revision, expected_number:row.number}));
 const largeOrder = await api(large.env, 'PUT', '/api/notebooks/n1/spreads/order', 'token-1', {client_ref:'large-order', items:largeItems});
 assert.equal(largeOrder.status, 200, '200-spread reorder respects D1 parameter/query limits');
+assert.equal((await api(large.env, 'GET', '/api/sync?since=0')).status, 200, 'sync with 200 spreads respects D1 bind limits');
 assert.equal(largeOrder.data.spreads[0].id, 's200');
 assert.equal(largeOrder.data.spreads[199].id, 's1');
 assert.equal((await api(large.env, 'GET', '/api/notebooks/n1/snapshot')).data.spreads.length,200,'large reordered notebook remains readable');
@@ -566,4 +570,60 @@ assert.equal(preCaps.data.capabilities.activity_spread_seen, undefined, 'spread 
 assert.equal((await api(pre0002.env, 'GET', '/api/notebooks/n1/cover', 'token-1')).status, 503);
 assert.equal((await api(pre0002.env, 'PUT', '/api/notebooks/n1/activity/seen', 'token-1', {})).status, 503);
 
-console.log('backend notes/activity/merge/reorder/photo/security tests passed (22 scenarios + race checks + cover/unread)');
+// Production-shaped asymmetric scope: A owns 272 spreads; B sees one small notebook.
+const asym = createFixture();
+asym.sqlite.prepare(`INSERT INTO notebooks (id,owner_id,created_by,title,created_at,updated_at,revision,seq)
+  VALUES('n2','u1','u1','Owner only','x','x',1,1)`).run();
+for (let i=2;i<=272;i++) asym.sqlite.prepare(`INSERT INTO spreads
+  (id,notebook_id,number,title,created_by,created_at,updated_at,revision,seq)
+  VALUES(?,?,?,?,?,?,?,?,?)`).run('large-'+i,'n2',i,'fixture','u1','x','x',1,1);
+for (const [actor,receiver,id] of [['token-2','token-1','b-to-a'],['token-1','token-2','a-to-b']]) {
+  const write=await api(asym.env,'POST','/api/spreads/s1/notes',actor,{id,client_ref:id,body:id});
+  assert.equal(write.status,201);
+  const pull=await api(asym.env,'GET','/api/sync?since=0',receiver);
+  assert.equal(pull.status,200);
+  assert.ok(pull.data.changes.spread_notes.some(row=>row.id===id));
+  assert.ok(pull.data.changes.activity_events.some(row=>row.entity_id===id));
+  assert.ok(pull.data.unread.spreads.s1.count>0);
+  assert.equal(asym.env.DB.lastBatchSql.length,10,'all change tables share one D1 transaction');
+  assert.ok(asym.env.DB.lastBatchSql.every(sql=>sql.startsWith('WITH candidates')));
+}
+asym.sqlite.prepare('DELETE FROM notebook_members WHERE user_id=?').run('u1');
+const ownerList=await api(asym.env,'GET','/api/notebooks','token-1');
+assert.ok(ownerList.data.notebooks.some(row=>row.id==='n1'));
+for(const route of ['/api/notebooks/n1','/api/notebooks/n1/snapshot','/api/notebooks/n1/activity',
+  '/api/notebooks/n1/members','/api/notebooks/n1/cover','/api/spreads/s1/notes','/api/sync?since=0','/api/activity/unread']) {
+  assert.equal((await api(asym.env,'GET',route,'token-1')).status,200,'OWNER fallback '+route);
+}
+const beforeOwn=(await api(asym.env,'GET','/api/activity/unread','token-1')).data.unread.total;
+const allSeen=await api(asym.env,'PUT','/api/notebooks/n1/activity/seen','token-2',{all_spreads:true});
+assert.equal(allSeen.status,200);assert.equal(allSeen.data.unread.total,0);
+assert.equal((await api(asym.env,'GET','/api/activity/unread','token-2')).data.unread.total,0,'server confirms read-all');
+assert.equal((await api(asym.env,'GET','/api/activity/unread','token-1')).data.unread.total,beforeOwn,'seen isolated');
+assert.ok((await api(asym.env,'GET','/api/notebooks/n1/activity','token-2')).data.events.length>=2,'read history retained');
+{
+const mutations=createFixture();
+const created=await api(mutations.env,'POST','/api/notebooks','token-1',{title:'New',client_ref:'create-once'});
+assert.equal(created.status,200);const notebookId=created.data.notebook.id;
+await api(mutations.env,'POST','/api/notebooks','token-1',{title:'New',client_ref:'create-once'});
+mutations.sqlite.prepare('DELETE FROM notebook_members WHERE notebook_id=? AND user_id=?').run(notebookId,'u1');
+assert.equal((await api(mutations.env,'PATCH','/api/notebooks/'+notebookId,'token-1',{title:'Renamed',revision:1})).status,200);
+const spreadCreated=await api(mutations.env,'POST',`/api/notebooks/${notebookId}/spreads`,'token-1',{number:1,title:'New spread',client_ref:'spread-once'});
+assert.equal(spreadCreated.status,200);const spreadId=spreadCreated.data.spread.id;
+assert.equal((await api(mutations.env,'PATCH','/api/spreads/'+spreadId,'token-1',{title:'Updated',revision:1})).status,200);
+assert.equal((await api(mutations.env,'POST',`/api/notebooks/${notebookId}/members`,'token-1',{user_id:'u2'})).status,200);
+assert.equal((await api(mutations.env,'DELETE',`/api/notebooks/${notebookId}/members/u2`,'token-1')).status,200);
+const invitation=await api(mutations.env,'POST','/api/invites','token-1',{notebook_id:notebookId});
+assert.equal(invitation.status,200);
+assert.equal((await api(mutations.env,'POST','/api/auth/redeem-invite','token-2',{code:invitation.data.code})).status,200);
+for(let repeat=0;repeat<2;repeat++)assert.equal((await api(mutations.env,'DELETE','/api/spreads/'+spreadId,'token-1')).status,200);
+for(let repeat=0;repeat<2;repeat++)assert.equal((await api(mutations.env,'DELETE','/api/notebooks/'+notebookId,'token-1')).status,200);
+const coverage=mutations.sqlite.prepare('SELECT action,COUNT(*) AS count FROM activity_events GROUP BY action').all();
+for(const action of ['notebook.created','notebook.updated','notebook.deleted','spread.created','spread.updated','spread.deleted','member.joined','member.revoked']) {
+  assert.ok(coverage.some(row=>row.action===action),action+' has canonical activity');
+}
+assert.equal(coverage.find(row=>row.action==='notebook.created').count,1,'create retry does not duplicate activity');
+assert.equal(coverage.find(row=>row.action==='spread.deleted').count,1,'delete retry does not duplicate activity');
+assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
+}
+console.log('backend: PASS (existing scenarios + 272-spread bidirectional delivery + OWNER fallback + server read-all)');

@@ -14,7 +14,7 @@ const output = '/* Generated from version.json by tools/build-version.mjs. Do no
   + `self.__BLOCKNOT_VERSION__ = ${JSON.stringify(version)};\n`;
 
 if (process.argv.includes('--check')) {
-  const current = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
+    const current = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8').replace(/\r\n?/g, '\n') : '';
   if (current !== output) {
     console.error('version.js is not generated from version.json');
     process.exit(1);

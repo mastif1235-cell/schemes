@@ -184,7 +184,7 @@ try {
   }, null, {timeout:10000});
   // Cover must survive an app restart (IndexedDB state + cached blob).
   await page.reload({waitUntil:'load'});
-  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof get === 'function');
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined' && db?.version === 3);
   assert.equal(await page.evaluate(async () => {
     const notebook = await get('notebooks','nb');
     const cached = await get('blobs', window.v340CoverBlobId('nb'));
@@ -198,7 +198,7 @@ try {
     await applyChangeBatch({notebook_covers:[{notebook_id:'remote-nb',cover_revision:4,deleted_at:null,seq:33}]});
   });
   await page.reload({waitUntil:'load'});
-  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof get === 'function');
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined' && db?.version === 3);
   assert.equal(await page.evaluate(async () => {
     const notebook = await get('notebooks','nb');
     const cached = await get('blobs', window.v340CoverBlobId('nb'));

@@ -2,15 +2,17 @@
 (function () {
   const UNSYNCED_QUEUE = new Set(['pending','syncing','failed','conflict']);
 
-  async function renderNotes(host, spread) {
+  async function renderNotes(host, spread, refreshRemote = true) {
     if (!host?.isConnected) return;
     const team = window.vNextSync;
     // Always refresh the server copy when a spread is opened: a note added on another phone must
     // appear here even if this device's sync cursor already passed it.
-    if (spread?.server_id && isAuthed() && isOnline()) {
+    if (refreshRemote && spread?.server_id && isAuthed() && isOnline()) {
       try {
         const data = await api(`/api/spreads/${encodeURIComponent(spread.server_id)}/notes`);
-        for (const note of (data.notes || [])) await team.cacheNote(note, spread, true);
+        for (const note of (data.notes || [])) await team.cacheNote(note, spread);
+        // Content refresh must also refresh the server-owned activity/unread envelope.
+        window.vNextSync.requestRemoteRefresh();
       } catch (error) {
         console.warn('Server notes could not be refreshed', error);
       }
@@ -244,7 +246,7 @@
     let currentUrl = null;
     let closed = false;
     const stopSyncUpdates = window.BlocknotV3.on('sync-complete', () => {
-      renderNotes(overlay.querySelector('[data-team-notes]'),spreads[index]).catch(error => console.warn('Notes refresh failed',error));
+      renderNotes(overlay.querySelector('[data-team-notes]'),spreads[index],false).catch(error => console.warn('Notes refresh failed',error));
     });
     const historyToken = 'v340-viewer-' + Date.now();
     const overlay = document.createElement('div');

@@ -109,7 +109,7 @@ for (const entry of manifest.files) {
   assert.ok(sw.includes(`'./${entry.path}'`), `${entry.path} must be precached`);
 }
 for (const asset of ['./version.json', './version.js']) assert.ok(sw.includes(asset), `${asset} must be precached`);
-assert.match(sw, /c\.addAll\(SHELL\)/, 'install keeps the atomic addAll shell');
+assert.match(sw, /c\.addAll\(SHELL\.map/, 'install keeps atomic addAll with reload requests');
 assert.doesNotMatch(index, /unregister|getRegistrations|location\.replace/);
 assert.match(index, /blocknot_release_reload_once/, 'automatic reload is limited to one per session');
 
@@ -163,7 +163,7 @@ assert.match(core, /cover_migrated_at:nowISO\(\)/);
 assert.match(read('v3-ui.js'), /v340-unread-badge/);
 assert.match(read('v3-ui.js'), /v340-unread-dot/);
 assert.match(photos, /Server notes could not be refreshed/);
-assert.match(photos, /team\.cacheNote\(note, spread, true\)/);
+assert.match(photos, /team\.cacheNote\(note, spread\)/, 'direct GET must preserve pending local notes');
 assert.match(history, /const hasServerNotebook = isAuthed\(\)/);
 assert.match(read('v3-ui.js'), /v340-unread-badge\{z-index:6!important/);
 assert.match(worker, /ae\.spread_id IS NULL/);

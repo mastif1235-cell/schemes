@@ -9,6 +9,46 @@
   const enabled = name => settings.team_capabilities?.scope === scope() && settings.team_capabilities.flags?.[name] === true;
   const assertScope = expected => { if (expected !== scope()) throw new Error('Аккаунт изменился; повторите синхронизацию'); };
   const recoveringNotebooks = new Set();
+  let refreshRequested = false;
+  function requestRemoteRefresh() {
+    if (!isOnline() || !isAuthed()) return;
+    if (syncing) { refreshRequested = true; return; }
+    void fullSync();
+  }
+
+  async function diagnostics() {
+    const queue = (await getAll('sync_queue')).filter(item => UNSYNCED.has(item.status));
+    const errors = settings.sync_errors || [];
+    const conflict = queue.find(item => item.status === 'conflict');
+    const failed = queue.find(item => item.status === 'failed');
+    const coverPending = (await getAll('notebooks')).some(row => row.cover_retry);
+    const name = item => ({spread_note:'note', photo:'photos', notebook_cover:'covers', spread_fields:'spread'})[item.entity] || item.entity;
+    const label = !isOnline() ? 'Нет сети' : syncing ? 'Синхронизация…' : conflict ? 'Конфликт: ' + name(conflict)
+      : errors.length ? 'Ошибка: ' + errors.map(row => row.stage).join(', ')
+      : failed ? 'Ошибка: ' + name(failed) : coverPending ? 'Ожидает загрузки: covers'
+      : queue.length ? 'Ожидает отправки: ' + queue.length : settings.sync_status === 'error' ? 'Ошибка синхронизации' : 'Синхронизировано';
+    return {label, pending:queue.length, conflicts:queue.filter(item => item.status === 'conflict').length,
+      failed:queue.filter(item => item.status === 'failed').length, errors, coverPending};
+  }
+
+  updateSyncIndicator = async function () {
+    const el = document.getElementById('syncDot');
+    if (!el) return;
+    const state = await diagnostics();
+    el.textContent = !isOnline() ? '—' : syncing ? '⟳' : state.conflicts || state.failed || state.errors.length || settings.sync_status === 'error' ? '⚠'
+      : state.pending || state.coverPending ? '↑' : '✓';
+    el.title = state.label;
+    el.setAttribute('aria-label', state.label);
+    el.setAttribute('role', 'button'); el.tabIndex = 0; el.style.cursor = 'pointer';
+    el.onclick = async () => {
+      const fresh = await diagnostics();
+      const {el:sheet, close} = openSheet(`<div class="sheet-handle"></div><h2>Синхронизация</h2>
+        <p data-sync-diagnostic>${esc(fresh.label)}</p><p>Ожидает отправки: ${fresh.pending}. Конфликтов: ${fresh.conflicts}.</p>
+        <button class="btn-primary" data-sync-retry>Повторить</button>`);
+      sheet.querySelector('[data-sync-retry]').onclick = () => { close(); void fullSync(true); };
+    };
+    el.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); el.click(); } };
+  };
 
   async function cacheNote(note, localSpread, force = false) {
     const cache_id = scope() + '|' + note.id;
@@ -430,6 +470,26 @@
   };
 
   applyChangeBatch = async function (changes) {
+    // A parent's latest seq may fall on a later page. Resolve missing parents before
+    // applying children; silently skipping a photo/tag/favorite would advance past it.
+    const knownNotebooks = new Set((await getAll('notebooks')).map(row => row.server_id));
+    for (const row of changes.notebooks || []) knownNotebooks.add(row.id);
+    for (const row of [...(changes.spreads || []), ...(changes.notebook_covers || [])]) {
+      if (row.notebook_id && !knownNotebooks.has(row.notebook_id)) {
+        await applySnapshot(row.notebook_id); knownNotebooks.add(row.notebook_id);
+      }
+    }
+    const knownSpreads = new Set((await getAll('spreads')).map(row => row.server_id));
+    for (const row of changes.spreads || []) knownSpreads.add(row.id);
+    for (const row of [...(changes.photos || []), ...(changes.spread_tags || []), ...(changes.favorites || [])]) {
+      if (!knownSpreads.has(row.spread_id)) {
+        const parent = await api(`/api/spreads/${encodeURIComponent(row.spread_id)}`);
+        if (!parent?.spread?.notebook_id) throw new Error('Не найден родитель синхронизируемого объекта');
+        await applySnapshot(parent.spread.notebook_id);
+        if (!(await getAll('spreads')).some(spread => spread.server_id === row.spread_id)) throw new Error('Разворот не сохранён');
+        knownSpreads.add(row.spread_id);
+      }
+    }
     const queue = await getAll('sync_queue');
     const notebooksAll = await getAll('notebooks');
     const spreadsAll = await getAll('spreads');
@@ -636,48 +696,71 @@
     if (!isOnline()) { if (manual) toast('Нет подключения к интернету'); return; }
     syncing = true;
     settings.sync_status = 'syncing';
+    settings.sync_errors = [];
     updateSyncIndicator();
+    const recordFailure = (stage, error) => {
+      settings.sync_errors.push({stage, message:String(error?.message || error).slice(0, 200)});
+    };
     try {
       if (isAuthed()) {
         const sessionScope = scope();
-        const me = await api('/api/me');
-        assertScope(sessionScope);
-        settings.team_capabilities = {scope:sessionScope, flags:me.capabilities || {}};
+        let sessionVerified = false;
+        try {
+          const me = await api('/api/me');
+          assertScope(sessionScope);
+          settings.team_capabilities = {scope:sessionScope, flags:me.capabilities || {}};
+          sessionVerified = true;
+        } catch (error) {
+          assertScope(sessionScope);
+          if (error.status === 401 || error.status === 403) throw error;
+          recordFailure('session', error);
+          // Read endpoints authenticate independently. Keep scoped cached capabilities,
+          // but never push using unverified session/capability information.
+        }
         // One failing push step must never skip the pull: history/unread would silently stop
         // updating (content still arrives through its own refetch), which is exactly the bug we hit.
-        try { await pushEntityQueue(!!manual); }
-        catch (error) { console.warn('Outbox push failed; continuing with pull', error); }
-        try { await pushPhotoQueue(!!manual); }
-        catch (error) { console.warn('Photo push failed; continuing with pull', error); }
+        if (sessionVerified) {
+          try { await pushEntityQueue(!!manual); }
+          catch (error) { recordFailure('outbox', error); console.warn('Outbox push failed; continuing with pull', error); }
+          assertScope(sessionScope);
+          try { await pushPhotoQueue(!!manual); }
+          catch (error) { recordFailure('photos', error); console.warn('Photo push failed; continuing with pull', error); }
+        }
+        assertScope(sessionScope);
         try { await syncMembership(); }
-        catch (error) { console.warn('Membership refresh failed; continuing with pull', error); }
+        catch (error) { recordFailure('membership', error); console.warn('Membership refresh failed; continuing with pull', error); }
+        assertScope(sessionScope);
         if (enabled('team_notes') && settings.team_snapshot_scope !== sessionScope) {
           // Old clients already advanced the same cursor while ignoring new fields.
           // Backfill notes once without resetting that cursor or deleting local data.
           const notebooks = (await getAll('notebooks')).filter(row => row.server_id && !row.deleted_at && !row.hidden_no_access);
+          let backfillComplete = true;
           for (const notebook of notebooks) {
             try { await applySnapshot(notebook.server_id); }
-            catch (error) { console.warn('Snapshot backfill failed', notebook.server_id, error); }
+            catch (error) { backfillComplete = false; recordFailure('snapshot', error); console.warn('Snapshot backfill failed', notebook.server_id, error); }
           }
           assertScope(sessionScope);
-          settings.team_snapshot_scope = sessionScope;
+          if (backfillComplete) settings.team_snapshot_scope = sessionScope;
         }
         await pullChanges();
-        void window.v340MigrateLegacyCovers?.();
+        try { await window.v340RetryCovers?.(); }
+        catch (error) { recordFailure('covers', error); }
+        if (sessionVerified) void window.v340MigrateLegacyCovers?.().catch(error => console.warn('Legacy cover migration failed', error));
       } else {
         await pushPhotoQueue(!!manual);
       }
       const remaining = (await getAll('sync_queue')).some(item => UNSYNCED.has(item.status));
-      settings.sync_status = remaining ? 'pending' : 'idle';
+      settings.sync_status = settings.sync_errors.length ? 'error' : remaining ? 'pending' : 'idle';
       settings.last_sync_at = nowISO();
     } catch (error) {
+      recordFailure('sync', error);
       settings.sync_status = 'error';
       console.error('Synchronization failed', error);
       if (manual) toast('Ошибка синхронизации: ' + (error.message || error));
     }
-    await saveSettings();
-    syncing = false;
-    updateSyncIndicator();
+    try { await saveSettings(); }
+    catch (error) { settings.sync_status = 'error'; recordFailure('storage', error); }
+    finally { syncing = false; updateSyncIndicator(); }
     window.BlocknotV3?.emit('sync-complete');
     if (route.screen === 'settings') {
       const el = document.getElementById('syncStatus');
@@ -685,19 +768,23 @@
     }
     if (manual && settings.sync_status === 'idle') toast('Синхронизация завершена');
     else if (manual && settings.sync_status === 'pending') toast('Часть изменений ожидает зависимые данные или повторную отправку');
+    if (refreshRequested) { refreshRequested = false; setTimeout(() => void fullSync(), 0); }
   };
 
-  window.v340Sync = {retryDelay, retryDue, mapServerPhoto};
-  window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote};
+  window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics};
+  window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
   // The base pull loop only knows about changes and the cursor; unread counts arrive in the same
   // envelope, so the loop is kept here where the server response is available.
   pullChanges = async function () {
+    const sessionScope = scope();
     let hasMore = true;
     let guard = 0;
     while (hasMore && guard < 20) {
       guard++;
       const data = await api(`/api/sync?since=${settings.sync_cursor}&limit=500`);
+      assertScope(sessionScope);
       await applyChangeBatch(data.changes || {});
+      assertScope(sessionScope);
       if (data.unread) {
         settings.unread_by_notebook = data.unread.notebooks || {};
         settings.unread_spreads = data.unread.spreads || {};

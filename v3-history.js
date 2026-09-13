@@ -36,6 +36,9 @@
       ,'note.created':'Добавлено примечание', 'note.updated':'Изменено примечание', 'note.deleted':'Удалено примечание',
       'spread.updated':'Изменены поля разворота', 'spread.reordered':'Изменён порядок разворотов',
       'photo.added':'Добавлена версия фото', 'photo.made_current':'Выбрана версия фото'
+      ,'notebook.created':'Создан блокнот', 'notebook.updated':'Изменён блокнот', 'notebook.deleted':'Удалён блокнот',
+      'spread.created':'Создан разворот', 'spread.deleted':'Удалён разворот',
+      'member.joined':'Участник добавлен', 'member.revoked':'Доступ участника отозван'
     };
     return labels[action] || action || 'Изменение';
   }
@@ -119,22 +122,15 @@
   }
 
   async function markAllSeen(notebooks) {
-    const spreads = await getAll('spreads');
-    if (window.vNextSync.enabled('activity_seen')) {
-      for (const notebook of notebooks.filter(row => row.server_id)) {
-        try { await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/activity/seen`, {method:'PUT', json:{}}); }
-        catch (error) { console.warn('Notebook seen could not be stored', error); }
-      }
-    }
-    if (window.vNextSync.enabled('activity_spread_seen')) {
-      for (const serverId of Object.keys(settings.unread_spreads || {})) {
-        if (!spreads.some(row => row.server_id === serverId)) continue;
-        try { await api(`/api/spreads/${encodeURIComponent(serverId)}/activity/seen`, {method:'PUT', json:{}}); }
-        catch (error) { console.warn('Spread seen could not be stored', error); }
-      }
-    }
-    settings.unread_spreads = {}; settings.unread_by_notebook = {}; settings.unread_total = 0;
-    await saveSettings(); refreshBadge(); window.BlocknotV3.emit('unread-change');
+    if (!isOnline()) { toast('Нет сети'); return; }
+    try {
+      const state = await api('/api/activity/unread');
+      await window.v340ApplyUnread(state.unread);
+      const ids = new Set([...notebooks.map(row => row.server_id).filter(Boolean), ...Object.keys(state.unread.notebooks)]);
+      for (const id of ids) await markNotebookSeen(id, true);
+      const fresh = await api('/api/activity/unread');
+      await window.v340ApplyUnread(fresh.unread);
+    } catch (error) { console.warn('Mark all seen failed', error); toast('Не удалось отметить всё прочитанным. Повторите.'); }
   }
 
   // Opening one spread clears only that spread's unread for the current user.
@@ -192,14 +188,14 @@
           <div>${esc(notebook?.title || row.notebook_title || '')}${row.spread_number || spread ? ' · №' + esc(row.spread_number ?? spread?.number ?? '') : ''}</div>
           <div>${esc(actionLabel(row.action))}${spread && spread.deleted_at ? ' · Разворот удалён' : ''}</div></div>
           ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open>Открыть</button>'
-            : (!row.spread_id && notebook?.server_id ? '<button class="btn-secondary" data-mark-notebook>Отметить прочитанным</button>' : '')}`;
+            : (!row.spread_id && notebook?.server_id ? '<button class="btn-secondary" data-mark-notebook>Прочитать весь блокнот</button>' : '')}`;
         item.querySelector('[data-open]')?.addEventListener('click', async () => {
           close();
           await window.v340OpenSpread(spread, {returnToHistory:true});
         });
         item.querySelector('[data-mark-notebook]')?.addEventListener('click', async event => {
           event.target.disabled = true;
-          await markNotebookSeen(notebook.server_id);
+          await markNotebookSeen(notebook.server_id, true);
           await draw();
         });
         host.appendChild(item);
@@ -223,10 +219,10 @@
     return count;
   }
 
-  async function markNotebookSeen(serverNotebookId) {
+  async function markNotebookSeen(serverNotebookId, allSpreads = false) {
     if (!window.vNextSync.enabled('activity_seen') || !serverNotebookId || !isOnline()) return false;
     try {
-      const data = await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:{}});
+      const data = await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:{all_spreads:allSpreads}});
       if (data && data.unread) await window.v340ApplyUnread(data.unread);
       else {
         const map = {...(settings.unread_by_notebook || {})};

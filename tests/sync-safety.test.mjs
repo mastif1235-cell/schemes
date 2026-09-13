@@ -19,7 +19,7 @@ function createRuntime(seed = {}) {
   };
   let apiImpl = async () => { throw new Error('Unexpected API request'); };
   const context = {
-    console:{...console, warn() {}},
+    console:{...console, warn() {}, error() {}},
     Date,
     Math,
     Set,
@@ -307,4 +307,86 @@ coverRuntime.context.settings.sync_cursor = 0;
 await coverRuntime.context.pullChanges();
 assert.equal(coverRuntime.context.settings.unread_by_notebook['remote-nb-c'].count,2,'server unread reaches the badge state');
 assert.equal(coverRuntime.context.settings.unread_spreads['remote-sp'].count,1,'per-spread unread reaches the client');
-console.log('sync-safety: PASS');
+for (const failingStep of ['pushEntityQueue','pushPhotoQueue','syncMembership']) {
+  const r = createRuntime(); let pulled = 0;
+  r.setApi(async () => ({capabilities:{}}));
+  r.context[failingStep] = async () => { throw new Error(failingStep); };
+  r.context.pullChanges = async () => { pulled++; };
+  await r.context.fullSync();
+  assert.equal(pulled, 1, failingStep + ' must not block pull');
+  assert.equal(r.context.settings.sync_status, 'error', 'isolated failure stays diagnostic');
+}
+for (const status of [0,503,401,403]) {
+  const r = createRuntime(); let pulls = 0, pushes = 0;
+  r.context.settings.team_capabilities = {scope:r.context.window.vNextSync.scope(), flags:{activity:true}};
+  r.setApi(async () => { throw Object.assign(new Error('session failure'), {status}); });
+  r.context.pushEntityQueue = r.context.pushPhotoQueue = async () => { pushes++; };
+  r.context.pullChanges = async () => { pulls++; };
+  await r.context.fullSync();
+  assert.equal(pushes, 0, 'unverified session never pushes');
+  assert.equal(pulls, status === 401 || status === 403 ? 0 : 1);
+  assert.equal(r.context.window.vNextSync.enabled('activity'), true, 'transient failure preserves scoped capabilities');
+}
+{
+  const r = createRuntime({notebooks:[{id:'n',server_id:'server'}]}); let attempts=0;
+  r.setApi(async path => {
+    if (path === '/api/me') return {capabilities:{team_notes:true}};
+    if (path.endsWith('/snapshot')) { attempts++; throw new Error('snapshot offline'); }
+    return {changes:{},next_cursor:12,has_more:false};
+  });
+  await r.context.fullSync(); await r.context.fullSync();
+  assert.equal(attempts, 2, 'failed backfill retried next sync');
+  assert.equal(r.context.settings.team_snapshot_scope, undefined);
+  assert.equal(r.context.settings.sync_cursor, 12, 'failed optional backfill does not prevent pull');
+}
+{
+  const r = createRuntime();
+  r.setApi(async () => ({capabilities:{}})); r.context.pullChanges=async()=>{};
+  r.context.saveSettings = async () => { throw new Error('disk unavailable'); };
+  await r.context.fullSync();
+  assert.equal(r.context.syncing, false, 'settings write failure cannot permanently lock fullSync');
+  assert.equal(r.context.settings.sync_status, 'error');
+}
+{
+  const r = createRuntime(teamSeed);
+  r.context.settings.sync_cursor = 5;
+  r.setApi(async () => ({changes:{activity_events:[{id:'durable-event',seq:8}]},next_cursor:8,has_more:false}));
+  const original = r.context.put;
+  r.context.put = async (store,row) => { if(store==='activity_events') throw new Error('IDB failure'); return original(store,row); };
+  await assert.rejects(r.context.pullChanges(), /IDB failure/);
+  assert.equal(r.context.settings.sync_cursor, 5, 'failed apply keeps cursor');
+  r.context.put=original; await r.context.pullChanges();
+  assert.equal(r.context.settings.sync_cursor,8); assert.equal(r.db.activity_events.size,1);
+}
+{
+  const r=createRuntime();r.context.settings.sync_cursor=4;
+  r.setApi(async()=> {r.context.settings.user_id='other';return {changes:{activity_events:[{id:'wrong-account'}]},next_cursor:50};});
+  await assert.rejects(r.context.pullChanges(),/Аккаунт/);
+  assert.equal(r.db.activity_events.size,0);assert.equal(r.context.settings.sync_cursor,4);
+}
+{
+  const r=createRuntime({sync_queue:[{id:1,entity:'spread_note',status:'conflict'}]});
+  assert.equal((await r.context.window.v340Sync.diagnostics()).label,'Конфликт: note');
+  r.db.sync_queue.set(1,{id:1,entity:'photo',status:'failed'});
+  assert.equal((await r.context.window.v340Sync.diagnostics()).label,'Ошибка: photos');
+  r.db.sync_queue.set(1,{id:1,entity:'photo',status:'pending'});
+  assert.equal((await r.context.window.v340Sync.diagnostics()).label,'Ожидает отправки: 1');
+  r.db.sync_queue.clear();assert.equal((await r.context.window.v340Sync.diagnostics()).label,'Синхронизировано');
+  r.context.isOnline=()=>false;assert.equal((await r.context.window.v340Sync.diagnostics()).label,'Нет сети');
+}
+{
+  const r=createRuntime();r.context.settings.sync_cursor=2;
+  r.setApi(async path=>{
+    if(path.startsWith('/api/sync'))return {changes:{photos:[{id:'photo',spread_id:'late-parent',seq:3}]},next_cursor:3};
+    throw new Error('parent unavailable');
+  });
+  await assert.rejects(r.context.pullChanges(),/parent unavailable/);
+  assert.equal(r.context.settings.sync_cursor,2,'orphan photo cannot be skipped');
+  r.setApi(async path=>{
+    if(path.startsWith('/api/sync'))return {changes:{photos:[{id:'photo',spread_id:'late-parent',seq:3}]},next_cursor:3};
+    if(path.startsWith('/api/spreads/'))return {spread:{notebook_id:'parent-nb'}};
+    return {notebook:{id:'parent-nb'},spreads:[{id:'late-parent',notebook_id:'parent-nb'}],tags:[],photos:[],spread_tags:[],favorites:[]};
+  });
+  await r.context.pullChanges();assert.equal(r.context.settings.sync_cursor,3);assert.equal(r.db.photos.size,1);
+}
+console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics)');

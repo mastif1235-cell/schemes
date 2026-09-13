@@ -115,7 +115,7 @@
       await del('blobs', blobId).catch(() => {});
       await setCoverRemoved(notebook.id, true);
       await put('notebooks', {...notebook, server_id:notebook.server_id || cover.notebook_id,
-        cover_state_known:true, cover_deleted_at:cover.deleted_at, cover_revision:revision, cover_updated_at:now});
+        cover_state_known:true, cover_deleted_at:cover.deleted_at, cover_revision:revision, cover_retry:false, cover_updated_at:now});
       BlocknotV3.emit('cover-change', notebook.id);
       return true;
     }
@@ -123,18 +123,33 @@
     if (!local || !local.blob || Number(local.cover_revision) !== revision) {
       const blob = await downloadCoverBlob(notebook.server_id || cover.notebook_id);
       if (!blob) {
-        await put('notebooks', {...notebook, cover_state_known:true, cover_deleted_at:null,
-          cover_revision:revision, cover_updated_at:now});
-        BlocknotV3.emit('cover-change', notebook.id);
+        await put('notebooks', {...notebook, cover_retry:true});
         return false;
       }
       await put('blobs', {id:blobId, blob, cover_revision:revision, mime_type:blob.type || cover.mime_type || ''});
     }
     await setCoverRemoved(notebook.id, false);
     await put('notebooks', {...notebook, cover_state_known:true, cover_deleted_at:null,
-      cover_revision:revision, cover_updated_at:now});
+      cover_revision:revision, cover_retry:false, cover_updated_at:now});
     BlocknotV3.emit('cover-change', notebook.id);
     return true;
+  };
+
+  window.v340RetryCovers = async function () {
+    const queue = await getAll('sync_queue');
+    for (const notebook of await getAll('notebooks')) {
+      if (!notebook.server_id || notebook.hidden_no_access || notebook.deleted_at) continue;
+      const blob = await get('blobs', COVER_PREFIX + notebook.id);
+      const incomplete = notebook.cover_state_known && !notebook.cover_deleted_at && notebook.cover_revision
+        && (!blob?.blob || Number(blob.cover_revision) !== Number(notebook.cover_revision));
+      if (!notebook.cover_retry && !incomplete) continue;
+      if (queue.some(item => item.entity === 'notebook_cover' && item.local_id === notebook.id && ['pending','syncing','failed','conflict'].includes(item.status))) continue;
+      try {
+        // Re-read authoritative metadata so retry cannot resurrect a deleted/replaced cover.
+        const data = await api(`/api/notebooks/${encodeURIComponent(notebook.server_id)}/cover`);
+        await window.v340ApplyServerCover(await get('notebooks', notebook.id), data.cover);
+      } catch (error) { console.warn('Cover retry failed', error); }
+    }
   };
 
   async function downloadCoverBlob(serverNotebookId) {

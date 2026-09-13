@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {webcrypto} from 'node:crypto';
 
 const swSource = fs.readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
 const indexSource = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const release = JSON.parse(fs.readFileSync(new URL('../version.json', import.meta.url), 'utf8')).version;
 
-function createWorker({failInstall = false, offline = true} = {}) {
+function createWorker({failInstall = false, offline = true, mixedRelease = false} = {}) {
   const handlers = {};
   const deleted = [];
   const entries = new Map([['./index.html', new Response('cached-index', {status:200})]]);
@@ -14,8 +15,19 @@ function createWorker({failInstall = false, offline = true} = {}) {
   const cache = {
     addAll: async urls => {
       if (failInstall) throw new Error('missing shell file');
-      for (const url of urls) if (!entries.has(url)) entries.set(url, new Response(url));
-    }
+      for (const request of urls) {
+        const key='./'+new URL(request.url).pathname.split('/').pop();
+        if(entries.has(key))continue;
+        const file=key==='./'?'index.html':key.slice(2);
+        let text=fs.readFileSync(new URL('../'+file,import.meta.url),'utf8');
+        if(mixedRelease && file==='v3-sync.js')text+='stale asset';
+        entries.set(key,new Response(text));
+      }
+    },
+    match:async request=>{
+      const key=typeof request==='string'?request:'./'+new URL(request.url).pathname.split('/').pop();
+      return entries.get(key)?.clone();
+    },
   };
   const caches = {
     open: async () => cache,
@@ -27,13 +39,13 @@ function createWorker({failInstall = false, offline = true} = {}) {
     }
   };
   const self = {
-    location:{origin:'https://example.test'},
+    location:{origin:'https://example.test',href:'https://example.test/sw.js'},
     clients:{claim:async () => {}},
     skipWaiting:async () => { skipWaitingCalls++; },
     addEventListener:(type, handler) => { handlers[type] = handler; }
   };
   const context = {
-    self, caches, URL, Request, Response, Promise,
+    self, caches, URL, Request, Response, Promise, TextEncoder, Uint8Array, crypto:webcrypto,
     importScripts:url => {
       assert.equal(url, './version.js', 'release version must come from the generated bridge');
       self.__BLOCKNOT_VERSION__ = release;
@@ -75,6 +87,12 @@ assert.doesNotMatch(indexSource, /location\.replace\s*\(/);
 {
   const worker = createWorker({failInstall:true});
   await assert.rejects(dispatchWait(worker.handlers.install), /missing shell file/);
+}
+
+{
+  const worker=createWorker({mixedRelease:true});
+  await assert.rejects(dispatchWait(worker.handlers.install),/Mixed runtime/);
+  assert.equal(worker.getSkipWaitingCalls(),0,'mixed install never activates');
 }
 
 {

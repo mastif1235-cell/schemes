@@ -8,8 +8,9 @@
 <body>
   <div id="boot" style="font-family:system-ui;padding:24px">Запуск приложения…</div>
   <script>
+    const RELOAD_GUARD = 'blocknot_release_reload_once';
     (async () => {
-      const RELOAD_GUARD = 'blocknot_release_reload_once';
+      let release = '';
 
       async function unpackBase64Gzip(text) {
         const b64 = text.trim();
@@ -21,7 +22,7 @@
       async function fetchTextWithOfflineFallback(path) {
         let firstError = null;
         try {
-          const r = await fetch(`${path}?v=${encodeURIComponent(APP_VERSION)}`, {cache:'no-store'});
+          const r = await fetch(release ? `${path}?v=${encodeURIComponent(release)}` : path, {cache:'no-store'});
           if (r.ok) return await r.text();
           firstError = new Error(`${path}: HTTP ${r.status}`);
         } catch (e) {
@@ -44,6 +45,7 @@
 
       const manifest = JSON.parse(await fetchTextWithOfflineFallback('./app-v3-manifest.json'));
       const APP_VERSION = JSON.parse(await fetchTextWithOfflineFallback('./version.json')).version;
+      release = APP_VERSION;
       if (manifest.version !== APP_VERSION || !Array.isArray(manifest.files)) {
         throw new Error('Несовместимая версия runtime manifest');
       }
