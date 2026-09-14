@@ -335,8 +335,10 @@ async function telegramSendDocument(env, blob, filename) {
   return data.result;
 }
 function telegramLink(chatId, messageId) {
+  const normalizedMessageId = Number(messageId);
+  if (!Number.isSafeInteger(normalizedMessageId) || normalizedMessageId <= 0) return null;
   const raw = String(chatId).replace(/^-100/, '');
-  return `https://t.me/c/${raw}/${messageId}`;
+  return `https://t.me/c/${raw}/${normalizedMessageId}`;
 }
 async function telegramFetchFile(env, fileId) {
   const infoResp = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
