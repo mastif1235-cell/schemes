@@ -64,9 +64,11 @@
     const rows = (await visibleRows(notebook)).slice(0, 100);
     localStorage.setItem(SEEN_KEY, String(Date.now()));
     const {close, el} = openSheet(`<div class="sheet-handle"></div><div class="v340-history-head">
-      <h2>🕘 История этого устройства</h2>${notebook ? '' : '<button class="btn-ghost" data-clear>Очистить у меня</button>'}</div>
+      <h2>🕘 История этого устройства</h2><button class="icon-btn" data-history-close aria-label="Закрыть историю">✕</button></div>
+      ${notebook ? '' : '<button class="btn-ghost" data-clear>Очистить у меня</button>'}
       <p class="v340-caption">Локальная история на этом телефоне. Она не синхронизируется и не является общей историей команды.</p>
       <div class="v340-history-list"></div>`);
+    el.querySelector('[data-history-close]').onclick = close;
     const host = el.querySelector('.v340-history-list');
     if (!rows.length) host.innerHTML = '<div class="empty-state">История пока пуста.</div>';
     for (const row of rows) {
@@ -164,9 +166,11 @@
   async function openServerHistory() {
     const scope = window.vNextSync.scope();
     const {el, close} = openSheet(`<div class="sheet-handle"></div><div class="v340-history-head"><h2>🕘 История</h2>
-      <button class="btn-ghost" data-mark-all>Отметить всё прочитанным</button></div>
+      <button class="icon-btn" data-history-close aria-label="Закрыть историю">✕</button></div>
+      <button class="btn-ghost" data-mark-all>Отметить всё прочитанным</button>
       <p class="v340-caption">Общая история всех блокнотов. Записи видят все участники, отметка «прочитано» — только вы.</p>
       <div class="v340-history-list" data-server-history></div>`);
+    el.querySelector('[data-history-close]').onclick = close;
     const host = el.querySelector('[data-server-history]');
     const notebooks = (await getAll('notebooks')).filter(row => !row.deleted_at && !row.hidden_no_access);
     const byServer = new Map(notebooks.filter(row => row.server_id).map(row => [row.server_id, row]));
@@ -341,6 +345,6 @@
   BlocknotV3.on('db-ready', refreshBadge);
 
   const style = document.createElement('style');
-  style.textContent = `#v340HistoryButton{position:relative;background:none;border:0;color:var(--text)}.v340-history-badge{position:absolute;right:0;top:0;min-width:18px;height:18px;padding:0 4px;border-radius:10px;background:var(--danger);color:#fff;font:700 10px/18px var(--font-sans)}.v340-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.v340-history-head h2{margin:0}.v340-history-list{display:grid;gap:8px}.v340-history-row{padding:12px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px}.v340-history-row .btn-secondary{width:auto}`;
+  style.textContent = `#v340HistoryButton{position:relative;background:none;border:0;color:var(--text)}.v340-history-badge{position:absolute;right:0;top:0;min-width:18px;height:18px;padding:0 4px;border-radius:10px;background:var(--danger);color:#fff;font:700 10px/18px var(--font-sans)}.v340-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.v340-history-head h2{margin:0}.v340-history-head [data-history-close]{flex:0 0 44px}.v340-history-list{display:grid;gap:8px}.v340-history-row{padding:12px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px}.v340-history-row .btn-secondary{width:auto}`;
   document.head.appendChild(style);
 })();

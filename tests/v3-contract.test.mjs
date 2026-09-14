@@ -55,12 +55,15 @@ assert.match(photos, /v342-photo-fullscreen/);
 assert.match(photos, /Math\.abs\(dx\)>60/);
 const fullscreenSource = photos.slice(photos.indexOf('async function openPhotoFullscreen'), photos.indexOf('attachPhoto = async function'));
 assert.doesNotMatch(fullscreenSource, /data-team-notes|vnext-notes|note_short|note_full/);
-assert.ok(fullscreenSource.indexOf('viewer-stage') < fullscreenSource.indexOf('v342-photo-nav'), 'fullscreen navigation is below the photo');
+assert.doesNotMatch(fullscreenSource, /v342-photo-nav|data-full-nav|data-full-zoom|v340-zoom-controls/,
+  'fullscreen has no persistent navigation or zoom controls');
+assert.match(fullscreenSource, /classList\.toggle\('controls-visible'\)/,'single tap toggles minimal fullscreen controls');
 assert.doesNotMatch(photos, /v341-nav-zone/);
 assert.match(photos, /press\.moved && gesture\.scale <= 1\.001/);
 assert.match(photos, /v341-zoomed/);
-assert.match(photos, /\.vnext-note-composer textarea\{[^}]*width:100%[^}]*min-height:96px/);
-assert.match(photos, /\.vnext-note-composer \[data-note-add\]\{[^}]*width:100%/);
+assert.match(photos, /data-note-editor hidden/,'new note editor starts collapsed');
+assert.match(photos, /\.vnext-note-composer textarea\{[^}]*width:100%[^}]*min-height:112px/);
+assert.match(photos, /\.vnext-note-composer \[data-note-add\],[^}]*\[data-note-cancel\]\{[^}]*width:100%/);
 assert.match(photos, /!note\.pending \? '<div class="v342-note-actions">/);
 assert.match(photos, /const maxSide = 3200/);
 assert.match(photos, /new ImageDecoder\(\{data:blob\.stream\(\), type:blob\.type\}\)/);

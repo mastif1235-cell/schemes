@@ -32,8 +32,9 @@
         || String(b.id||'').localeCompare(String(a.id||'')));
     if (!host.isConnected) return;
     host.innerHTML = `<h3>Примечания</h3><p class="vnext-note-caption">Общие для участников блокнота · ${isOnline() ? 'загруженные записи' : 'офлайн-копия'}</p>
-      <div class="vnext-note-composer"><textarea data-note-input maxlength="10000" placeholder="Новое примечание"></textarea>
-      <button class="btn-secondary" data-note-add>Добавить</button></div>
+      <div class="vnext-note-composer"><button class="btn-secondary" data-note-compose>＋ Добавить примечание</button>
+      <div data-note-editor hidden><textarea data-note-input maxlength="10000" placeholder="Новое примечание"></textarea>
+      <div class="btn-row"><button class="btn-primary" data-note-add>Сохранить</button><button class="btn-secondary" data-note-cancel>Отмена</button></div></div></div>
       <div data-note-list></div>`;
     const edit = note => {
       const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>${note ? 'Изменить' : 'Добавить'} примечание</h2>
@@ -45,15 +46,26 @@
         catch (error) { console.warn('Note save failed',error); el.querySelector('[data-note-error]').textContent = error.message; event.target.disabled = false; }
       };
     };
-    host.querySelector('[data-note-add]').onclick = async () => {
+    const composerButton = host.querySelector('[data-note-compose]');
+    const editor = host.querySelector('[data-note-editor]');
+    composerButton.onclick = () => {
+      composerButton.hidden = true; editor.hidden = false;
+      host.querySelector('[data-note-input]').focus();
+    };
+    host.querySelector('[data-note-cancel]').onclick = () => {
+      host.querySelector('[data-note-input]').value = '';
+      editor.hidden = true; composerButton.hidden = false;
+    };
+    host.querySelector('[data-note-add]').onclick = async event => {
       const input = host.querySelector('[data-note-input]');
       const body = String(input.value || '').trim();
       if (!body) { toast('Введите примечание'); return; }
+      event.target.disabled = true;
       try {
         await team.saveNote(spread, body, null);
         input.value = '';
         await renderNotes(host, spread);
-      } catch (error) { console.warn('Note save failed', error); toast(error.message); }
+      } catch (error) { console.warn('Note save failed', error); toast(error.message); event.target.disabled = false; }
     };
     for (const note of rows) {
       const conflict = note.pending && note.sync_error ? await team.noteConflict(note) : null;
@@ -199,15 +211,20 @@
   };
 
   async function openPhotoFullscreen(spreads, initialIndex) {
-    let index = initialIndex, objectUrl = null, closed = false;
+    let index = initialIndex, objectUrl = null, closed = false, tapTimer = null, hideTimer = null;
     const overlay = document.createElement('div');
-    overlay.className = 'viewer v342-photo-fullscreen';
+    overlay.className = 'viewer v342-photo-fullscreen controls-visible';
     document.body.appendChild(overlay);
     const result = new Promise(resolve => { overlay.__resolveIndex = resolve; });
     const revoke = () => { if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; } };
+    const showControlsBriefly = () => {
+      overlay.classList.add('controls-visible');
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => overlay.classList.remove('controls-visible'), 1800);
+    };
     const close = () => {
       if (closed) return;
-      closed = true; revoke(); overlay.remove(); overlay.__resolveIndex(index);
+      closed = true; clearTimeout(tapTimer); clearTimeout(hideTimer); revoke(); overlay.remove(); overlay.__resolveIndex(index);
     };
     async function draw() {
       revoke();
@@ -218,18 +235,14 @@
       if (resolved.blob) objectUrl = URL.createObjectURL(resolved.blob);
       overlay.innerHTML = `<div class="viewer-top"><button class="icon-btn" data-full-close aria-label="Закрыть">✕</button>
         <span class="num">№${esc(spread.number)} · ${index + 1}/${spreads.length}</span></div>
-        <div class="viewer-stage" data-full-stage>${objectUrl ? `<img data-full-image src="${objectUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}</div>
-        ${spreads.length > 1 ? '<div class="v342-photo-nav"><button data-full-nav="prev" aria-label="Предыдущее фото">← Предыдущее</button><button data-full-nav="next" aria-label="Следующее фото">Следующее →</button></div>' : ''}
-        <div class="v340-zoom-controls"><button data-full-zoom="minus">−</button><button data-full-zoom="reset">100%</button><button data-full-zoom="plus">+</button></div>`;
+        <div class="viewer-stage" data-full-stage>${objectUrl ? `<img data-full-image src="${objectUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}</div>`;
       const stage = overlay.querySelector('[data-full-stage]');
       const image = overlay.querySelector('[data-full-image]');
-      const reset = overlay.querySelector('[data-full-zoom="reset"]');
       const gesture = {scale:1,x:0,y:0,pointers:new Map(),startScale:1,startDistance:0,startX:0,startY:0,lastTap:0};
       const apply = () => {
         if (!image) return;
         if (gesture.scale <= 1) { gesture.scale=1; gesture.x=0; gesture.y=0; }
         image.style.transform=`translate(${gesture.x}px,${gesture.y}px) scale(${gesture.scale})`;
-        reset.textContent=Math.round(gesture.scale*100)+'%';
       };
       const scale = value => { gesture.scale=Math.max(1,Math.min(6,value)); apply(); };
       stage?.addEventListener('pointerdown', event => {
@@ -247,14 +260,20 @@
         const dx=event.clientX-gesture.startX, dy=event.clientY-gesture.startY;
         gesture.pointers.delete(event.pointerId);
         if (gesture.scale <= 1.001 && Math.abs(dx)>60 && Math.abs(dx)>Math.abs(dy)) { index=(index+(dx<0?1:-1)+spreads.length)%spreads.length; void draw(); return; }
-        if (Math.hypot(dx,dy)<10) { const now=Date.now(); if(now-gesture.lastTap<320) scale(gesture.scale===1?2.5:1); gesture.lastTap=now; }
+        if (Math.hypot(dx,dy)<10) {
+          const now=Date.now();
+          if (now-gesture.lastTap<320) {
+            clearTimeout(tapTimer); tapTimer=null; scale(gesture.scale===1?2.5:1);
+          } else {
+            clearTimeout(tapTimer);
+            tapTimer=setTimeout(() => overlay.classList.toggle('controls-visible'),320);
+          }
+          gesture.lastTap=now;
+        }
       });
       stage?.addEventListener('pointercancel', event => gesture.pointers.delete(event.pointerId));
-      overlay.querySelector('[data-full-close]').onclick=close;
-      overlay.querySelectorAll('[data-full-nav]').forEach(button => button.onclick=()=>{index=(index+(button.dataset.fullNav==='next'?1:-1)+spreads.length)%spreads.length;void draw();});
-      overlay.querySelector('[data-full-zoom="minus"]').onclick=()=>scale(gesture.scale-.5);
-      overlay.querySelector('[data-full-zoom="plus"]').onclick=()=>scale(gesture.scale+.5);
-      reset.onclick=()=>scale(1);
+      overlay.querySelector('[data-full-close]').onclick=event=>{event.stopPropagation();close();};
+      showControlsBriefly();
     }
     await draw();
     return result;
@@ -600,9 +619,9 @@
   };
 
   const extraStyle = document.createElement('style');
-  extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img,.v342-photo-fullscreen img{will-change:transform;transform-origin:center}.v342-photo-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px;background:#171717}.v342-photo-nav button{min-height:44px;color:#fff;background:#ffffff18;border:1px solid #ffffff38}.v342-photo-fullscreen{z-index:130;background:#080808}.v342-photo-fullscreen .viewer-stage{flex:1;min-height:0}.v342-photo-fullscreen .viewer-top{flex:0 0 auto}`;
+  extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img,.v342-photo-fullscreen img{will-change:transform;transform-origin:center}.v342-photo-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px;background:#171717}.v342-photo-nav button{min-height:44px;color:#fff;background:#ffffff18;border:1px solid #ffffff38}.v342-photo-fullscreen{position:fixed;inset:0;z-index:130;background:#000;overflow:hidden;padding:0}.v342-photo-fullscreen .viewer-stage{position:absolute;inset:0;display:grid;place-items:center;min-height:0;touch-action:none}.v342-photo-fullscreen .viewer-stage img{display:block;max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain}.v342-photo-fullscreen .viewer-top{position:absolute;z-index:2;left:0;right:0;top:0;display:flex;align-items:center;gap:12px;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;background:linear-gradient(#000b,transparent);opacity:0;pointer-events:none;transition:opacity .18s ease}.v342-photo-fullscreen.controls-visible .viewer-top{opacity:1;pointer-events:auto}`;
   document.head.appendChild(extraStyle);
   const teamStyle = document.createElement('style');
-  teamStyle.textContent = `.sheet-backdrop{z-index:120}.v340-viewer .viewer-top .icon-btn,.v342-photo-fullscreen .viewer-top .icon-btn{color:#fff;background:rgba(255,255,255,.18);border:1px solid #ffffff38;width:44px;height:44px;min-width:44px;min-height:44px;border-radius:50%;padding:0}.v340-viewer .viewer-actions{display:flex;gap:8px}.v340-viewer .viewer-actions button{min-height:44px;flex:1;padding:8px 10px}.vnext-notes{margin-top:12px;border-top:1px solid #ffffff38;padding-top:10px}.vnext-note{padding:10px 0;border-bottom:1px solid #ffffff28}.vnext-note p{white-space:pre-wrap;overflow-wrap:anywhere}.vnext-note-caption,.vnext-note small{font-size:.8rem;opacity:.8}.vnext-notes button{color:inherit;background:#ffffff18;border:1px solid #ffffff38}.vnext-note-composer{display:grid;grid-template-columns:1fr;gap:8px;width:100%}.vnext-note-composer textarea{display:block;width:100%;min-height:96px;box-sizing:border-box;resize:vertical}.vnext-note-composer [data-note-add]{display:block;width:100%;min-height:44px}.v342-note-actions{display:flex;gap:6px;justify-content:flex-end}.v342-note-actions button{min-height:36px;padding:6px 10px;font-size:.86rem}`;
+  teamStyle.textContent = `.sheet-backdrop{z-index:120}.v340-viewer .viewer-top .icon-btn,.v342-photo-fullscreen .viewer-top .icon-btn{color:#fff;background:rgba(255,255,255,.18);border:1px solid #ffffff38;width:44px;height:44px;min-width:44px;min-height:44px;border-radius:50%;padding:0}.v340-viewer .viewer-actions{display:flex;gap:8px}.v340-viewer .viewer-actions button{min-height:44px;flex:1;padding:8px 10px}.vnext-notes{margin-top:12px;border-top:1px solid #ffffff38;padding-top:10px}.vnext-note{padding:10px 0;border-bottom:1px solid #ffffff28}.vnext-note p{white-space:pre-wrap;overflow-wrap:anywhere}.vnext-note-caption,.vnext-note small{font-size:.8rem;opacity:.8}.vnext-notes button{color:inherit;background:#ffffff18;border:1px solid #ffffff38}.vnext-note-composer{display:grid;grid-template-columns:1fr;gap:8px;width:100%}.vnext-note-composer>[data-note-compose]{display:block;width:100%;min-height:44px}.vnext-note-composer [data-note-editor]{display:grid;gap:8px;width:100%}.vnext-note-composer [data-note-editor][hidden]{display:none}.vnext-note-composer textarea{display:block;width:100%;min-height:112px;box-sizing:border-box;resize:vertical}.vnext-note-composer .btn-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.vnext-note-composer [data-note-add],.vnext-note-composer [data-note-cancel]{display:block;width:100%;min-height:44px}.v342-note-actions{display:flex;gap:6px;justify-content:flex-end}.v342-note-actions button{min-height:36px;padding:6px 10px;font-size:.86rem}`;
   document.head.appendChild(teamStyle);
 })();

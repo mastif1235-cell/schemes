@@ -62,6 +62,7 @@ try {
     return false;
   }),true);
   await page.evaluate(async () => window.v340OpenSpread(await get('spreads','s1')));
+  await page.locator('[data-note-compose]').click();
   await page.locator('[data-note-input]').fill('Проверил муфту — всё нормально');
   await page.locator('[data-note-add]').click();
   await page.getByText('Проверил муфту — всё нормально',{exact:true}).waitFor();
@@ -301,31 +302,65 @@ try {
     await window.v340OpenGlobalHistory();
     await new Promise(res => setTimeout(res, 250));
     const rows = document.querySelectorAll('[data-server-history] .v340-history-row').length;
-    document.querySelector('.sheet-backdrop')?.remove();
+    const close = document.querySelector('[data-history-close]');
+    if (!close) return false;
+    close.click();
+    await new Promise(res => setTimeout(res, 30));
+    if (document.querySelector('[data-server-history]')) return false;
     return rows >= 1;
-  }), true, 'global history is not capability-gated');
+  }), true, 'global history is not capability-gated and has an explicit close button');
   // Notes composer must sit above the notes list.
   const composer = await page.evaluate(async () => {
     settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{team_notes:true, activity:true}};
     await window.v340OpenSpread(await get('spreads','s1'));
     await new Promise(res => setTimeout(res, 250));
     const host = document.querySelector('.vnext-notes');
+    const compose = host?.querySelector('[data-note-compose]');
+    const editor = host?.querySelector('[data-note-editor]');
+    const initiallyCollapsed=!!(compose&&editor&&editor.hidden&&!compose.hidden);
+    compose?.click();
     const input = host?.querySelector('[data-note-input]');
     const add = host?.querySelector('[data-note-add]');
     const list = host?.querySelector('[data-note-list]');
     const ordered = !!(input && list) && (input.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     const texts = [...(host?.querySelectorAll('[data-note-list] .vnext-note p') || [])].map(el => el.textContent);
-    const inputBox=input?.getBoundingClientRect(), addBox=add?.getBoundingClientRect(), hostBox=host?.getBoundingClientRect();
-    const fullWidth=!!(inputBox&&addBox&&hostBox)&&Math.abs(inputBox.width-hostBox.width)<2&&Math.abs(addBox.width-hostBox.width)<2;
+    const inputBox=input?.getBoundingClientRect(), editorBox=editor?.getBoundingClientRect(), hostBox=host?.getBoundingClientRect();
+    const fullWidth=!!(inputBox&&editorBox&&hostBox)&&Math.abs(inputBox.width-hostBox.width)<2&&Math.abs(editorBox.width-hostBox.width)<2;
     const minHeight=inputBox?.height || 0;
     const foreignActions=host?.querySelectorAll('.vnext-note .v342-note-actions').length || 0;
+    host?.querySelector('[data-note-cancel]')?.click();
+    const collapsedAfterCancel=!!(editor?.hidden&&!compose?.hidden);
     document.querySelector('.viewer')?.remove();
-    return {ordered, texts, fullWidth, minHeight, foreignActions};
+    return {ordered, texts, fullWidth, minHeight, foreignActions, initiallyCollapsed, collapsedAfterCancel};
   });
   assert.equal(composer.ordered,true,'notes composer is above the notes list');
-  assert.equal(composer.fullWidth,true,'notes textarea and add button use full width');
+  assert.equal(composer.fullWidth,true,'expanded notes textarea uses full width');
   assert.ok(composer.minHeight>=80,'notes textarea remains comfortably tall');
   assert.ok(composer.foreignActions>=1,'active member sees edit/delete actions on another author note');
+  assert.equal(composer.initiallyCollapsed,true,'new note textarea is hidden by default');
+  assert.equal(composer.collapsedAfterCancel,true,'Cancel collapses the new note composer');
+  const switches = await page.evaluate(async () => {
+    settings.keep_originals_offline=false; settings.theme='light'; document.body.dataset.theme='light';
+    route={screen:'settings'}; await render();
+    const keep=document.querySelector('#swKeep');
+    const light=getComputedStyle(keep); const offBackground=light.backgroundColor;
+    const dimensions={width:light.width,height:light.height,radius:light.borderRadius};
+    keep.click();
+    await new Promise(resolve=>setTimeout(resolve,250));
+    const onBackground=getComputedStyle(keep).backgroundColor;
+    document.querySelector('#swTheme').click();
+    await new Promise(resolve=>setTimeout(resolve,250));
+    const darkOnBackground=getComputedStyle(keep).backgroundColor;
+    keep.click(); await new Promise(resolve=>setTimeout(resolve,250));
+    const darkOffBackground=getComputedStyle(keep).backgroundColor;
+    keep.click(); await new Promise(resolve=>setTimeout(resolve,250));
+    return {dimensions,offBackground,onBackground,darkOnBackground,darkOffBackground,
+      functional:settings.keep_originals_offline===true&&settings.theme==='dark'&&keep.classList.contains('on')};
+  });
+  assert.deepEqual(switches.dimensions,{width:'56px',height:'30px',radius:'999px'});
+  assert.notEqual(switches.offBackground,switches.onBackground,'off and on switches have distinct contrast');
+  assert.notEqual(switches.darkOffBackground,switches.darkOnBackground,'off and on switches have distinct contrast in dark theme');
+  assert.equal(switches.functional,true,'switch controls keep their original settings behavior');
   const fullscreen = await page.evaluate(async () => {
     settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{team_notes:true,activity_spread_seen:true}};
     await window.v340OpenSpread(await get('spreads','s1'));
@@ -334,13 +369,17 @@ try {
     detail.querySelector('[data-image]')?.click(); await new Promise(res=>setTimeout(res,150));
     const full=document.querySelector('.v342-photo-fullscreen');
     const pure=!!full&&!full.querySelector('.vnext-notes')&&!full.textContent.includes('Примечания');
-    const navBelow=!!full?.querySelector('.v342-photo-nav')&&full.querySelector('[data-full-stage]').compareDocumentPosition(full.querySelector('.v342-photo-nav'))&Node.DOCUMENT_POSITION_FOLLOWING;
+    const noPersistentNav=!full?.querySelector('.v342-photo-nav,[data-full-nav]');
+    const noZoomButtons=!full?.querySelector('.v340-zoom-controls,[data-full-zoom]');
+    const blackBackground=getComputedStyle(full).backgroundColor==='rgb(0, 0, 0)';
+    const sameSpread=full?.querySelector('.num')?.textContent.includes('№1');
     full?.querySelector('[data-full-close]')?.click(); await new Promise(res=>setTimeout(res,50));
     const restored=!!document.querySelector('.v340-viewer')&&!document.querySelector('.v342-photo-fullscreen');
     document.querySelector('.v340-viewer')?.remove();
-    return {pure,navBelow:!!navBelow,restored};
+    return {pure,noPersistentNav,noZoomButtons,blackBackground,sameSpread,restored};
   });
-  assert.deepEqual(fullscreen,{pure:true,navBelow:true,restored:true},'fullscreen is photo-only and returns to the same spread detail');
+  assert.deepEqual(fullscreen,{pure:true,noPersistentNav:true,noZoomButtons:true,blackBackground:true,sameSpread:true,restored:true},
+    'fullscreen is photo-only, has no persistent nav/zoom bars and returns to the same spread detail');
   // Back from a spread opened in History must reopen History.
   const backToHistory = await page.evaluate(async () => {
     settings.team_capabilities = {scope:window.vNextSync.scope(), flags:{activity:true, activity_spread_seen:true}};
@@ -364,26 +403,42 @@ try {
   const diagnostic = await page.evaluate(async () => {
     document.querySelectorAll('.sheet-backdrop,.viewer').forEach(node=>node.remove());
     route={screen:'notebooks'};await render();
-    const server={id:'remote-s1',number:1,title:'Сервер',status:'Актуально',note_short:'server short',note_full:'server full',revision:8};
+    const local=await get('spreads','s1');
+    const server={id:local.server_id,number:local.number,title:local.title,status:local.status,
+      note_short:local.note_short,note_full:local.note_full,revision:8};
     await put('sync_queue',{id:901,entity:'spread',local_id:'s1',status:'conflict',retry_count:2,last_error:'revision conflict',server_copy:server});
     await put('sync_queue',{id:902,entity:'spread',local_id:'s1',status:'conflict',retry_count:3,last_error:'revision conflict',server_copy:server});
     const before=JSON.stringify((await getAll('sync_queue')).filter(row=>row.id===901||row.id===902));
     let syncCalls=0;fullSync=async()=>{syncCalls++;};
+    const originalApi=api; let requests=[];
+    api=async (path,options) => {requests.push([path,options]); return {spread:server};};
     document.getElementById('syncDot').click();
     await new Promise(res=>setTimeout(res,30));
     const button=document.querySelector('[data-conflict-diagnostics]');
     button?.click();await new Promise(res=>setTimeout(res,30));
     const text=document.querySelector('[data-conflict-diagnostics]')?.textContent||'';
-    const after=JSON.stringify((await getAll('sync_queue')).filter(row=>row.id===901||row.id===902));
+    const cleanup=document.querySelector('[data-safe-conflict-cleanup]');
+    const afterView=JSON.stringify((await getAll('sync_queue')).filter(row=>row.id===901||row.id===902));
+    const spreadBefore=JSON.stringify(await get('spreads','s1'));
+    cleanup?.click();await new Promise(res=>setTimeout(res,50));
+    const rows=(await getAll('sync_queue')).filter(row=>row.id===901||row.id===902);
+    const spreadAfter=JSON.stringify(await get('spreads','s1'));
+    api=originalApi;
     document.querySelector('.sheet-backdrop')?.remove();
     await del('sync_queue',901);await del('sync_queue',902);
-    return {hasButton:!!button,text,unchanged:before===after,syncCalls};
+    return {hasButton:!!button,text,unchangedBeforeCleanup:before===afterView,hasCleanup:!!cleanup,
+      statuses:rows.map(row=>row.status),spreadUnchanged:spreadBefore===spreadAfter,syncCalls,
+      onlyGets:requests.every(([path,options])=>path==='/api/spreads/'+encodeURIComponent(local.server_id)&&options===undefined)};
   });
   assert.equal(diagnostic.hasButton,true,'sync sheet exposes conflict diagnostics');
   assert.match(diagnostic.text,/legacy spread/);
   assert.match(diagnostic.text,/2 дублей/);
   assert.match(diagnostic.text,/не отправляет/,'diagnostics explains that Retry skips conflicts');
-  assert.equal(diagnostic.unchanged,true,'opening diagnostics does not write IndexedDB');
+  assert.equal(diagnostic.unchangedBeforeCleanup,true,'opening diagnostics does not write IndexedDB');
+  assert.equal(diagnostic.hasCleanup,true,'safe cleanup appears only after live server equality check');
+  assert.deepEqual(diagnostic.statuses,['done','done'],'explicit safe cleanup retires every duplicate');
+  assert.equal(diagnostic.spreadUnchanged,true,'safe cleanup does not change spread or current photo');
+  assert.equal(diagnostic.onlyGets,true,'safe cleanup uses only read-only spread GET requests');
   assert.equal(diagnostic.syncCalls,0,'opening diagnostics does not start fullSync');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');

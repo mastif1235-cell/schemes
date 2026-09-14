@@ -142,25 +142,55 @@
     return JSON.stringify(metadata(left)) === JSON.stringify(metadata(right));
   }
 
-  // Prepared for an explicit future action. Diagnostics and sync never call this function.
-  // It performs one read-only server GET and writes only when every metadata value already matches.
-  async function safeResolveDuplicateSpreadConflicts(groupOrKey) {
+  function completeSpreadServerCopy(server, expectedId) {
+    return !!server && server.id === expectedId && Number.isFinite(Number(server.revision))
+      && Number(server.revision) > 0 && FIELD_NAMES.every(key => Object.hasOwn(server, key));
+  }
+
+  async function assessLegacySpreadConflict(groupOrKey) {
     const requestedKey = typeof groupOrKey === 'string' ? groupOrKey : groupOrKey?.key;
     const group = (await conflictGroups()).find(item => item.key === requestedKey);
-    if (!group || group.entity !== 'spread') return {resolved:false, reason:'not_legacy_spread'};
+    if (!group || group.entity !== 'spread') return {safe:false, reason:'not_legacy_spread'};
+    if (group.scope !== '(legacy: scope отсутствует)') return {safe:false, reason:'not_unscoped_legacy'};
     if (!group.items.length || group.items.some(item => item.status !== 'conflict' || item.method_or_op === 'delete')) {
-      return {resolved:false, reason:'unsupported_group'};
+      return {safe:false, reason:'unsupported_group'};
     }
     const local = await get('spreads', group.localId);
-    if (!local?.server_id || local.deleted_at || !isOnline() || !isAuthed()) return {resolved:false, reason:'server_check_unavailable'};
+    if (!local?.server_id || local.deleted_at) return {safe:false, reason:'local_spread_unavailable'};
+    if (!isOnline() || !isAuthed()) return {safe:false, reason:'server_check_unavailable'};
     const expectedScope = scope();
-    if (group.scope !== '(legacy: scope отсутствует)' && group.scope !== expectedScope) return {resolved:false, reason:'scope_mismatch'};
     const response = await api(`/api/spreads/${encodeURIComponent(local.server_id)}`);
     assertScope(expectedScope);
     const server = response?.spread;
-    if (!server || server.id !== local.server_id || !sameSpreadValues(local, server)) {
-      return {resolved:false, reason:'values_differ'};
+    if (!completeSpreadServerCopy(server, local.server_id)) {
+      return {safe:false, reason:'server_data_unavailable', server:null};
     }
+    const safe = sameSpreadValues(local, server);
+    return {safe, reason:safe ? 'server_equals_local' : 'values_differ',
+      server:{id:server.id, revision:Number(server.revision), values:metadata(server)}};
+  }
+
+  async function safeLegacySpreadConflictAssessments(groups = null) {
+    const source = groups || await conflictGroups();
+    const result = new Map();
+    for (const group of source.filter(item => item.entity === 'spread')) {
+      try { result.set(group.key, await assessLegacySpreadConflict(group)); }
+      catch (error) {
+        console.warn('Legacy spread conflict check failed', error);
+        result.set(group.key, {safe:false, reason:'server_check_failed'});
+      }
+    }
+    return result;
+  }
+
+  // Explicit user action only. One fresh GET proves equality before queue rows are retired.
+  // No PATCH is sent and the spread, photos and current_photo_id are not written.
+  async function safeResolveDuplicateSpreadConflicts(groupOrKey) {
+    const requestedKey = typeof groupOrKey === 'string' ? groupOrKey : groupOrKey?.key;
+    const group = (await conflictGroups()).find(item => item.key === requestedKey);
+    const assessment = await assessLegacySpreadConflict(group);
+    if (!assessment.safe) return {resolved:false, reason:assessment.reason};
+    const server = assessment.server;
     const queue = await getAll('sync_queue');
     const ids = new Set(group.items.map(item => item.id));
     const currentItems = queue.filter(item => ids.has(item.id));
@@ -168,11 +198,11 @@
       return {resolved:false, reason:'group_changed'};
     }
     await window.vNextAtomic('spreads', group.localId, current => {
-      if (!current || current.server_id !== server.id || !sameSpreadValues(current, server)) throw new Error('Конфликт изменился; ничего не закрыто');
+      if (!current || current.server_id !== server.id || !sameSpreadValues(current, server.values)) throw new Error('Конфликт изменился; ничего не закрыто');
       return {
-        row:{...current, revision:server.revision, updated_at:server.updated_at || current.updated_at,
-          metadata_base:metadata(server), conflict:null},
-        retired:currentItems.map(item => ({...item, status:'done', last_error:'server already equals local metadata', server_copy:null}))
+        retired:currentItems.map(item => ({...item, status:'done', next_attempt_at:null,
+          retired_at:nowISO(), retired_reason:'server already equals local business fields',
+          retired_previous_error:item.last_error || null, last_error:null}))
       };
     });
     return {resolved:true, count:currentItems.length};
@@ -180,9 +210,12 @@
 
   async function openConflictDiagnostics() {
     const groups = await conflictGroups();
-    const {el} = openSheet(`<div class="sheet-handle"></div><h2>Диагностика конфликтов</h2>
+    const assessments = await safeLegacySpreadConflictAssessments(groups);
+    const safe = groups.filter(group => assessments.get(group.key)?.safe);
+    const {el,close} = openSheet(`<div class="sheet-handle"></div><h2>Диагностика конфликтов</h2>
       <p class="warn-box">Только чтение. Записи со статусом conflict не повторяются кнопкой «Повторить».</p>
-      <p class="v340-caption">Экран не запускает синхронизацию, не отправляет PATCH и не изменяет очередь.</p>
+      <p class="v340-caption">Просмотр не запускает синхронизацию и не отправляет PATCH. Очередь меняется только после явного нажатия безопасной очистки.</p>
+      ${safe.length ? `<button class="btn-secondary" data-safe-conflict-cleanup>Очистить безопасные старые конфликты (${safe.reduce((sum,group) => sum + group.items.length,0)})</button>` : ''}
       <div data-conflict-diagnostics></div>`);
     const host = el.querySelector('[data-conflict-diagnostics]');
     if (!groups.length) { host.innerHTML = '<div class="empty-state">Конфликтов в очереди нет.</div>'; return; }
@@ -190,16 +223,37 @@
       const card = document.createElement('article');
       card.className = 'v350-conflict-diagnostic';
       const local = group.spread ? group.spread.values : null;
+      const assessment = assessments.get(group.key);
+      const serverValues = assessment?.server?.values || group.server?.values || group.items.map(item => item.server_conflicts).filter(Boolean);
+      const resolution = assessment?.safe ? 'Сервер уже равен телефону. Эту legacy-группу можно безопасно закрыть без отправки.'
+        : assessment?.reason === 'values_differ' ? 'Значения отличаются. Конфликт останется до ручного выбора.'
+        : assessment?.reason === 'server_data_unavailable' ? 'Нет достоверной server revision или полного набора полей. Автоочистка запрещена.'
+        : assessment?.reason === 'not_unscoped_legacy' ? 'Запись содержит scope и не считается старой legacy-записью.'
+        : assessment ? 'Безопасность не доказана. Конфликт останется без изменений.' : '';
       card.innerHTML = `<h3>${esc(group.kind)} · ${group.items.length > 1 ? `${group.items.length} дублей` : '1 запись'}</h3>
         <p><strong>Разворот:</strong> ${esc(group.spread ? `№${group.spread.number} ${group.spread.title || ''}` : 'не определён')}</p>
         <p><strong>local_id:</strong> <code>${esc(group.localId)}</code></p>
         <p><strong>scope:</strong> <code>${esc(group.scope)}</code></p>
         <p><strong>Причина:</strong> ${esc(group.reason)}</p>
+        ${resolution ? `<p><strong>Решение:</strong> ${esc(resolution)}</p>` : ''}
         <details open><summary>Локально · revision ${esc(group.spread?.revision ?? '—')}</summary><pre>${esc(JSON.stringify(local, null, 2))}</pre></details>
-        <details open><summary>С сервера · revision ${esc(group.server?.revision ?? '—')}</summary><pre>${esc(JSON.stringify(group.server?.values || group.items.map(item => item.server_conflicts).filter(Boolean), null, 2))}</pre></details>
+        <details open><summary>С сервера · revision ${esc(assessment?.server?.revision ?? group.server?.revision ?? '—')}</summary><pre>${esc(JSON.stringify(serverValues, null, 2))}</pre></details>
         <details><summary>Queue items: ${group.items.map(item => '#' + item.id).join(', ')}</summary><pre>${esc(JSON.stringify(group.items, null, 2))}</pre></details>`;
       host.appendChild(card);
     }
+    el.querySelector('[data-safe-conflict-cleanup]')?.addEventListener('click', async event => {
+      event.target.disabled = true;
+      let retired = 0;
+      for (const group of safe) {
+        try {
+          const result = await safeResolveDuplicateSpreadConflicts(group.key);
+          if (result.resolved) retired += result.count;
+        } catch (error) { console.warn('Safe legacy conflict cleanup stopped for one group', error); }
+      }
+      close();
+      await updateSyncIndicator();
+      toast(retired ? `Безопасно закрыто старых конфликтов: ${retired}` : 'Конфликты изменились; ничего не закрыто');
+    });
   }
 
   function notebookValues(row) {
@@ -1036,7 +1090,7 @@
   };
 
   window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics, conflictGroups, openConflictDiagnostics,
-    safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts};
+    assessLegacySpreadConflict, safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
   const baseQueueEntityChange = typeof queueEntityChange === 'function' ? queueEntityChange : async (entity, localId, extra = {}) => {
     await put('sync_queue', {entity, local_id:localId, status:'pending', retry_count:0, ...extra});
