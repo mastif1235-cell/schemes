@@ -2,6 +2,18 @@
 (function () {
   const UNSYNCED_QUEUE = new Set(['pending','syncing','failed','conflict']);
 
+
+  function getTelegramPhotoLink(photo) {
+    const link = typeof photo?.telegram_link === 'string' ? photo.telegram_link.trim() : '';
+    if (!link) return null;
+    try {
+      const parsed = new URL(link, location.href);
+      if (parsed.protocol === 'https:' && parsed.hostname === 't.me') return parsed.href;
+    } catch (error) { console.warn('Invalid Telegram photo link', error); }
+    return null;
+  }
+  window.v350GetTelegramPhotoLink = getTelegramPhotoLink;
+
   async function renderNotes(host, spread, refreshRemote = true) {
     if (!host?.isConnected) return;
     const team = window.vNextSync;
@@ -384,6 +396,7 @@
       const links = await getAllByIndex('spread_tags', 'spread_id', spread.id);
       const tags = (await Promise.all(links.map(link => get('tags', link.tag_id)))).filter(Boolean);
       const photoState = photo ? window.v340GetPhotoSyncState(photo, queue) : null;
+      const telegramLink = getTelegramPhotoLink(photo);
       overlay.innerHTML = `<div class="viewer-top">
         <button class="icon-btn" data-action="close" aria-label="Закрыть">✕</button>
         <span class="num">№${spread.number} · ${index + 1}/${spreads.length}</span><div class="spacer"></div>
@@ -402,7 +415,7 @@
           ${spread.note_full ? `<div class="note">${esc(spread.note_full)}</div>` : ''}
           <section class="vnext-notes" data-team-notes></section>
           <div class="viewer-actions"><button data-action="replace">📷 Заменить</button>
-          <button data-action="telegram" ${photo && photo.telegram_message_id ? '' : 'disabled'}>✈ Telegram</button>
+          <button data-action="telegram" ${telegramLink ? '' : 'disabled'}>✈ Telegram</button>
           <button data-action="delete" aria-label="Удалить разворот">🗑</button></div></div>`;
       renderNotes(overlay.querySelector('[data-team-notes]'),spread).catch(error => console.warn('Notes could not be displayed',error));
 
@@ -569,7 +582,10 @@
           anchor.download = `spread_${spread.number}_${download.fallback ? 'preview' : 'original'}.jpg`;
           try { anchor.click(); }
           finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
-        } else if (action === 'telegram' && photo && photo.telegram_link) window.open(photo.telegram_link, '_blank');
+        } else if (action === 'telegram') {
+          const link = getTelegramPhotoLink(photo);
+          if (link) window.open(link, '_blank');
+        }
         else if (action === 'delete') {
           confirmAction('Удалить этот разворот? Запись переместится в корзину.', async () => {
             const button = event.target.closest('[data-action="delete"]');

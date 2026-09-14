@@ -324,9 +324,13 @@ assert.equal(tiedSync.data.next_cursor, 1000);
 
 const scenario = createFixture();
 const db2 = scenario.sqlite, env2 = scenario.env;
+env2.CHAT_ID = '-100555777';
 for (const [id, version, current] of [['p1', 1, 1], ['p2', 2, 0]]) {
   db2.prepare('INSERT INTO photos(id,spread_id,version,is_current,seq) VALUES(?,?,?,?,?)').run(id, 's1', version, current, 1);
 }
+db2.prepare(`UPDATE photos SET storage_object_id=?, telegram_message_id=?, telegram_file_id=?,
+  telegram_file_unique_id=?, mime_type=?, file_size=? WHERE id=?`)
+  .run('storage-old', '321', 'file-old', 'unique-old', 'image/jpeg', 1234, 'p2');
 db2.prepare('UPDATE spreads SET current_photo_id=? WHERE id=?').run('p1', 's1');
 const beforePhoto = db2.prepare('SELECT * FROM spreads WHERE id=?').get('s1');
 const madeCurrent = await api(env2, 'POST', '/api/spreads/s1/photos/p2/make-current', 'token-1', { client_ref: 'switch-photo' });
@@ -342,6 +346,10 @@ assert.equal(phoneAPull.data.changes.spreads.find(row => row.id === 's1').title,
 assert.equal(phoneAPull.data.changes.spreads.find(row => row.id === 's1').current_photo_id, 'p2');
 assert.equal(phoneAPull.data.changes.photos.find(row => row.id === 'p1').is_current, 0);
 assert.equal(phoneAPull.data.changes.photos.find(row => row.id === 'p2').is_current, 1);
+assert.equal(phoneAPull.data.changes.photos.find(row => row.id === 'p2').telegram_link, 'https://t.me/c/555777/321',
+  'sync returns computed Telegram links for old D1 photo rows without a stored link column');
+const oldPhotoGet = await api(env2, 'GET', '/api/photos/p2', 'token-1');
+assert.equal(oldPhotoGet.data.photo.telegram_link, 'https://t.me/c/555777/321', 'photo GET returns computed Telegram link');
 assert.ok(phoneAPull.data.changes.activity_events.some(event => event.action === 'photo.made_current'));
 const sameField = await api(env2, 'PATCH', '/api/spreads/s1', 'token-1', {
   client_ref: 'a:text', changes: { title: 'Другой текст' }, base_values: { title: beforePhoto.title },
@@ -410,6 +418,8 @@ assert.equal(snapshot.status, 200, 'v3.4.2 snapshot remains readable');
 for (const key of ['notebook', 'spreads', 'photos', 'tags', 'spread_tags', 'favorites', 'members', 'cursor']) assert.ok(key in snapshot.data);
 assert.equal(snapshot.data.spreads.find(row => row.id === 's1').note_full, 'legacy full');
 assert.equal(snapshot.data.photos.length, 2, 'original photo rows remain');
+assert.equal(snapshot.data.photos.find(row => row.id === 'p2').telegram_link, 'https://t.me/c/555777/321',
+  'snapshot returns computed Telegram links for old photos');
 const invite = await api(env2, 'POST', '/api/invites', 'token-1', { notebook_id: 'n1' });
 assert.equal(invite.status, 200);
 assert.equal((await api(env2, 'GET', '/api/invites?notebook_id=n1')).data.invites.length, 1);
@@ -433,6 +443,8 @@ try {
   }), { ...env2, CHAT_ID: 'fixture-chat', BOT_TOKEN: 'fixture-only' });
   assert.equal(uploaded.status, 200, 'existing photo upload SQL remains valid');
   const uploadedData = await uploaded.json();
+  assert.equal(uploadedData.telegram_link, 'https://t.me/c/fixture-chat/100', 'fresh upload response includes Telegram link');
+  assert.equal(uploadedData.photo.telegram_link, uploadedData.telegram_link, 'fresh upload response includes mapped photo metadata');
   assert.equal(db2.prepare('SELECT current_photo_id FROM spreads WHERE id=?').get('s2').current_photo_id, uploadedData.photo_id);
   assert.ok(db2.prepare("SELECT id FROM activity_events WHERE action='photo.added'").get());
 } finally { globalThis.fetch = nativeFetch; }
