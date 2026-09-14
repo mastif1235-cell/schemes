@@ -530,7 +530,7 @@
       telegram_message_id: serverPhoto.telegram_message_id || serverPhoto.message_id || null,
       telegram_file_id: serverPhoto.telegram_file_id || serverPhoto.file_id || null,
       telegram_file_unique_id: serverPhoto.telegram_file_unique_id || serverPhoto.file_unique_id || null,
-      telegram_link: serverPhoto.telegram_link || null,
+      telegram_link: serverPhoto.telegram_link || localPhoto.telegram_link || null,
       mime_type: serverPhoto.mime_type,
       file_size: serverPhoto.file_size,
       upload_status: 'synced'
@@ -1089,9 +1089,352 @@
     if (refreshRequested) { refreshRequested = false; setTimeout(() => void fullSync(), 0); }
   };
 
+
+  function diagnosticValue(source, key) {
+    return source && Object.hasOwn(source, key) ? (source[key] ?? null) : null;
+  }
+
+  function redactDiagnosticKey(key) {
+    return /(^|_)(auth|authorization|bearer|token|secret|password|bot)(_|$)|chat_id/i.test(String(key || ''));
+  }
+
+  function sanitizeDiagnosticValue(value, depth = 0, seen = null) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (typeof value !== 'object') return String(value);
+    const tag = Object.prototype.toString.call(value);
+    if (tag === '[object Blob]' || tag === '[object File]') {
+      return {type:'[binary omitted]', size:typeof value.size === 'number' ? value.size : null,
+        mime_type:value.type || null, name:value.name || null};
+    }
+    if (depth > 8) return '[max depth]';
+    const guard = seen || new WeakSet();
+    if (guard.has(value)) return '[circular]';
+    guard.add(value);
+    if (Array.isArray(value)) return value.slice(0, 100).map(item => sanitizeDiagnosticValue(item, depth + 1, guard));
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (redactDiagnosticKey(key)) { out[key] = '[redacted]'; continue; }
+      if (key === 'blob' || key === 'body' && item && typeof item === 'object' && typeof item.arrayBuffer === 'function') {
+        out[key] = '[binary omitted]'; continue;
+      }
+      out[key] = sanitizeDiagnosticValue(item, depth + 1, guard);
+    }
+    return out;
+  }
+
+  function backendOrigin() {
+    const raw = String(settings.backend_url || '').trim();
+    if (!raw) return null;
+    if (typeof URL === 'function') {
+      try { return new URL(raw).origin; }
+      catch (error) { console.warn('Backend URL is not parseable for diagnostics', error); }
+    }
+    const match = raw.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i);
+    return match ? match[0] : raw.replace(/\/.*$/, '');
+  }
+
+  function queueStatusCounts(queue) {
+    const counts = {total_unsynced:0, pending:0, syncing:0, failed:0, conflict:0};
+    for (const item of queue) {
+      if (!UNSYNCED.has(item.status)) continue;
+      counts.total_unsynced++;
+      if (Object.hasOwn(counts, item.status)) counts[item.status]++;
+    }
+    return counts;
+  }
+
+  function explicitQueueFields(item) {
+    const payload = item && item.payload || {};
+    return {
+      id:diagnosticValue(item, 'id'),
+      entity:diagnosticValue(item, 'entity'),
+      local_id:diagnosticValue(item, 'local_id'),
+      server_id:diagnosticValue(item, 'server_id'),
+      spread_id:diagnosticValue(item, 'spread_id'),
+      photo_id:diagnosticValue(item, 'photo_id'),
+      note_id:diagnosticValue(item, 'note_id'),
+      tag_id:diagnosticValue(item, 'tag_id'),
+      scope:diagnosticValue(item, 'scope'),
+      status:diagnosticValue(item, 'status'),
+      retry_count:diagnosticValue(item, 'retry_count'),
+      created_at:diagnosticValue(item, 'created_at'),
+      updated_at:diagnosticValue(item, 'updated_at'),
+      last_attempt_at:diagnosticValue(item, 'last_attempt_at'),
+      next_attempt_at:diagnosticValue(item, 'next_attempt_at'),
+      last_error:diagnosticValue(item, 'last_error'),
+      error:diagnosticValue(item, 'error'),
+      sync_error:diagnosticValue(item, 'sync_error'),
+      method:diagnosticValue(item, 'method'),
+      op:diagnosticValue(item, 'op') ?? diagnosticValue(payload, 'op'),
+      revision:diagnosticValue(item, 'revision') ?? diagnosticValue(payload, 'revision'),
+      base_revision:diagnosticValue(item, 'base_revision') ?? diagnosticValue(payload, 'base_revision'),
+      payload:sanitizeDiagnosticValue(diagnosticValue(item, 'payload')),
+      server_copy:sanitizeDiagnosticValue(storedServerCopy(item) || diagnosticValue(item, 'server_copy')),
+      conflict_data:sanitizeDiagnosticValue(diagnosticValue(item, 'conflict_data') || storedConflicts(item) || diagnosticValue(item, 'conflicts')),
+    };
+  }
+
+  function localSpreadDiagnostic(spread, allSpreads) {
+    if (!spread) {
+      return {exists:false, id:null, server_id:null, notebook_id:null, number:null, title:null,
+        status:null, note_short:null, note_full:null, revision:null, deleted_at:null,
+        current_photo_id:null, duplicate_number:{exists:false, count:0, rows:[]}};
+    }
+    const duplicates = (allSpreads || []).filter(row => row.id !== spread.id && !row.deleted_at &&
+      row.notebook_id === spread.notebook_id && row.number === spread.number)
+      .map(row => ({local_id:row.id, server_id:row.server_id || null, revision:row.revision ?? null,
+        deleted_at:row.deleted_at || null, number:row.number ?? null, title:row.title || null}));
+    return {exists:true, id:spread.id, server_id:spread.server_id || null, notebook_id:spread.notebook_id || null,
+      number:spread.number ?? null, title:spread.title ?? null, status:spread.status ?? null,
+      note_short:spread.note_short ?? null, note_full:spread.note_full ?? null,
+      revision:spread.revision ?? null, deleted_at:spread.deleted_at || null,
+      current_photo_id:spread.current_photo_id || null,
+      duplicate_number:{exists:duplicates.length > 0, count:duplicates.length + 1,
+        rows:[{local_id:spread.id, server_id:spread.server_id || null, revision:spread.revision ?? null,
+          deleted_at:spread.deleted_at || null, number:spread.number ?? null, title:spread.title || null}, ...duplicates]}};
+  }
+
+  async function blobDiagnostic(blobId) {
+    const empty = {exists:false, size:null, mime_type:null, error:null};
+    if (!blobId) return empty;
+    try {
+      const record = await get('blobs', blobId);
+      const blob = record && record.blob;
+      if (!blob) return empty;
+      return {exists:true, size:typeof blob.size === 'number' ? blob.size : null,
+        mime_type:blob.type || null, error:null};
+    } catch (error) {
+      return {exists:false, size:null, mime_type:null, error:String(error && error.message ? error.message : error)};
+    }
+  }
+
+  async function photoDiagnostic(photo) {
+    if (!photo) return null;
+    return {
+      id:photo.id || null,
+      server_id:photo.server_id || null,
+      spread_id:photo.spread_id || null,
+      version:photo.version ?? null,
+      is_current:photo.is_current ?? null,
+      upload_status:photo.upload_status ?? null,
+      storage_object_id:photo.storage_object_id ?? null,
+      telegram_message_id:photo.telegram_message_id ?? null,
+      telegram_file_id:photo.telegram_file_id ?? null,
+      telegram_file_unique_id:photo.telegram_file_unique_id ?? null,
+      telegram_link:photo.telegram_link ?? null,
+      mime_type:photo.mime_type ?? null,
+      file_size:photo.file_size ?? null,
+      client_upload_id:photo.client_upload_id ?? null,
+      blobs:{
+        orig:await blobDiagnostic((photo.id || '') + '_orig'),
+        thumb:await blobDiagnostic((photo.id || '') + '_thumb'),
+      }
+    };
+  }
+
+  async function relatedSpread(item, allPhotos) {
+    if (!item) return null;
+    if (['spread','spread_fields','spread_order','tag_link','favorite'].includes(item.entity) && item.local_id) {
+      const spread = await get('spreads', item.local_id);
+      if (spread) return spread;
+    }
+    if (item.spread_id) {
+      const spread = await get('spreads', item.spread_id);
+      if (spread) return spread;
+    }
+    if (item.photo_id) {
+      const photo = (allPhotos || []).find(row => row.id === item.photo_id) || await get('photos', item.photo_id);
+      if (photo?.spread_id) return await get('spreads', photo.spread_id);
+    }
+    if (item.entity === 'spread_note' && item.local_id) {
+      const note = await get('spread_notes', item.local_id);
+      if (note?.spread_id) return await get('spreads', note.spread_id);
+    }
+    return null;
+  }
+
+  async function relatedPhotoDiagnostics(item, spread, allPhotos) {
+    const photos = new Map();
+    if (item?.photo_id) {
+      const direct = (allPhotos || []).find(row => row.id === item.photo_id) || await get('photos', item.photo_id);
+      if (direct) photos.set(direct.id, direct);
+    }
+    if (spread?.id) for (const photo of (allPhotos || []).filter(row => row.spread_id === spread.id)) photos.set(photo.id, photo);
+    const result = [];
+    for (const photo of photos.values()) result.push(await photoDiagnostic(photo));
+    return result.sort((a,b) => (Number(b.is_current) || 0) - (Number(a.is_current) || 0)
+      || (Number(b.version) || 0) - (Number(a.version) || 0) || String(a.id).localeCompare(String(b.id)));
+  }
+
+  function deriveQueueServerId(item, spread, photos) {
+    if (item?.server_id) return item.server_id;
+    if (item?.entity === 'photo') return photos.find(photo => photo.id === item.photo_id)?.server_id || null;
+    if (spread?.server_id) return spread.server_id;
+    return null;
+  }
+
+
+  function localCurrentRole(notebooks) {
+    const currentNotebookId = route?.notebookId || null;
+    const candidates = currentNotebookId ? (notebooks || []).filter(row => row.id === currentNotebookId)
+      : (notebooks || []).filter(row => row.server_id && !row.deleted_at && !row.hidden_no_access);
+    for (const notebook of candidates) {
+      if (settings.user_id && notebook.owner_id === settings.user_id) return {role:'OWNER', source:'local notebook.owner_id'};
+      if (notebook.role || notebook.my_role) return {role:notebook.role || notebook.my_role, source:'local notebook role field'};
+    }
+    return {role:null, source:'not stored locally; diagnostics is read-only'};
+  }
+
+  async function buildReadOnlyDiagnosticReport() {
+    const queueAll = await getAll('sync_queue');
+    const unfinished = queueAll.filter(item => UNSYNCED.has(item.status))
+      .sort((a,b) => Number(a.id || 0) - Number(b.id || 0) || String(a.id || '').localeCompare(String(b.id || '')));
+    const allSpreads = await getAll('spreads');
+    const allPhotos = await getAll('photos');
+    const role = localCurrentRole(await getAll('notebooks'));
+    const report = {
+      generated_at:nowISO(),
+      app_version:window.__BLOCKNOT_APP_VERSION__ || null,
+      backend_origin:backendOrigin(),
+      current_user_id:settings.user_id || null,
+      current_role:role.role,
+      current_role_source:role.source,
+      sync_scope:scope(),
+      sync_cursor:settings.sync_cursor ?? null,
+      last_sync_at:settings.last_sync_at ?? null,
+      online:typeof isOnline === 'function' ? !!isOnline() : null,
+      authenticated:typeof isAuthed === 'function' ? !!isAuthed() : null,
+      queue_counts:queueStatusCounts(queueAll),
+      items:[],
+    };
+    for (const item of unfinished) {
+      const spread = await relatedSpread(item, allPhotos);
+      const photos = await relatedPhotoDiagnostics(item, spread, allPhotos);
+      const entry = explicitQueueFields(item);
+      entry.server_id = deriveQueueServerId(item, spread, photos) || entry.server_id || null;
+      entry.local_spread = localSpreadDiagnostic(spread, allSpreads);
+      entry.photos = photos;
+      report.items.push(entry);
+    }
+    return report;
+  }
+
+  function sameBusinessFields(local, server) {
+    if (!local || !server) return null;
+    return JSON.stringify(metadata(local)) === JSON.stringify(metadata(server));
+  }
+
+  async function checkSpreadOnServerReadOnly(serverId, localBusiness = null) {
+    if (!serverId) return {method:'GET', path:null, http_status:null, exists:false,
+      message:'Проверка невозможна: отсутствует server_id'};
+    const path = `/api/spreads/${encodeURIComponent(serverId)}`;
+    try {
+      const data = await api(path);
+      const spread = data && data.spread;
+      return {method:'GET', path, http_status:200, exists:!!spread,
+        server_id:spread?.id || null, revision:spread?.revision ?? null, number:spread?.number ?? null,
+        title:spread?.title ?? null, status:spread?.status ?? null, note_short:spread?.note_short ?? null,
+        note_full:spread?.note_full ?? null, deleted_at:spread?.deleted_at || null,
+        business_fields:spread ? metadata(spread) : null,
+        same_business_fields:sameBusinessFields(localBusiness, spread)};
+    } catch (error) {
+      return {method:'GET', path, http_status:error?.status ?? null, exists:false,
+        error:String(error && error.message ? error.message : error)};
+    }
+  }
+
+  function diagnosticTable(rows) {
+    return '<dl class="v352-diag-kv">' + Object.entries(rows).map(([key,value]) =>
+      `<dt>${esc(key)}</dt><dd>${esc(value === undefined ? null : value)}</dd>`).join('') + '</dl>';
+  }
+
+  function diagnosticPre(value) {
+    return `<pre>${esc(JSON.stringify(value, null, 2))}</pre>`;
+  }
+
+  async function copyDiagnosticText(text) {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
+    const area = document.createElement('textarea');
+    area.value = text; area.setAttribute('readonly', ''); area.style.position = 'fixed'; area.style.left = '-9999px';
+    document.body.appendChild(area); area.select();
+    let ok = false;
+    try { ok = typeof document.execCommand === 'function' ? document.execCommand('copy') : false; }
+    finally { area.remove(); }
+    return ok;
+  }
+
+  async function openReadOnlySyncDiagnostics() {
+    const report = await buildReadOnlyDiagnosticReport();
+    const serverChecks = new Map();
+    const {el, close} = openSheet(`<div class="sheet-handle"></div><div class="v352-diag-head">
+      <h2>Диагностика синхронизации</h2><button class="icon-btn" data-diag-close aria-label="Закрыть диагностику">✕</button></div>
+      <p class="warn-box">READ-ONLY: этот экран не запускает sync/retry и не меняет IndexedDB, очередь, сервер или conflicts.</p>
+      <div data-diag-summary></div><div class="btn-row"><button class="btn-secondary" data-copy-report>Копировать отчёт</button></div>
+      <div data-diag-items></div>`);
+    el.closest('.sheet-backdrop')?.classList.add('v352-diag-sheet');
+    el.querySelector('[data-diag-close]').onclick = close;
+    const summaryHost = el.querySelector('[data-diag-summary]');
+    const itemsHost = el.querySelector('[data-diag-items]');
+    summaryHost.innerHTML = diagnosticTable({
+      app_version:report.app_version, backend_origin:report.backend_origin, current_user_id:report.current_user_id,
+      current_role:report.current_role, current_role_source:report.current_role_source, sync_scope:report.sync_scope, sync_cursor:report.sync_cursor,
+      last_sync_at:report.last_sync_at, online:report.online, authenticated:report.authenticated,
+      total_unsynced:report.queue_counts.total_unsynced, pending:report.queue_counts.pending,
+      syncing:report.queue_counts.syncing, failed:report.queue_counts.failed, conflict:report.queue_counts.conflict,
+    });
+    if (!report.items.length) itemsHost.innerHTML = '<div class="empty-state">Незавершённых записей sync_queue нет.</div>';
+    report.items.forEach((item, index) => {
+      const card = document.createElement('article');
+      card.className = 'v352-diag-card';
+      card.innerHTML = `<h3>#${esc(item.id)} · ${esc(item.entity)} · ${esc(item.status)}</h3>
+        ${diagnosticTable({local_id:item.local_id, server_id:item.server_id, spread_id:item.spread_id,
+          photo_id:item.photo_id, note_id:item.note_id, tag_id:item.tag_id, scope:item.scope,
+          retry_count:item.retry_count, last_error:item.last_error, error:item.error, sync_error:item.sync_error, method:item.method,
+          op:item.op, revision:item.revision, base_revision:item.base_revision})}
+        <button class="btn-secondary" data-server-check="${index}">Проверить на сервере</button>
+        <div data-server-result="${index}" class="v352-diag-result"></div>
+        <details open><summary>Local spread</summary>${diagnosticPre(item.local_spread)}</details>
+        <details><summary>Photo metadata / blobs</summary>${diagnosticPre(item.photos)}</details>
+        <details><summary>Queue payload</summary>${diagnosticPre(item.payload)}</details>
+        <details><summary>server_copy / conflict data</summary>${diagnosticPre({server_copy:item.server_copy, conflict_data:item.conflict_data})}</details>`;
+      itemsHost.appendChild(card);
+    });
+    itemsHost.addEventListener('click', async event => {
+      const button = event.target.closest('[data-server-check]');
+      if (!button) return;
+      const index = Number(button.dataset.serverCheck);
+      const item = report.items[index];
+      const host = itemsHost.querySelector(`[data-server-result="${index}"]`);
+      button.disabled = true; host.textContent = 'Проверяю только GET…';
+      const spreadServerId = item?.local_spread?.exists ? item.local_spread.server_id : null;
+      const result = await checkSpreadOnServerReadOnly(spreadServerId,
+        item?.local_spread?.exists ? item.local_spread : null);
+      serverChecks.set(String(item?.id ?? index), result);
+      host.innerHTML = diagnosticPre(result);
+      button.disabled = false;
+    });
+    el.querySelector('[data-copy-report]').onclick = async event => {
+      event.target.disabled = true;
+      try {
+        const fresh = await buildReadOnlyDiagnosticReport();
+        fresh.server_checks = Object.fromEntries(serverChecks.entries());
+        const text = JSON.stringify(fresh, null, 2);
+        await copyDiagnosticText(text);
+        toast('Диагностический отчёт скопирован');
+      } catch (error) {
+        console.warn('Diagnostic report copy failed', error);
+        toast('Не удалось скопировать отчёт');
+      } finally { event.target.disabled = false; }
+    };
+  }
+
   window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics, conflictGroups, openConflictDiagnostics,
-    assessLegacySpreadConflict, safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts};
+    assessLegacySpreadConflict, safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts,
+    buildReadOnlyDiagnosticReport, checkSpreadOnServerReadOnly, openReadOnlySyncDiagnostics};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
+  window.v350OpenSyncDiagnostics = openReadOnlySyncDiagnostics;
+  window.v350BuildSyncDiagnosticReport = buildReadOnlyDiagnosticReport;
   const baseQueueEntityChange = typeof queueEntityChange === 'function' ? queueEntityChange : async (entity, localId, extra = {}) => {
     await put('sync_queue', {entity, local_id:localId, status:'pending', retry_count:0, ...extra});
   };
@@ -1137,10 +1480,13 @@
 
   if (document.head && typeof document.createElement === 'function') {
     const diagnosticStyle = document.createElement('style');
-    diagnosticStyle.textContent = `.v350-conflict-diagnostic{margin:12px 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
-      .v350-conflict-diagnostic h3{margin:0 0 10px}.v350-conflict-diagnostic p{overflow-wrap:anywhere}
-      .v350-conflict-diagnostic details{margin-top:8px}.v350-conflict-diagnostic summary{cursor:pointer;font-weight:600}
-      .v350-conflict-diagnostic pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:8px;border-radius:8px;background:var(--surface-2);font-size:.78rem}`;
+    diagnosticStyle.textContent = `.v350-conflict-diagnostic,.v352-diag-card{margin:12px 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
+      .v350-conflict-diagnostic h3,.v352-diag-card h3{margin:0 0 10px}.v350-conflict-diagnostic p,.v352-diag-card p{overflow-wrap:anywhere}
+      .v350-conflict-diagnostic details,.v352-diag-card details{margin-top:8px}.v350-conflict-diagnostic summary,.v352-diag-card summary{cursor:pointer;font-weight:600}
+      .v350-conflict-diagnostic pre,.v352-diag-card pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:8px;border-radius:8px;background:var(--surface-2);font-size:.78rem;max-height:45vh;overflow:auto}
+      .v352-diag-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.v352-diag-head h2{margin:0}
+      .v352-diag-kv{display:grid;grid-template-columns:minmax(92px,.85fr) minmax(0,1.4fr);gap:6px 10px;font-size:.82rem}.v352-diag-kv dt{font-weight:700;color:var(--ink-soft);overflow-wrap:anywhere}.v352-diag-kv dd{margin:0;overflow-wrap:anywhere}
+      .v352-diag-result{margin-top:8px}`;
     document.head.appendChild(diagnosticStyle);
   }
 })();

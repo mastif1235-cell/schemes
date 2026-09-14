@@ -168,6 +168,19 @@ function publicActivity(row) {
 
 // Notebook cover is shared state: Telegram keeps the image, D1 keeps the reference and a small
 // preview. telegram_file_id is never exposed to clients; they download through the API.
+
+function publicPhoto(row, env) {
+  if (!row) return null;
+  const messageId = row.telegram_message_id ?? row.message_id ?? null;
+  return {
+    ...row,
+    telegram_link: messageId && env.CHAT_ID ? telegramLink(env.CHAT_ID, messageId) : (row.telegram_link ?? null),
+  };
+}
+function publicPhotos(rows, env) {
+  return (rows || []).map(row => publicPhoto(row, env));
+}
+
 function publicCover(row) {
   if (!row) return null;
   return {
@@ -322,8 +335,10 @@ async function telegramSendDocument(env, blob, filename) {
   return data.result;
 }
 function telegramLink(chatId, messageId) {
+  const normalizedMessageId = Number(messageId);
+  if (!Number.isSafeInteger(normalizedMessageId) || normalizedMessageId <= 0) return null;
   const raw = String(chatId).replace(/^-100/, '');
-  return `https://t.me/c/${raw}/${messageId}`;
+  return `https://t.me/c/${raw}/${normalizedMessageId}`;
 }
 async function telegramFetchFile(env, fileId) {
   const infoResp = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
@@ -607,7 +622,7 @@ on('GET', '/api/notebooks/:id/snapshot', async (request, env, p) => {
     FROM spread_notes sn WHERE notebook_id=?`).bind(p.id).all();
   const cursorRow = await env.DB.prepare('SELECT MAX(seq) as m FROM change_seq').first();
   return json({
-    notebook, spreads: spreads.results, photos: photos.results, tags: tags.results,
+    notebook, spreads: spreads.results, photos: publicPhotos(photos.results, env), tags: tags.results,
     spread_tags: spreadTags.results, favorites: favorites.results, members: members.results, spread_notes: notes.results,
     cover: (await hasCoverSchema(env)) ? publicCover(await selectCover(env, p.id)) : null,
     cursor: cursorRow.m || 0,
@@ -1294,7 +1309,18 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   if (!file || !clientUploadId) return err(400, 'file_and_client_upload_id_required');
 
   const existingUpload = await env.DB.prepare('SELECT * FROM uploads WHERE client_upload_id=?').bind(clientUploadId).first();
-  if (existingUpload) return json(JSON.parse(existingUpload.result_json));
+  if (existingUpload) {
+    const cached = JSON.parse(existingUpload.result_json);
+    if (!cached.telegram_link && existingUpload.photo_id) {
+      const row = await env.DB.prepare('SELECT * FROM photos WHERE id=?').bind(existingUpload.photo_id).first();
+      const mapped = publicPhoto(row, env);
+      if (mapped) {
+        cached.telegram_link = mapped.telegram_link;
+        cached.photo = mapped;
+      }
+    }
+    return json(cached);
+  }
 
   const maxVersionRow = await env.DB.prepare('SELECT MAX(version) as v FROM photos WHERE spread_id=?').bind(p.id).first();
   const version = (maxVersionRow.v || 0) + 1;
@@ -1332,11 +1358,14 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   await env.DB.batch(statements);
 
   const spreadFresh = await env.DB.prepare('SELECT revision FROM spreads WHERE id=?').bind(p.id).first();
+  const uploadedPhoto = publicPhoto(await env.DB.prepare('SELECT * FROM photos WHERE id=?').bind(photoId).first(), env);
   const result = {
-    photo_id: photoId, storage_object_id: storageObjectId, message_id: tgResult.message_id,
-    file_id: doc.file_id, file_unique_id: doc.file_unique_id, mime_type: doc.mime_type || file.type,
-    file_size: doc.file_size, telegram_link: telegramLink(env.CHAT_ID, tgResult.message_id),
-    version, seq, spread_revision: spreadFresh.revision,
+    photo_id: uploadedPhoto.id, storage_object_id: uploadedPhoto.storage_object_id,
+    message_id: uploadedPhoto.telegram_message_id, file_id: uploadedPhoto.telegram_file_id,
+    file_unique_id: uploadedPhoto.telegram_file_unique_id, mime_type: uploadedPhoto.mime_type,
+    file_size: uploadedPhoto.file_size, telegram_link: uploadedPhoto.telegram_link,
+    version: uploadedPhoto.version, seq: uploadedPhoto.seq, spread_revision: spreadFresh.revision,
+    photo: uploadedPhoto,
   };
   await env.DB.prepare('INSERT INTO uploads (client_upload_id, photo_id, result_json, created_at) VALUES (?,?,?,?)')
     .bind(clientUploadId, photoId, JSON.stringify(result), now).run();
@@ -1350,7 +1379,7 @@ on('GET', '/api/photos/:id', async (request, env, p) => {
   if (!photo) return err(404, 'not_found');
   const spread = await env.DB.prepare('SELECT notebook_id FROM spreads WHERE id=?').bind(photo.spread_id).first();
   await requireMembership(env, u.userId, spread.notebook_id);
-  return json({ photo });
+  return json({ photo: publicPhoto(photo, env) });
 });
 
 on('GET', '/api/photos/:id/preview', async (request, env, p) => {
@@ -1537,7 +1566,7 @@ on('GET', '/api/sync', async (request, env) => {
   const pages = await env.DB.batch(tables.map(t => syncStatement(env, t.sql, t.params, since, limit)));
   for (let i=0; i<tables.length; i++) {
     const rows = pages[i].results;
-    changes[tables[i].name] = rows;
+    changes[tables[i].name] = tables[i].name === 'photos' ? publicPhotos(rows, env) : rows;
     if (rows.length >= limit) fullTables.push(tables[i].name);
     for (const row of rows) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
   }
@@ -1650,7 +1679,7 @@ on('POST', '/api/migration/register-existing-photo', async (request, env) => {
       body.telegram_file_unique_id, body.mime_type, body.file_size, u.userId, now, seq),
     env.DB.prepare('UPDATE spreads SET current_photo_id=?, seq=? WHERE id=?').bind(photoId, seq, body.spread_id),
   ]);
-  return json({ photo_id: photoId, version });
+  return json({ photo_id: photoId, version, photo: publicPhoto(await env.DB.prepare('SELECT * FROM photos WHERE id=?').bind(photoId).first(), env) });
 });
 
 // ------------------------------------------------------------------ main

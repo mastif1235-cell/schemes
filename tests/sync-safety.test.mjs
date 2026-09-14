@@ -498,4 +498,88 @@ for (const status of [0,503,401,403]) {
   });
   await r.context.pullChanges();assert.equal(r.context.settings.sync_cursor,3);assert.equal(r.db.photos.size,1);
 }
+
+{
+  const r = createRuntime();
+  const preserved = r.context.window.v340Sync.mapServerPhoto(
+    {id:'local-photo', telegram_link:'https://t.me/c/111/5'},
+    {id:'server-photo', version:1, is_current:1, telegram_message_id:'5', mime_type:'image/jpeg', file_size:10},
+    'spread-local'
+  );
+  assert.equal(preserved.telegram_link, 'https://t.me/c/111/5', 'sync without link preserves an already usable local Telegram link');
+  const replaced = r.context.window.v340Sync.mapServerPhoto(
+    {id:'local-photo', telegram_link:'https://t.me/c/111/stale'},
+    {id:'server-photo', version:1, is_current:1, telegram_message_id:'6', telegram_link:'https://t.me/c/222/6'},
+    'spread-local'
+  );
+  assert.equal(replaced.telegram_link, 'https://t.me/c/222/6', 'fresh server Telegram link replaces stale local link');
+}
+{
+  const r = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server', owner_id:'u1', title:'Owner notebook'}],
+    spreads:[
+      {id:'mtlf4xgftqrtxh', server_id:'srv-spread', notebook_id:'nb-local', number:3,
+        title:'9-10', status:'Актуально', note_short:'short', note_full:'full', revision:4,
+        current_photo_id:'photo-local', deleted_at:null},
+      {id:'duplicate-local', server_id:'srv-duplicate', notebook_id:'nb-local', number:3,
+        title:'duplicate', status:'Актуально', revision:2, deleted_at:null}
+    ],
+    photos:[{id:'photo-local', server_id:'srv-photo', spread_id:'mtlf4xgftqrtxh', version:2, is_current:true,
+      upload_status:'synced', storage_object_id:'storage', telegram_message_id:'321', telegram_file_id:'file',
+      telegram_file_unique_id:'unique', telegram_link:'https://t.me/c/999/321', mime_type:'image/jpeg',
+      file_size:12345, client_upload_id:'photo-local'}],
+    sync_queue:[
+      {id:281, entity:'spread', local_id:'other-pending', status:'pending', retry_count:0},
+      {id:282, entity:'photo', photo_id:'photo-local', status:'failed', retry_count:2, last_error:'temporary'},
+      {id:283, entity:'spread_note', local_id:'note-cache', spread_id:'mtlf4xgftqrtxh', status:'syncing', retry_count:0},
+      {id:287, entity:'spread', local_id:'mtlf4xgftqrtxh', status:'conflict', retry_count:0,
+        last_error:'revision conflict', payload:{revision:null, client_ref:'safe-to-show', auth_token:'secret-token'},
+        server_copy:null},
+      {id:300, entity:'favorite', local_id:'mtlf4xgftqrtxh', status:'done', retry_count:0}
+    ]
+  });
+  r.db.blobs.set('photo-local_orig', {blob:{size:12345, type:'image/jpeg', raw:'rawbinary'}});
+  r.db.blobs.set('photo-local_thumb', {blob:{size:456, type:'image/webp', raw:'thumbbinary'}});
+  const beforeQueue = JSON.stringify([...r.db.sync_queue.values()]);
+  let fullSyncCalls = 0, retryCalls = 0;
+  r.context.fullSync = async () => { fullSyncCalls++; };
+  r.context.pushEntityQueue = async () => { retryCalls++; };
+  r.context.pushPhotoQueue = async () => { retryCalls++; };
+  const report = await r.context.window.v340Sync.buildReadOnlyDiagnosticReport();
+  assert.deepEqual(JSON.parse(JSON.stringify(report.queue_counts)), {total_unsynced:4, pending:1, syncing:1, failed:1, conflict:1}, 'diagnostic counts keep statuses separate');
+  assert.equal(report.current_role, 'OWNER');
+  assert.equal(report.items.length, 4, 'diagnostic screen data lists unfinished queue rows only');
+  const conflict = report.items.find(item => item.id === 287);
+  assert.equal(conflict.local_spread.exists, true, 'conflict diagnostic shows local spread exists');
+  assert.equal(conflict.local_spread.id, 'mtlf4xgftqrtxh');
+  assert.equal(conflict.local_spread.number, 3);
+  assert.equal(conflict.local_spread.revision, 4);
+  assert.equal(conflict.local_spread.duplicate_number.exists, true);
+  assert.equal(conflict.local_spread.duplicate_number.count, 2);
+  assert.equal(conflict.payload.auth_token, '[redacted]');
+  const photoItem = report.items.find(item => item.id === 282);
+  assert.equal(photoItem.photos[0].telegram_link, 'https://t.me/c/999/321');
+  assert.equal(photoItem.photos[0].blobs.orig.exists, true);
+  assert.equal(photoItem.photos[0].blobs.orig.size, 12345);
+  assert.equal(photoItem.photos[0].blobs.thumb.exists, true);
+  const serialized = JSON.stringify(report);
+  assert.doesNotMatch(serialized, /secret-token|rawbinary|thumbbinary|Bearer/, 'diagnostic report must not include auth tokens or blob contents');
+  assert.equal(JSON.stringify([...r.db.sync_queue.values()]), beforeQueue, 'diagnostic opening/building does not change sync_queue');
+  assert.equal(fullSyncCalls, 0, 'diagnostic opening/building does not run fullSync');
+  assert.equal(retryCalls, 0, 'diagnostic opening/building does not retry queue rows');
+  const calls = [];
+  r.setApi(async (path, options) => {
+    calls.push({path, options});
+    return {spread:{id:'srv-spread', number:3, title:'9-10', status:'Актуально', note_short:'short', note_full:'full', revision:9}};
+  });
+  const checked = await r.context.window.v340Sync.checkSpreadOnServerReadOnly('srv-spread', conflict.local_spread);
+  assert.equal(checked.method, 'GET');
+  assert.equal(checked.path, '/api/spreads/srv-spread');
+  assert.equal(checked.exists, true);
+  assert.equal(checked.same_business_fields, true);
+  assert.deepEqual(calls, [{path:'/api/spreads/srv-spread', options:undefined}], 'server check uses only a GET api(path) call');
+  const impossible = await r.context.window.v340Sync.checkSpreadOnServerReadOnly(null, conflict.local_spread);
+  assert.match(impossible.message, /отсутствует server_id/);
+}
+
 console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics)');

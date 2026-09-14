@@ -467,11 +467,21 @@
   renderSettings = async function () {
     await baseRenderSettings();
     const syncButton = document.getElementById('btnSyncNow');
+    if (syncButton && !document.getElementById('v352SyncDiagnostics')) {
+      const diagnosticsTitle = document.createElement('div'); diagnosticsTitle.id = 'v352DiagnosticsTitle';
+      diagnosticsTitle.className = 'section-title'; diagnosticsTitle.textContent = 'Диагностика';
+      const diagnostics = document.createElement('button'); diagnostics.id = 'v352SyncDiagnostics';
+      diagnostics.className = 'btn-secondary'; diagnostics.textContent = 'Синхронизация';
+      diagnostics.onclick = () => window.v350OpenSyncDiagnostics?.();
+      syncButton.insertAdjacentElement('afterend', diagnosticsTitle);
+      diagnosticsTitle.insertAdjacentElement('afterend', diagnostics);
+    }
     if (syncButton && !document.getElementById('v340SettingsInvite')) {
       const invite = document.createElement('button'); invite.id = 'v340SettingsInvite';
       invite.className = 'btn-secondary'; invite.textContent = '🔗 Ввести код приглашения';
       invite.onclick = window.v340OpenRedeemInvite;
-      syncButton.insertAdjacentElement('afterend', invite);
+      const anchor = document.getElementById('v352SyncDiagnostics') || syncButton;
+      anchor.insertAdjacentElement('afterend', invite);
     }
     const footer = [...screenEl.querySelectorAll('div')].find(element => /Блокнот-скан\s*·/.test(element.textContent || '') && element.children.length === 0);
     if (footer) footer.textContent = 'Блокнот-скан · v' + (window.__BLOCKNOT_APP_VERSION__ || '') + ' · Stable';
