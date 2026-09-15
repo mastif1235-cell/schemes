@@ -720,9 +720,31 @@
     }
   };
 
-  pushPhotoQueue = async function (forceRetry) {
+  async function sendPhotoUpload(photo, spread) {
+    const blobRec = await get('blobs', photo.id + '_orig');
+    const thumbRec = await get('blobs', photo.id + '_thumb');
+    if (!blobRec) throw new Error('no local original blob');
+    const fd = new FormData();
+    fd.append('file', blobRec.blob, `spread_${photo.spread_id}_v${photo.version}`);
+    fd.append('client_upload_id', photo.id);
+    if (thumbRec) fd.append('preview', thumbRec.blob, 'thumb.webp');
+    const path = isAuthed() ? `/api/spreads/${spread.server_id}/photos` : '/upload';
+    const headers = {};
+    if (settings.auth_token) headers.Authorization = 'Bearer ' + settings.auth_token;
+    const resp = await fetch(settings.backend_url.replace(/\/$/, '') + path, {method:'POST', body:fd, headers});
+    if (!resp.ok) {
+      const error = new Error('backend ' + resp.status);
+      error.status = resp.status;
+      throw error;
+    }
+    return await resp.json();
+  }
+
+  pushPhotoQueue = async function (forceRetry, options = {}) {
+    const onlyItemIds = options.onlyItemIds ? new Set(options.onlyItemIds.map(String)) : null;
     const queue = (await getAll('sync_queue')).filter(item =>
       item.entity === 'photo' && retryDue(item, !!forceRetry)
+      && (!onlyItemIds || onlyItemIds.has(String(item.id)))
     );
     for (const item of queue) {
       const photo = await get('photos', item.photo_id);
@@ -738,26 +760,12 @@
         await put('sync_queue', item);
         continue;
       }
+      const photoBeforeAttempt = {...photo};
+      const itemBeforeAttempt = {...item};
       photo.upload_status = 'uploading';
       await put('photos', photo);
       try {
-        const blobRec = await get('blobs', photo.id + '_orig');
-        const thumbRec = await get('blobs', photo.id + '_thumb');
-        if (!blobRec) throw new Error('no local original blob');
-        const fd = new FormData();
-        fd.append('file', blobRec.blob, `spread_${photo.spread_id}_v${photo.version}`);
-        fd.append('client_upload_id', photo.id);
-        if (thumbRec) fd.append('preview', thumbRec.blob, 'thumb.webp');
-        const path = isAuthed() ? `/api/spreads/${spread.server_id}/photos` : '/upload';
-        const headers = {};
-        if (settings.auth_token) headers.Authorization = 'Bearer ' + settings.auth_token;
-        const resp = await fetch(settings.backend_url.replace(/\/$/, '') + path, {method:'POST', body:fd, headers});
-        if (!resp.ok) {
-          const error = new Error('backend ' + resp.status);
-          error.status = resp.status;
-          throw error;
-        }
-        const data = await resp.json();
+        const data = await sendPhotoUpload(photo, spread);
         photo.storage_object_id = data.storage_object_id;
         photo.telegram_message_id = data.message_id;
         photo.telegram_file_id = data.file_id;
@@ -774,13 +782,19 @@
         }
         markDone(item);
         await put('sync_queue', item);
-        if (!settings.keep_originals_offline) await del('blobs', photo.id + '_orig');
+        if (!options.preserveOriginals && !settings.keep_originals_offline) await del('blobs', photo.id + '_orig');
       } catch (error) {
-        photo.upload_status = 'upload_failed';
-        await put('photos', photo);
-        markRetry(item, error);
-        await put('sync_queue', item);
-        console.warn('Photo upload failed; retry scheduled', photo.id, error);
+        if (options.restoreOnFailure) {
+          await put('photos', photoBeforeAttempt);
+          await put('sync_queue', itemBeforeAttempt);
+        } else {
+          photo.upload_status = 'upload_failed';
+          await put('photos', photo);
+          markRetry(item, error);
+          await put('sync_queue', item);
+        }
+        console.warn(options.restoreOnFailure ? 'Photo upload failed; local state restored' : 'Photo upload failed; retry scheduled', photo.id, error);
+        if (options.throwOnError) throw error;
       }
     }
   };
@@ -1364,6 +1378,357 @@
     return ok;
   }
 
+  const REPAIR_910 = Object.freeze({
+    localNotebookId:'mtk0xajzs8tiep',
+    serverNotebookId:'deb42fd8-38a3-4da0-862d-e5538cade2f6',
+    localSpreadId:'mtlf4xgftqrtxh',
+    localPhotoId:'mtlf4xmzkbhq9s',
+    photoQueueId:286,
+    spreadQueueId:287,
+    untouchedQueueId:367,
+    anchorServerId:'c260e443-099c-4797-8f0a-4f02a7d374aa',
+    anchorClientRef:'mtlf3c95g2wsiv',
+    expectedServerCount:27,
+    expectedOrigSize:4950282,
+    expectedThumbSize:24520,
+    backendOrigin:'https://blocknot-proxy.mastif1235.workers.dev',
+  });
+
+  function repair910Queue(queue, id) {
+    return queue.find(item => String(item.id) === String(id)) || null;
+  }
+
+  function repair910Contiguous(rows, expectedCount) {
+    if (!Array.isArray(rows) || rows.length !== expectedCount) return false;
+    const numbers = rows.map(row => Number(row.number)).sort((a,b) => a - b);
+    return numbers.every((number,index) => number === index + 1)
+      && new Set(rows.map(row => row.id)).size === rows.length;
+  }
+
+  function repair910BusinessMatches(local, server) {
+    return !!local && !!server && ['title','status','note_short','note_full'].every(key =>
+      (local[key] ?? '') === (server[key] ?? ''));
+  }
+
+  function repair910Check(checks, key, pass, detail) {
+    checks.push({key, pass:!!pass, detail:detail ?? null});
+  }
+
+  function repair910Backup(state) {
+    const localOrder = state.allSpreads.filter(row => row.notebook_id === REPAIR_910.localNotebookId && !row.deleted_at)
+      .sort((a,b) => Number(a.number) - Number(b.number) || String(a.id).localeCompare(String(b.id)))
+      .map(row => ({id:row.id, server_id:row.server_id || null, number:row.number, title:row.title,
+        revision:row.revision ?? null, current_photo_id:row.current_photo_id || null}));
+    return sanitizeDiagnosticValue({
+      created_at:nowISO(),
+      purpose:'Repair 9-10 before-image; blobs are intentionally not copied or changed',
+      queue_286:state.queue286,
+      queue_287:state.queue287,
+      spread_mtlf4xgftqrtxh:state.spread,
+      photo_mtlf4xmzkbhq9s:state.photo,
+      blob_verification:{orig:state.orig, thumb:state.thumb},
+      local_order_before:localOrder,
+      server_order_before:state.serverSpreads.map(row => ({id:row.id, client_ref:row.client_ref || null,
+        number:row.number, title:row.title, revision:row.revision, current_photo_id:row.current_photo_id || null})),
+    });
+  }
+
+  function repair910Guard(state) {
+    return JSON.stringify(sanitizeDiagnosticValue({
+      spread:state.spread, photo:state.photo, queue286:state.queue286, queue287:state.queue287,
+      orig:state.orig, thumb:state.thumb, queue367:state.queue367,
+      serverSpreads:state.serverSpreads, anchor:state.anchor,
+    }));
+  }
+
+  async function collectRepair910State() {
+    const [spread, photo, notebook, queue, allSpreads, orig, thumb] = await Promise.all([
+      get('spreads', REPAIR_910.localSpreadId), get('photos', REPAIR_910.localPhotoId),
+      get('notebooks', REPAIR_910.localNotebookId), getAll('sync_queue'), getAll('spreads'),
+      blobDiagnostic(REPAIR_910.localPhotoId + '_orig'), blobDiagnostic(REPAIR_910.localPhotoId + '_thumb'),
+    ]);
+    let serverSpreads = [], anchor = null, serverError = null;
+    if (isOnline() && isAuthed() && notebook?.server_id === REPAIR_910.serverNotebookId
+        && backendOrigin() === REPAIR_910.backendOrigin) {
+      try {
+        const list = await api(`/api/notebooks/${encodeURIComponent(REPAIR_910.serverNotebookId)}/spreads`);
+        serverSpreads = Array.isArray(list?.spreads) ? list.spreads : [];
+        anchor = (await api(`/api/spreads/${encodeURIComponent(REPAIR_910.anchorServerId)}`))?.spread || null;
+      } catch (error) {
+        serverError = String(error && error.message ? error.message : error);
+      }
+    }
+    return {
+      spread, photo, notebook, queue, allSpreads, orig, thumb, serverSpreads, anchor, serverError,
+      queue286:repair910Queue(queue, REPAIR_910.photoQueueId),
+      queue287:repair910Queue(queue, REPAIR_910.spreadQueueId),
+      queue367:repair910Queue(queue, REPAIR_910.untouchedQueueId),
+    };
+  }
+
+  async function buildRepair910Preview() {
+    const state = await collectRepair910State();
+    const checks = [];
+    const localAnchor = state.allSpreads.find(row => row.server_id === REPAIR_910.anchorServerId && !row.deleted_at);
+    const next = state.serverSpreads.filter(row => row.title === '11-12' && !row.deleted_at);
+    const serverTargets = state.serverSpreads.filter(row => !row.deleted_at
+      && (row.title === '9-10' || row.client_ref === REPAIR_910.localSpreadId));
+    const targetQueue = state.queue.filter(item => UNSYNCED.has(item.status) &&
+      (item.local_id === REPAIR_910.localSpreadId || item.photo_id === REPAIR_910.localPhotoId));
+    const localMappingsCurrent = state.serverSpreads.every(server => {
+      const matches = state.allSpreads.filter(local => local.server_id === server.id && !local.deleted_at);
+      return matches.length === 1 && Number(matches[0].number) === Number(server.number)
+        && Number(matches[0].revision) === Number(server.revision);
+    });
+
+    repair910Check(checks, 'production backend', backendOrigin() === REPAIR_910.backendOrigin, backendOrigin());
+    repair910Check(checks, 'online + authenticated', isOnline() && isAuthed(), {online:isOnline(), authenticated:isAuthed()});
+    repair910Check(checks, 'local notebook mapping', state.notebook?.server_id === REPAIR_910.serverNotebookId,
+      {local_id:state.notebook?.id || null, server_id:state.notebook?.server_id || null});
+    repair910Check(checks, 'local spread 9-10', !!state.spread && state.spread.id === REPAIR_910.localSpreadId
+      && state.spread.notebook_id === REPAIR_910.localNotebookId && state.spread.title === '9-10'
+      && Number(state.spread.number) === 3 && !state.spread.server_id && !state.spread.deleted_at
+      && state.spread.current_photo_id === REPAIR_910.localPhotoId, localSpreadDiagnostic(state.spread, state.allSpreads));
+    repair910Check(checks, 'local photo metadata', !!state.photo && state.photo.id === REPAIR_910.localPhotoId
+      && state.photo.spread_id === REPAIR_910.localSpreadId && !state.photo.server_id
+      && state.photo.upload_status === 'local_pending' && Number(state.photo.file_size) === REPAIR_910.expectedOrigSize,
+      state.photo ? await photoDiagnostic(state.photo) : null);
+    repair910Check(checks, 'orig blob intact', state.orig.exists && Number(state.orig.size) === REPAIR_910.expectedOrigSize, state.orig);
+    repair910Check(checks, 'thumb blob intact', state.thumb.exists && Number(state.thumb.size) === REPAIR_910.expectedThumbSize, state.thumb);
+    repair910Check(checks, 'queue #286 exact', !!state.queue286 && state.queue286.entity === 'photo'
+      && state.queue286.photo_id === REPAIR_910.localPhotoId && state.queue286.status === 'pending'
+      && state.queue286.last_error === 'spread has no server id', explicitQueueFields(state.queue286));
+    repair910Check(checks, 'queue #287 exact', !!state.queue287 && state.queue287.entity === 'spread'
+      && state.queue287.local_id === REPAIR_910.localSpreadId && state.queue287.status === 'conflict'
+      && state.queue287.last_error === 'revision conflict', explicitQueueFields(state.queue287));
+    repair910Check(checks, 'no additional target queue rows', targetQueue.length === 2
+      && targetQueue.every(item => [String(REPAIR_910.photoQueueId),String(REPAIR_910.spreadQueueId)].includes(String(item.id))),
+      targetQueue.map(item => ({id:item.id, entity:item.entity, status:item.status})));
+    repair910Check(checks, 'server GET checks', !state.serverError, state.serverError);
+    repair910Check(checks, 'server 9-10 absent', serverTargets.length === 0,
+      serverTargets.map(row => ({id:row.id, client_ref:row.client_ref, number:row.number, title:row.title, revision:row.revision})));
+    repair910Check(checks, 'server order 1..27', repair910Contiguous(state.serverSpreads, REPAIR_910.expectedServerCount),
+      state.serverSpreads.map(row => row.number).sort((a,b) => a-b));
+    repair910Check(checks, 'local/server order and revisions current', localMappingsCurrent, null);
+    repair910Check(checks, 'server 3-4 current', !!state.anchor && state.anchor.id === REPAIR_910.anchorServerId
+      && state.anchor.notebook_id === REPAIR_910.serverNotebookId && state.anchor.title === '3-4'
+      && Number(state.anchor.number) === 3 && Number(state.anchor.revision) === 6 && !state.anchor.deleted_at
+      && !!localAnchor && localAnchor.id === REPAIR_910.anchorClientRef && Number(localAnchor.revision) === Number(state.anchor.revision),
+      state.anchor ? {id:state.anchor.id, number:state.anchor.number, title:state.anchor.title, revision:state.anchor.revision} : null);
+    repair910Check(checks, 'unique next spread 11-12', next.length === 1 && Number(next[0].number) === 4,
+      next.map(row => ({id:row.id, number:row.number, revision:row.revision})));
+
+    const eligible = checks.every(check => check.pass);
+    const backup = repair910Backup(state);
+    return {
+      eligible,
+      checks,
+      backup,
+      guard:repair910Guard(state),
+      plan:{
+        temporary_number:REPAIR_910.expectedServerCount + 1,
+        final_position:4,
+        before_server_id:REPAIR_910.anchorServerId,
+        before_title:'3-4',
+        after_title:'11-12',
+        queue_286:'upload through the normal photo queue path; mark done only on success',
+        queue_287:'retire only after server photo metadata and Telegram link are confirmed',
+        queue_367:'read guard only; never update or retry',
+        blobs:'preserve orig and thumb regardless of offline-original setting',
+      },
+      _state:state,
+    };
+  }
+
+  function repair910ValidateCreated(created, local, temporaryNumber) {
+    return !!created && created.notebook_id === REPAIR_910.serverNotebookId
+      && created.client_ref === REPAIR_910.localSpreadId && Number(created.number) === temporaryNumber
+      && Number(created.revision) > 0 && repair910BusinessMatches(local, created) && !created.deleted_at;
+  }
+
+  function repair910OrderedRows(rows, targetServerId) {
+    if (!repair910Contiguous(rows, REPAIR_910.expectedServerCount + 1)) throw new Error('STOP: server order changed after spread creation');
+    const sorted = rows.slice().sort((a,b) => Number(a.number) - Number(b.number));
+    const target = sorted.find(row => row.id === targetServerId);
+    const anchor = sorted.find(row => row.id === REPAIR_910.anchorServerId);
+    const next = sorted.filter(row => row.title === '11-12');
+    if (!target || Number(target.number) !== REPAIR_910.expectedServerCount + 1 || !anchor
+        || Number(anchor.number) !== 3 || next.length !== 1 || Number(next[0].number) !== 4) {
+      throw new Error('STOP: repair anchors changed before reorder');
+    }
+    const withoutTarget = sorted.filter(row => row.id !== target.id);
+    const insertion = withoutTarget.findIndex(row => row.id === next[0].id);
+    withoutTarget.splice(insertion, 0, target);
+    return withoutTarget;
+  }
+
+  async function applyRepair910(expectedGuard) {
+    if (!expectedGuard) throw new Error('Сначала выполните Preview и скопируйте backup JSON');
+    if (syncing) throw new Error('STOP: уже выполняется синхронизация');
+    syncing = true;
+    await updateSyncIndicator();
+    try {
+      const preview = await buildRepair910Preview();
+      if (!preview.eligible || preview.guard !== expectedGuard) throw new Error('STOP: состояние изменилось после Preview; ничего не применено');
+      const state = preview._state;
+      const queue367Before = JSON.stringify(sanitizeDiagnosticValue(state.queue367));
+      const temporaryNumber = REPAIR_910.expectedServerCount + 1;
+      const createResult = await api(`/api/notebooks/${encodeURIComponent(REPAIR_910.serverNotebookId)}/spreads`, {method:'POST', json:{
+        number:temporaryNumber, title:state.spread.title, note_short:state.spread.note_short,
+        note_full:state.spread.note_full, status:state.spread.status, client_ref:REPAIR_910.localSpreadId,
+      }});
+      const created = createResult?.spread;
+      if (!repair910ValidateCreated(created, state.spread, temporaryNumber)) throw new Error('STOP: server returned an unexpected spread');
+      await window.vNextAtomic('spreads', REPAIR_910.localSpreadId, current => {
+        if (!current || current.server_id || current.title !== '9-10' || current.current_photo_id !== REPAIR_910.localPhotoId) {
+          throw new Error('STOP: local spread changed during creation');
+        }
+        return {row:{...current, server_id:created.id, number:created.number, revision:created.revision,
+          metadata_base:metadata(created), updated_at:created.updated_at || current.updated_at}};
+      });
+
+      const afterCreate = await api(`/api/notebooks/${encodeURIComponent(REPAIR_910.serverNotebookId)}/spreads`);
+      const ordered = repair910OrderedRows(afterCreate?.spreads || [], created.id);
+      const orderResult = await api(`/api/notebooks/${encodeURIComponent(REPAIR_910.serverNotebookId)}/spreads/order`, {method:'PUT', json:{
+        client_ref:'repair-9-10-order-mtlf4xgftqrtxh-v1',
+        items:ordered.map(row => ({spread_id:row.id, expected_revision:Number(row.revision), expected_number:Number(row.number)})),
+      }});
+      const reordered = Array.isArray(orderResult?.spreads) ? orderResult.spreads : [];
+      if (!repair910Contiguous(reordered, REPAIR_910.expectedServerCount + 1)) throw new Error('STOP: invalid reorder response');
+      const reorderedTarget = reordered.find(row => row.id === created.id);
+      const reorderedAnchor = reordered.find(row => row.id === REPAIR_910.anchorServerId);
+      const reorderedNext = reordered.filter(row => row.title === '11-12');
+      if (!reorderedTarget || Number(reorderedTarget.number) !== 4 || !reorderedAnchor || Number(reorderedAnchor.number) !== 3
+          || reorderedNext.length !== 1 || Number(reorderedNext[0].number) !== 5) throw new Error('STOP: 9-10 was not placed between 3-4 and 11-12');
+      await applyChangeBatch({spreads:reordered.filter(row => row.id !== created.id)});
+      const targetAfterCreate = await get('spreads', REPAIR_910.localSpreadId);
+      await put('spreads', {...targetAfterCreate, server_id:created.id, number:reorderedTarget.number,
+        revision:reorderedTarget.revision, updated_at:reorderedTarget.updated_at || targetAfterCreate.updated_at,
+        metadata_base:metadata(reorderedTarget), server_current_photo_id:reorderedTarget.current_photo_id || null});
+
+      await pushPhotoQueue(true, {onlyItemIds:[REPAIR_910.photoQueueId], preserveOriginals:true,
+        restoreOnFailure:true, throwOnError:true});
+      const photo = await get('photos', REPAIR_910.localPhotoId);
+      const queue286 = await get('sync_queue', REPAIR_910.photoQueueId);
+      if (!photo?.server_id || photo.upload_status !== 'synced' || queue286?.status !== 'done'
+          || !photo.telegram_message_id || !photo.telegram_link) throw new Error('STOP: photo upload did not return complete Telegram metadata');
+      const serverPhoto = (await api(`/api/photos/${encodeURIComponent(photo.server_id)}`))?.photo;
+      if (!serverPhoto || serverPhoto.id !== photo.server_id || serverPhoto.spread_id !== created.id
+          || !serverPhoto.telegram_message_id || !serverPhoto.telegram_link) throw new Error('STOP: server photo verification failed');
+
+      const finalList = await api(`/api/notebooks/${encodeURIComponent(REPAIR_910.serverNotebookId)}/spreads`);
+      const finalRows = Array.isArray(finalList?.spreads) ? finalList.spreads : [];
+      const finalTarget = finalRows.find(row => row.id === created.id);
+      if (!repair910Contiguous(finalRows, REPAIR_910.expectedServerCount + 1) || !finalTarget
+          || Number(finalTarget.number) !== 4 || !repair910BusinessMatches(state.spread, finalTarget)) {
+        throw new Error('STOP: final server spread verification failed');
+      }
+      const queue287 = await get('sync_queue', REPAIR_910.spreadQueueId);
+      if (!queue287 || queue287.status !== 'conflict' || queue287.local_id !== REPAIR_910.localSpreadId) {
+        throw new Error('STOP: queue #287 changed before retirement');
+      }
+      await window.vNextAtomic('spreads', REPAIR_910.localSpreadId, current => {
+        if (!current || current.server_id !== created.id || current.current_photo_id !== REPAIR_910.localPhotoId) {
+          throw new Error('STOP: local mapping changed before queue retirement');
+        }
+        return {row:{...current, number:finalTarget.number, revision:finalTarget.revision,
+          updated_at:finalTarget.updated_at || current.updated_at, metadata_base:metadata(finalTarget), conflict:null,
+          server_current_photo_id:finalTarget.current_photo_id || photo.server_id},
+          retired:[{...queue287, status:'done', retry_count:queue287.retry_count || 0, next_attempt_at:null,
+            retired_at:nowISO(), retired_reason:'Repair 9-10 completed and photo verified',
+            retired_previous_error:queue287.last_error || null, last_error:null, server_copy:null}]};
+      });
+      await applyChangeBatch({spreads:finalRows.filter(row => row.id !== created.id)});
+
+      const [finalSpread, finalPhoto, finalQueue286, finalQueue287, finalQueue367, finalOrig, finalThumb] = await Promise.all([
+        get('spreads', REPAIR_910.localSpreadId), get('photos', REPAIR_910.localPhotoId),
+        get('sync_queue', REPAIR_910.photoQueueId), get('sync_queue', REPAIR_910.spreadQueueId),
+        get('sync_queue', REPAIR_910.untouchedQueueId), blobDiagnostic(REPAIR_910.localPhotoId + '_orig'),
+        blobDiagnostic(REPAIR_910.localPhotoId + '_thumb'),
+      ]);
+      if (JSON.stringify(sanitizeDiagnosticValue(finalQueue367)) !== queue367Before) throw new Error('STOP: queue #367 changed unexpectedly');
+      const blobsPreserved = finalOrig.exists && finalThumb.exists
+        && Number(finalOrig.size) === REPAIR_910.expectedOrigSize && Number(finalThumb.size) === REPAIR_910.expectedThumbSize;
+      if (!blobsPreserved) throw new Error('STOP: local photo blobs changed unexpectedly');
+      const totals = queueStatusCounts(await getAll('sync_queue'));
+      return {
+        completed:true,
+        backup:preview.backup,
+        spread_server_id:finalSpread.server_id,
+        spread_revision:finalSpread.revision,
+        final_number:finalSpread.number,
+        photo_server_id:finalPhoto.server_id,
+        telegram_message_id_present:!!finalPhoto.telegram_message_id,
+        telegram_link_present:!!finalPhoto.telegram_link,
+        queue_286_status:finalQueue286?.status || null,
+        queue_287_status:finalQueue287?.status || null,
+        queue_367_unchanged:true,
+        totals,
+        data_preserved:blobsPreserved && finalSpread.id === REPAIR_910.localSpreadId && finalPhoto.id === REPAIR_910.localPhotoId,
+      };
+    } finally {
+      syncing = false;
+      await updateSyncIndicator();
+    }
+  }
+
+  async function openRepair910() {
+    let preview = null, copiedGuard = null;
+    const {el,close} = openSheet(`<div class="sheet-handle"></div><div class="v352-diag-head">
+      <h2>Repair 9-10</h2><button class="icon-btn" data-repair-close aria-label="Закрыть Repair 9-10">✕</button></div>
+      <p class="warn-box">Временный точечный инструмент только для queue #286/#287. Queue #367 не изменяется и не повторяется.</p>
+      <button class="btn-secondary" data-repair-preview>Preview / READ-ONLY</button>
+      <div data-repair-report></div>
+      <details hidden data-repair-backup-wrap><summary>Backup JSON</summary><pre data-repair-backup></pre></details>
+      <div class="btn-row"><button class="btn-secondary" data-repair-copy disabled>Копировать backup JSON</button>
+      <button class="btn-primary" data-repair-apply disabled>Apply Repair</button></div>`);
+    el.querySelector('[data-repair-close]').onclick = close;
+    const reportHost = el.querySelector('[data-repair-report]');
+    const backupWrap = el.querySelector('[data-repair-backup-wrap]');
+    const backupHost = el.querySelector('[data-repair-backup]');
+    const previewButton = el.querySelector('[data-repair-preview]');
+    const copyButton = el.querySelector('[data-repair-copy]');
+    const applyButton = el.querySelector('[data-repair-apply]');
+    previewButton.onclick = async () => {
+      previewButton.disabled = true; copyButton.disabled = true; applyButton.disabled = true; copiedGuard = null;
+      reportHost.textContent = 'Проверяю локальные данные и выполняю только GET…';
+      try {
+        preview = await buildRepair910Preview();
+        reportHost.innerHTML = `<h3>${preview.eligible ? 'Все проверки PASS' : 'STOP: есть несовпадения'}</h3>
+          <ul>${preview.checks.map(check => `<li>${check.pass ? '✅' : '❌'} ${esc(check.key)}${check.detail === null ? '' : `<details><summary>Детали</summary>${diagnosticPre(check.detail)}</details>`}</li>`).join('')}</ul>
+          <h3>План изменений</h3>${diagnosticPre(preview.plan)}`;
+        backupHost.textContent = JSON.stringify(preview.backup, null, 2);
+        backupWrap.hidden = false; copyButton.disabled = false;
+      } catch (error) {
+        preview = null; reportHost.innerHTML = `<p class="warn-box">STOP: ${esc(error.message || error)}</p>`;
+      } finally { previewButton.disabled = false; }
+    };
+    copyButton.onclick = async () => {
+      if (!preview) return;
+      copyButton.disabled = true;
+      try {
+        const copied = await copyDiagnosticText(JSON.stringify(preview.backup, null, 2));
+        if (!copied) throw new Error('clipboard copy failed');
+        copiedGuard = preview.guard;
+        applyButton.disabled = !preview.eligible;
+        toast('Backup JSON скопирован. Apply доступен только для неизменившегося PASS-состояния.');
+      } catch (error) { copiedGuard = null; applyButton.disabled = true; toast('Не удалось скопировать backup JSON'); }
+      finally { copyButton.disabled = false; }
+    };
+    applyButton.onclick = async () => {
+      applyButton.disabled = true; previewButton.disabled = true; copyButton.disabled = true;
+      reportHost.innerHTML = '<p>Выполняется точечный repair. Не закрывайте приложение…</p>';
+      try {
+        const result = await applyRepair910(copiedGuard);
+        reportHost.innerHTML = `<h3>Repair завершён</h3>${diagnosticPre(result)}`;
+        backupHost.textContent = JSON.stringify(result.backup, null, 2);
+        toast('Repair 9-10 завершён');
+      } catch (error) {
+        reportHost.innerHTML = `<p class="warn-box">${esc(error.message || error)}</p><p>Остановлено. Queue #367 не изменялась этим инструментом.</p>`;
+      } finally { previewButton.disabled = false; copyButton.disabled = !preview; }
+    };
+  }
+
   async function openReadOnlySyncDiagnostics() {
     const report = await buildReadOnlyDiagnosticReport();
     const serverChecks = new Map();
@@ -1431,10 +1796,12 @@
 
   window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics, conflictGroups, openConflictDiagnostics,
     assessLegacySpreadConflict, safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts,
-    buildReadOnlyDiagnosticReport, checkSpreadOnServerReadOnly, openReadOnlySyncDiagnostics};
+    buildReadOnlyDiagnosticReport, checkSpreadOnServerReadOnly, openReadOnlySyncDiagnostics,
+    buildRepair910Preview, applyRepair910, repair910OrderedRows};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
   window.v350OpenSyncDiagnostics = openReadOnlySyncDiagnostics;
   window.v350BuildSyncDiagnosticReport = buildReadOnlyDiagnosticReport;
+  window.v353OpenRepair910 = openRepair910;
   const baseQueueEntityChange = typeof queueEntityChange === 'function' ? queueEntityChange : async (entity, localId, extra = {}) => {
     await put('sync_queue', {entity, local_id:localId, status:'pending', retry_count:0, ...extra});
   };
