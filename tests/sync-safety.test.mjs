@@ -12,12 +12,13 @@ function createRuntime(seed = {}) {
     photos: new Map((seed.photos || []).map(row => [row.id, structuredClone(row)])),
     spread_notes: new Map((seed.spread_notes || []).map(row => [row.cache_id, structuredClone(row)])),
     activity_events: new Map(),
-    blobs: new Map(),
+    blobs: new Map((seed.blobs || []).map(row => [row.id, structuredClone(row)])),
     spread_tags: new Map(),
     user_favorites: new Map(),
     sync_queue: new Map((seed.sync_queue || []).map(row => [row.id, structuredClone(row)]))
   };
   let apiImpl = async () => { throw new Error('Unexpected API request'); };
+  let fetchImpl = async () => { throw new Error('Unexpected fetch'); };
   const context = {
     console:{...console, warn() {}, error() {}},
     Date,
@@ -29,7 +30,7 @@ function createRuntime(seed = {}) {
     Promise,
     Error,
     window: {},
-    settings: {auth_token:'token', user_id:'u1', backend_url:'https://example.test', keep_originals_offline:true, sync_status:'idle'},
+    settings: {auth_token:'token', user_id:'u1', backend_url:'https://example.test', keep_originals_offline:true, sync_status:'idle', ...(seed.settings || {})},
     syncing: false,
     route: {screen:'notebooks'},
     nowISO: () => new Date().toISOString(),
@@ -44,7 +45,7 @@ function createRuntime(seed = {}) {
     pullChanges: async () => {},
     renderSyncStatus: () => {},
     document: {getElementById: () => null},
-    fetch: async () => { throw new Error('Unexpected fetch'); },
+    fetch: (...args) => fetchImpl(...args),
     FormData: class { append() {} },
     api: (...args) => apiImpl(...args),
     get: async (store, id) => structuredClone(db[store].get(id)),
@@ -71,7 +72,7 @@ function createRuntime(seed = {}) {
     if (result.item) await context.put('sync_queue', result.item);
     for (const item of result.retired || []) await context.put('sync_queue', item);
   };
-  return {context, db, setApi(fn) { apiImpl = fn; }};
+  return {context, db, setApi(fn) { apiImpl = fn; }, setFetch(fn) { fetchImpl = fn; }};
 }
 
 async function testDeferredDependencyStaysPending() {
@@ -582,4 +583,166 @@ for (const status of [0,503,401,403]) {
   assert.match(impossible.message, /отсутствует server_id/);
 }
 
-console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics)');
+function repair910Fixture() {
+  const serverNotebookId = 'deb42fd8-38a3-4da0-862d-e5538cade2f6';
+  const anchorId = 'c260e443-099c-4797-8f0a-4f02a7d374aa';
+  const serverSpreads = Array.from({length:27}, (_, index) => {
+    const number = index + 1;
+    return {
+      id:number === 3 ? anchorId : `server-${number}`,
+      notebook_id:serverNotebookId,
+      client_ref:number === 3 ? 'mtlf3c95g2wsiv' : `local-${number}`,
+      number,
+      title:number === 3 ? '3-4' : number === 4 ? '11-12' : `spread-${number}`,
+      status:'Актуально', note_short:null, note_full:null,
+      revision:number === 3 ? 6 : number === 4 ? 3 : 1,
+      created_at:'2026-09-01T00:00:00.000Z', updated_at:'2026-09-01T00:00:00.000Z',
+      current_photo_id:null, deleted_at:null,
+    };
+  });
+  const localSpreads = serverSpreads.map(row => ({
+    id:row.client_ref, server_id:row.id, notebook_id:'mtk0xajzs8tiep', number:row.number,
+    title:row.title, status:row.status, note_short:row.note_short, note_full:row.note_full,
+    revision:row.revision, current_photo_id:null, deleted_at:null,
+  }));
+  localSpreads.push({
+    id:'mtlf4xgftqrtxh', notebook_id:'mtk0xajzs8tiep', number:3, title:'9-10',
+    status:'Актуально', note_short:null, note_full:null, revision:null, server_id:null,
+    current_photo_id:'mtlf4xmzkbhq9s', created_at:'2026-09-01T00:00:00.000Z',
+    updated_at:'2026-09-01T00:00:00.000Z', deleted_at:null,
+  });
+  return {
+    serverNotebookId, anchorId, serverSpreads,
+    seed:{
+      settings:{backend_url:'https://blocknot-proxy.mastif1235.workers.dev'},
+      notebooks:[{id:'mtk0xajzs8tiep', server_id:serverNotebookId}],
+      spreads:localSpreads,
+      photos:[{id:'mtlf4xmzkbhq9s', spread_id:'mtlf4xgftqrtxh', version:1, is_current:true,
+        upload_status:'local_pending', file_size:4950282, server_id:null}],
+      blobs:[
+        {id:'mtlf4xmzkbhq9s_orig', blob:{size:4950282, type:'image/jpeg'}},
+        {id:'mtlf4xmzkbhq9s_thumb', blob:{size:24520, type:'image/webp'}},
+      ],
+      sync_queue:[
+        {id:286, entity:'photo', photo_id:'mtlf4xmzkbhq9s', status:'pending', retry_count:0, last_error:'spread has no server id'},
+        {id:287, entity:'spread', local_id:'mtlf4xgftqrtxh', status:'conflict', retry_count:1, last_error:'revision conflict'},
+        {id:367, entity:'spread', local_id:'another-spread', status:'conflict', retry_count:2, payload:{number:32}},
+      ],
+    },
+  };
+}
+
+async function testRepair910PreviewIsReadOnly() {
+  const fixture = repair910Fixture();
+  const runtime = createRuntime(fixture.seed);
+  const before = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
+  const calls = [];
+  runtime.setApi(async (path, options) => {
+    calls.push({path, options});
+    if (path.endsWith('/spreads')) return {spreads:structuredClone(fixture.serverSpreads)};
+    if (path === `/api/spreads/${fixture.anchorId}`) return {spread:structuredClone(fixture.serverSpreads[2])};
+    throw new Error(`Unexpected API request: ${path}`);
+  });
+  const preview = await runtime.context.window.v340Sync.buildRepair910Preview();
+  assert.equal(preview.eligible, true);
+  assert.equal(preview.checks.every(check => check.pass), true);
+  assert.equal(preview.plan.queue_367.includes('never update'), true);
+  assert.equal(preview.backup.queue_286.id, 286);
+  assert.equal(preview.backup.queue_287.id, 287);
+  assert.equal(preview.backup.spread_mtlf4xgftqrtxh.id, 'mtlf4xgftqrtxh');
+  assert.equal(preview.backup.photo_mtlf4xmzkbhq9s.id, 'mtlf4xmzkbhq9s');
+  assert.equal(calls.length, 2);
+  assert.equal(calls.every(call => call.options === undefined), true, 'Preview must use GET-only api calls');
+  const after = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
+  assert.deepEqual(after, before, 'Preview must not mutate IndexedDB state');
+}
+
+async function testRepair910ApplyTouchesOnly286And287() {
+  const fixture = repair910Fixture();
+  const runtime = createRuntime(fixture.seed);
+  let serverSpreads = structuredClone(fixture.serverSpreads);
+  let serverPhoto = null;
+  const queue367Before = structuredClone(runtime.db.sync_queue.get(367));
+  const mutatingCalls = [];
+  runtime.setApi(async (path, options) => {
+    if (!options) {
+      if (path.endsWith('/spreads')) return {spreads:structuredClone(serverSpreads)};
+      if (path === `/api/spreads/${fixture.anchorId}`) return {spread:structuredClone(serverSpreads.find(row => row.id === fixture.anchorId))};
+      if (path === '/api/photos/photo-server-910') return {photo:structuredClone(serverPhoto)};
+    }
+    if (path.endsWith('/spreads') && options?.method === 'POST') {
+      mutatingCalls.push({path, method:'POST'});
+      const created = {id:'spread-server-910', notebook_id:fixture.serverNotebookId, client_ref:'mtlf4xgftqrtxh',
+        number:28, title:'9-10', status:'Актуально', note_short:null, note_full:null, revision:1,
+        current_photo_id:null, deleted_at:null, created_at:'2026-09-15T10:00:00.000Z', updated_at:'2026-09-15T10:00:00.000Z'};
+      serverSpreads.push(created);
+      return {spread:structuredClone(created)};
+    }
+    if (path.endsWith('/spreads/order') && options?.method === 'PUT') {
+      mutatingCalls.push({path, method:'PUT'});
+      assert.equal(options.json.items.length, 28);
+      assert.equal(new Set(options.json.items.map(item => item.spread_id)).size, 28);
+      const ids = options.json.items.map(item => item.spread_id);
+      serverSpreads = ids.map((id,index) => {
+        const row = serverSpreads.find(candidate => candidate.id === id);
+        return {...row, number:index + 1, revision:Number(row.revision) + 1, updated_at:'2026-09-15T10:01:00.000Z'};
+      });
+      return {spreads:structuredClone(serverSpreads)};
+    }
+    throw new Error(`Unexpected API request: ${path} ${options?.method || 'GET'}`);
+  });
+  runtime.setFetch(async (url, options) => {
+    mutatingCalls.push({path:String(url), method:options?.method});
+    assert.equal(options.method, 'POST');
+    const target = serverSpreads.find(row => row.id === 'spread-server-910');
+    target.revision += 1;
+    target.current_photo_id = 'photo-server-910';
+    serverPhoto = {id:'photo-server-910', spread_id:target.id, telegram_message_id:'777',
+      telegram_link:'https://t.me/c/1/777'};
+    return {ok:true, status:200, json:async () => ({photo_id:serverPhoto.id, storage_object_id:'object-910',
+      message_id:serverPhoto.telegram_message_id, file_id:'file-910', file_unique_id:'unique-910',
+      telegram_link:serverPhoto.telegram_link, spread_revision:target.revision})};
+  });
+  const preview = await runtime.context.window.v340Sync.buildRepair910Preview();
+  const result = await runtime.context.window.v340Sync.applyRepair910(preview.guard);
+  assert.equal(result.completed, true);
+  assert.equal(result.spread_server_id, 'spread-server-910');
+  assert.equal(result.final_number, 4);
+  assert.equal(result.photo_server_id, 'photo-server-910');
+  assert.equal(result.telegram_message_id_present, true);
+  assert.equal(result.telegram_link_present, true);
+  assert.equal(runtime.db.sync_queue.get(286).status, 'done');
+  assert.equal(runtime.db.sync_queue.get(287).status, 'done');
+  assert.deepEqual(runtime.db.sync_queue.get(367), queue367Before, '#367 must remain byte-equivalent');
+  assert.equal(runtime.db.blobs.has('mtlf4xmzkbhq9s_orig'), true);
+  assert.equal(runtime.db.blobs.has('mtlf4xmzkbhq9s_thumb'), true);
+  assert.deepEqual(mutatingCalls.map(call => call.method), ['POST','PUT','POST']);
+}
+
+async function testRepair910StopsIfStateChangesAfterPreview() {
+  const fixture = repair910Fixture();
+  const runtime = createRuntime(fixture.seed);
+  let mutations = 0;
+  runtime.setApi(async (path, options) => {
+    if (options) { mutations++; throw new Error('mutation must not run'); }
+    if (path.endsWith('/spreads')) return {spreads:structuredClone(fixture.serverSpreads)};
+    if (path === `/api/spreads/${fixture.anchorId}`) return {spread:structuredClone(fixture.serverSpreads[2])};
+    throw new Error(`Unexpected API request: ${path}`);
+  });
+  const preview = await runtime.context.window.v340Sync.buildRepair910Preview();
+  runtime.db.sync_queue.get(367).retry_count = 3;
+  await assert.rejects(
+    runtime.context.window.v340Sync.applyRepair910(preview.guard),
+    /состояние изменилось после Preview/,
+  );
+  assert.equal(mutations, 0);
+  assert.equal(runtime.db.spreads.get('mtlf4xgftqrtxh').server_id, null);
+  assert.equal(runtime.db.sync_queue.get(286).status, 'pending');
+  assert.equal(runtime.db.sync_queue.get(287).status, 'conflict');
+}
+
+await testRepair910PreviewIsReadOnly();
+await testRepair910ApplyTouchesOnly286And287();
+await testRepair910StopsIfStateChangesAfterPreview();
+
+console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repair 9-10)');
