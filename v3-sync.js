@@ -1734,7 +1734,10 @@
     localNotebookId:'mtk0pu3k5wrwma',
     serverNotebookId:'2225c8d5-ed4e-435f-93da-8d365c4fc112',
     duplicatedServerId:'47eabd6b-abc0-4b9a-8ddf-c83980b36219',
+    canonicalLocalId:'mtk12qcznnzdex',
+    legacyLocalId:'47eabd6b-abc0-4b9a-8ddf-c83980b36219',
     expectedSpreadCount:50,
+    expectedLocalCountBefore:51,
     backendOrigin:'https://blocknot-proxy.mastif1235.workers.dev',
   });
 
@@ -1774,10 +1777,45 @@
     return {numbers, unique, contiguous, legacy_gap_32:legacyGap32};
   }
 
+  function repair367DuplicateMatches(canonical, legacy) {
+    const fields = ['server_id','notebook_id','number','title','status','note_short','note_full','revision','current_photo_id','deleted_at'];
+    return !!canonical && !!legacy && fields.every(key => (canonical[key] ?? null) === (legacy[key] ?? null));
+  }
+
+  function repair367DirectReferences(state, localId) {
+    const matches = (rows, fields) => rows.filter(row => fields.some(field => row?.[field] === localId));
+    const photos = matches(state.photos, ['spread_id','local_spread_id']);
+    return {
+      photos,
+      photo_blobs:Object.fromEntries(photos.map(photo => [photo.id,state.photoBlobs[photo.id] || null])),
+      notes:matches(state.notes, ['spread_id','local_spread_id']),
+      spread_tags:matches(state.spreadTags, ['spread_id','local_spread_id']),
+      favorites:matches(state.favorites, ['spread_id','local_spread_id']),
+      queue:matches(state.queue.filter(item => String(item.id) !== String(REPAIR_367.queueId)), ['local_id','spread_id','local_spread_id']),
+      notebooks:matches(state.notebooks, ['current_spread_id','cover_spread_id','last_spread_id']),
+      tags:matches(state.tags, ['spread_id','local_spread_id']),
+      activity_local:matches(state.activity, ['local_spread_id','spread_local_id']),
+      recents:state.recents.filter(row => row?.id === localId),
+    };
+  }
+
+  function repair367ReferenceCount(refs) {
+    return Object.values(refs).reduce((total, rows) => total + (Array.isArray(rows) ? rows.length : 0), 0);
+  }
+
   async function collectRepair367State() {
-    const [notebook, queue, allSpreads] = await Promise.all([
-      get('notebooks', REPAIR_367.localNotebookId), getAll('sync_queue'), getAll('spreads'),
+    const [notebook, queue, allSpreads, photos, notes, spreadTags, favorites, notebooks, tags, activity] = await Promise.all([
+      get('notebooks', REPAIR_367.localNotebookId), getAll('sync_queue'), getAll('spreads'), getAll('photos'),
+      getAll('spread_notes'), getAll('spread_tags'), getAll('user_favorites'), getAll('notebooks'), getAll('tags'),
+      getAll('activity_events'),
     ]);
+    const linkedPhotoIds = photos.filter(row => [REPAIR_367.canonicalLocalId,REPAIR_367.legacyLocalId].includes(row.spread_id)).map(row => row.id);
+    const photoBlobs = Object.fromEntries(await Promise.all(linkedPhotoIds.map(async id => [id,{
+      orig:await blobDiagnostic(id + '_orig'), thumb:await blobDiagnostic(id + '_thumb'),
+    }])));
+    let recents = [];
+    try { if (typeof v3LoadRecents === 'function') recents = v3LoadRecents(); }
+    catch (error) { console.warn('Repair #367 could not read recents', error); }
     let serverSpreads = [], serverError = null;
     if (isOnline() && isAuthed() && notebook?.server_id === REPAIR_367.serverNotebookId
         && backendOrigin() === REPAIR_367.backendOrigin) {
@@ -1790,15 +1828,20 @@
     }
     return {
       notebook, queue, allSpreads, serverSpreads, serverError,
+      photos, notes, spreadTags, favorites, notebooks, tags, photoBlobs, activity, recents,
       queue367:repair910Queue(queue, REPAIR_367.queueId),
       localSpreads:allSpreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at),
     };
   }
 
   function repair367Guard(state) {
+    const canonicalRefs = repair367DirectReferences(state, REPAIR_367.canonicalLocalId);
+    const legacyRefs = repair367DirectReferences(state, REPAIR_367.legacyLocalId);
     return JSON.stringify(sanitizeDiagnosticValue({
       notebook:state.notebook, queue367:state.queue367, queue:state.queue,
       localSpreads:state.localSpreads, serverSpreads:state.serverSpreads,
+      canonicalRefs, legacyRefs,
+      sharedServerActivity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
     }));
   }
 
@@ -1807,9 +1850,15 @@
     const checks = [];
     const unfinished = state.queue.filter(item => UNSYNCED.has(item.status));
     const payload = repair367PayloadAnalysis(state.queue367);
-    const localShape = repair367NumberShape(state.localSpreads);
+    const canonical = state.localSpreads.find(row => row.id === REPAIR_367.canonicalLocalId) || null;
+    const legacy = state.localSpreads.find(row => row.id === REPAIR_367.legacyLocalId) || null;
+    const serverCanonical = state.serverSpreads.find(row => row.id === REPAIR_367.duplicatedServerId) || null;
+    const effectiveLocal = state.localSpreads.filter(row => row.id !== REPAIR_367.legacyLocalId);
+    const canonicalRefs = repair367DirectReferences(state, REPAIR_367.canonicalLocalId);
+    const legacyRefs = repair367DirectReferences(state, REPAIR_367.legacyLocalId);
+    const localShape = repair367NumberShape(effectiveLocal);
     const serverShape = repair367NumberShape(state.serverSpreads);
-    const localIds = repair367Ids(state.localSpreads);
+    const localIds = repair367Ids(effectiveLocal);
     const serverIds = repair367Ids(state.serverSpreads);
     const sameSet = localIds.length === serverIds.length
       && new Set(localIds).size === localIds.length
@@ -1837,10 +1886,26 @@
       && payload.duplicates.length === 1
       && payload.known_duplicate_count === 2 && payload.missing_expected_number_32, payload);
     repair910Check(checks, 'server GET', !state.serverError, state.serverError);
-    repair910Check(checks, '50 active local spreads with unique mappings', state.localSpreads.length === REPAIR_367.expectedSpreadCount
-      && localShape.unique && state.localSpreads.every(row => !!row.server_id)
-      && new Set(state.localSpreads.map(row => row.server_id)).size === REPAIR_367.expectedSpreadCount,
-      {count:state.localSpreads.length, numbers:localShape.numbers});
+    repair910Check(checks, 'canonical local spread exact', !!canonical
+      && canonical.server_id === REPAIR_367.duplicatedServerId && canonical.notebook_id === REPAIR_367.localNotebookId
+      && canonical.title === '1-2' && Number(canonical.revision) === 20 && !canonical.deleted_at,
+      canonical ? localSpreadDiagnostic(canonical, state.allSpreads) : null);
+    repair910Check(checks, 'legacy local spread exact duplicate', !!legacy && legacy.id === REPAIR_367.legacyLocalId
+      && repair367DuplicateMatches(canonical,legacy), legacy ? localSpreadDiagnostic(legacy, state.allSpreads) : null);
+    repair910Check(checks, 'server confirms canonical client_ref', !!serverCanonical
+      && serverCanonical.client_ref === REPAIR_367.canonicalLocalId && serverCanonical.title === '1-2'
+      && Number(serverCanonical.revision) >= 20 && !serverCanonical.deleted_at
+      && ['status','note_short','note_full'].every(key => (serverCanonical[key] ?? null) === (canonical?.[key] ?? null)),
+      serverCanonical ? {id:serverCanonical.id, client_ref:serverCanonical.client_ref, number:serverCanonical.number,
+        title:serverCanonical.title, revision:serverCanonical.revision} : null);
+    repair910Check(checks, 'legacy has no unique local references', repair367ReferenceCount(legacyRefs) === 0,
+      {legacy_reference_count:repair367ReferenceCount(legacyRefs), references:legacyRefs,
+        canonical_reference_count:repair367ReferenceCount(canonicalRefs)});
+    repair910Check(checks, '51 local rows reduce to 50 unique mappings', state.localSpreads.length === REPAIR_367.expectedLocalCountBefore
+      && effectiveLocal.length === REPAIR_367.expectedSpreadCount && localShape.unique
+      && effectiveLocal.every(row => !!row.server_id)
+      && new Set(effectiveLocal.map(row => row.server_id)).size === REPAIR_367.expectedSpreadCount,
+      {before_count:state.localSpreads.length, after_legacy_retire:effectiveLocal.length, numbers:localShape.numbers});
     repair910Check(checks, '50 active server spreads with known number shape', state.serverSpreads.length === REPAIR_367.expectedSpreadCount
       && new Set(state.serverSpreads.map(row => row.id)).size === REPAIR_367.expectedSpreadCount
       && (serverShape.contiguous || serverShape.legacy_gap_32),
@@ -1855,6 +1920,11 @@
       created_at:nowISO(), purpose:'Repair #367 before-image; no spread, photo, blob, note or auth data is changed directly',
       queue_367:state.queue367, notebook:state.notebook,
       payload_analysis:payload,
+      canonical_spread:canonical,
+      legacy_spread:legacy,
+      canonical_references:canonicalRefs,
+      legacy_references:legacyRefs,
+      shared_server_activity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
       local_order:repair367Ordered(state.localSpreads).map(row => ({local_id:row.id, server_id:row.server_id,
         number:row.number, title:row.title, revision:row.revision ?? null})),
       server_order:repair367Ordered(state.serverSpreads).map(row => ({server_id:row.id, client_ref:row.client_ref || null,
@@ -1865,10 +1935,12 @@
       notebook:{local_id:REPAIR_367.localNotebookId, server_id:REPAIR_367.serverNotebookId,
         title:state.notebook?.title || null},
       comparison:{same_relative_order:sameRelativeOrder, server_numbers_contiguous:serverShape.contiguous,
-        server_has_legacy_gap_32:serverShape.legacy_gap_32, action},
+        server_has_legacy_gap_32:serverShape.legacy_gap_32, action,
+        local_rows_before:state.localSpreads.length, local_rows_after_legacy_retire:effectiveLocal.length,
+        legacy_reference_count:repair367ReferenceCount(legacyRefs)},
       plan:action === 'retire_only'
-        ? {action:'Server order is already canonical; retire only queue #367 without an API write.'}
-        : {action:'Build a new reorder from current local order and current server revisions/numbers; retire #367 only after server success.',
+        ? {action:'Retire only the proven legacy local spread, refresh canonical rows from the already-correct server order, then retire queue #367.'}
+        : {action:'Retire the proven legacy local spread, build a new reorder from the remaining 50 rows and current server revisions/numbers, then retire #367 only after server success.',
           item_count:localIds.length, old_payload:'never reused'},
       _state:state,
     };
@@ -1888,12 +1960,26 @@
     if (syncing) throw new Error('STOP: уже выполняется синхронизация');
     syncing = true;
     await updateSyncIndicator();
+    let deletedLegacy = null;
+    let repairCommitted = false;
     try {
       const preview = await buildRepair367Preview();
       if (!preview.eligible || preview.guard !== expectedGuard) throw new Error('STOP: состояние изменилось после Preview; ничего не применено');
       const state = preview._state;
+      const canonicalBefore = state.localSpreads.find(row => row.id === REPAIR_367.canonicalLocalId);
+      deletedLegacy = state.localSpreads.find(row => row.id === REPAIR_367.legacyLocalId);
+      const effectiveLocal = state.localSpreads.filter(row => row.id !== REPAIR_367.legacyLocalId);
+      await del('spreads', REPAIR_367.legacyLocalId);
+      const afterDelete = (await getAll('spreads')).filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
+      const canonicalAfterDelete = afterDelete.find(row => row.id === REPAIR_367.canonicalLocalId);
+      if (afterDelete.length !== REPAIR_367.expectedSpreadCount
+          || new Set(afterDelete.map(row => row.server_id)).size !== REPAIR_367.expectedSpreadCount
+          || JSON.stringify(sanitizeDiagnosticValue(canonicalAfterDelete)) !== JSON.stringify(sanitizeDiagnosticValue(canonicalBefore))) {
+        throw new Error('STOP: local legacy retirement did not produce the exact canonical set');
+      }
+      let verifiedServerRows = state.serverSpreads;
       if (preview.comparison.action === 'fresh_reorder_then_retire') {
-        const desiredIds = repair367Ids(state.localSpreads);
+        const desiredIds = repair367Ids(effectiveLocal);
         const serverById = new Map(state.serverSpreads.map(row => [row.id,row]));
         const items = desiredIds.map(id => serverById.get(id)).map(row => ({
           spread_id:row.id, expected_revision:Number(row.revision), expected_number:Number(row.number),
@@ -1911,22 +1997,43 @@
             || !repair367NumberShape(reordered).contiguous || !repair367SameIds(desiredIds,reorderedIds)) {
           throw new Error('STOP: server returned an unexpected order');
         }
-        await applyChangeBatch({spreads:reordered});
+        verifiedServerRows = reordered;
+      }
+      await applyChangeBatch({spreads:verifiedServerRows});
+      const synchronizedLocal = (await getAll('spreads')).filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
+      const synchronizedIds = repair367Ids(synchronizedLocal);
+      const verifiedIds = repair367Ids(verifiedServerRows);
+      const revisionsMatch = verifiedServerRows.every(server => {
+        const local = synchronizedLocal.find(row => row.server_id === server.id);
+        return local && Number(local.number) === Number(server.number) && Number(local.revision) === Number(server.revision);
+      });
+      if (synchronizedLocal.length !== REPAIR_367.expectedSpreadCount
+          || synchronizedLocal.some(row => row.id === REPAIR_367.legacyLocalId)
+          || new Set(synchronizedLocal.map(row => row.server_id)).size !== REPAIR_367.expectedSpreadCount
+          || !repair367NumberShape(synchronizedLocal).contiguous
+          || !repair367SameIds(synchronizedIds,verifiedIds) || !revisionsMatch) {
+        throw new Error('STOP: local/server verification after fresh reorder failed');
       }
       const currentQueue = await get('sync_queue', REPAIR_367.queueId);
       if (JSON.stringify(sanitizeDiagnosticValue(currentQueue)) !== JSON.stringify(sanitizeDiagnosticValue(state.queue367))) {
         throw new Error('STOP: queue #367 changed before retirement');
       }
       await retireRepair367(currentQueue);
-      const [finalQueue, finalSpreads, finalQueueAll] = await Promise.all([
-        get('sync_queue', REPAIR_367.queueId), getAll('spreads'), getAll('sync_queue'),
-      ]);
-      const finalLocal = finalSpreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
+      repairCommitted = true;
+      const finalQueueAll = await getAll('sync_queue');
       return {
         completed:true, action:preview.comparison.action, notebook:preview.notebook,
-        queue_367_status:finalQueue?.status || null, totals:queueStatusCounts(finalQueueAll),
-        spread_count:finalLocal.length, data_preserved:finalLocal.length === REPAIR_367.expectedSpreadCount,
+        queue_367_status:'done', totals:queueStatusCounts(finalQueueAll),
+        spread_count:synchronizedLocal.length, unique_server_ids:new Set(synchronizedLocal.map(row => row.server_id)).size,
+        numbers_contiguous:repair367NumberShape(synchronizedLocal).contiguous,
+        canonical_preserved:synchronizedLocal.some(row => row.id === REPAIR_367.canonicalLocalId),
+        legacy_removed:!synchronizedLocal.some(row => row.id === REPAIR_367.legacyLocalId), data_preserved:true,
       };
+    } catch (error) {
+      if (deletedLegacy && !repairCommitted && !(await get('spreads', REPAIR_367.legacyLocalId))) {
+        await put('spreads', deletedLegacy);
+      }
+      throw error;
     } finally {
       syncing = false;
       await updateSyncIndicator();
