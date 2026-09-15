@@ -483,11 +483,18 @@
       const diagnostics = document.getElementById('v352SyncDiagnostics') || syncButton;
       diagnostics.insertAdjacentElement('afterend', repair);
     }
+    if (syncButton && !document.getElementById('v354Repair367')) {
+      const repair = document.createElement('button'); repair.id = 'v354Repair367';
+      repair.className = 'btn-secondary'; repair.textContent = 'Repair #367';
+      repair.onclick = () => window.v354OpenRepair367?.();
+      const anchor = document.getElementById('v353Repair910') || document.getElementById('v352SyncDiagnostics') || syncButton;
+      anchor.insertAdjacentElement('afterend', repair);
+    }
     if (syncButton && !document.getElementById('v340SettingsInvite')) {
       const invite = document.createElement('button'); invite.id = 'v340SettingsInvite';
       invite.className = 'btn-secondary'; invite.textContent = '🔗 Ввести код приглашения';
       invite.onclick = window.v340OpenRedeemInvite;
-      const anchor = document.getElementById('v353Repair910') || document.getElementById('v352SyncDiagnostics') || syncButton;
+      const anchor = document.getElementById('v354Repair367') || document.getElementById('v353Repair910') || document.getElementById('v352SyncDiagnostics') || syncButton;
       anchor.insertAdjacentElement('afterend', invite);
     }
     const footer = [...screenEl.querySelectorAll('div')].find(element => /Блокнот-скан\s*·/.test(element.textContent || '') && element.children.length === 0);

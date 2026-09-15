@@ -1729,6 +1729,265 @@
     };
   }
 
+  const REPAIR_367 = Object.freeze({
+    queueId:367,
+    localNotebookId:'mtk0pu3k5wrwma',
+    serverNotebookId:'2225c8d5-ed4e-435f-93da-8d365c4fc112',
+    duplicatedServerId:'47eabd6b-abc0-4b9a-8ddf-c83980b36219',
+    expectedSpreadCount:50,
+    backendOrigin:'https://blocknot-proxy.mastif1235.workers.dev',
+  });
+
+  function repair367Ordered(rows) {
+    return rows.slice().sort((a,b) => Number(a.number) - Number(b.number) || String(a.id).localeCompare(String(b.id)));
+  }
+
+  function repair367Ids(rows) {
+    return repair367Ordered(rows).map(row => row.server_id || row.id);
+  }
+
+  function repair367SameIds(left, right) {
+    return left.length === right.length && left.every((id,index) => id === right[index]);
+  }
+
+  function repair367PayloadAnalysis(item) {
+    const rows = Array.isArray(item?.payload?.items) ? item.payload.items : [];
+    const counts = new Map();
+    rows.forEach(row => counts.set(row?.spread_id, (counts.get(row?.spread_id) || 0) + 1));
+    const duplicates = [...counts.entries()].filter(([,count]) => count > 1).map(([spread_id,count]) => ({spread_id,count}));
+    const expectedNumbers = rows.map(row => Number(row?.expected_number)).filter(Number.isFinite);
+    return {
+      item_count:rows.length,
+      unique_spread_ids:counts.size,
+      duplicates,
+      missing_expected_number_32:!expectedNumbers.includes(32),
+      known_duplicate_count:counts.get(REPAIR_367.duplicatedServerId) || 0,
+    };
+  }
+
+  function repair367NumberShape(rows) {
+    const numbers = rows.map(row => Number(row.number)).sort((a,b) => a-b);
+    const unique = numbers.length === new Set(numbers).size;
+    const contiguous = unique && numbers.every((number,index) => number === index + 1);
+    const legacyGap32 = unique && numbers.length === REPAIR_367.expectedSpreadCount
+      && numbers.every((number,index) => number === (index < 31 ? index + 1 : index + 2));
+    return {numbers, unique, contiguous, legacy_gap_32:legacyGap32};
+  }
+
+  async function collectRepair367State() {
+    const [notebook, queue, allSpreads] = await Promise.all([
+      get('notebooks', REPAIR_367.localNotebookId), getAll('sync_queue'), getAll('spreads'),
+    ]);
+    let serverSpreads = [], serverError = null;
+    if (isOnline() && isAuthed() && notebook?.server_id === REPAIR_367.serverNotebookId
+        && backendOrigin() === REPAIR_367.backendOrigin) {
+      try {
+        const data = await api(`/api/notebooks/${encodeURIComponent(REPAIR_367.serverNotebookId)}/spreads`);
+        serverSpreads = Array.isArray(data?.spreads) ? data.spreads : [];
+      } catch (error) {
+        serverError = String(error && error.message ? error.message : error);
+      }
+    }
+    return {
+      notebook, queue, allSpreads, serverSpreads, serverError,
+      queue367:repair910Queue(queue, REPAIR_367.queueId),
+      localSpreads:allSpreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at),
+    };
+  }
+
+  function repair367Guard(state) {
+    return JSON.stringify(sanitizeDiagnosticValue({
+      notebook:state.notebook, queue367:state.queue367, queue:state.queue,
+      localSpreads:state.localSpreads, serverSpreads:state.serverSpreads,
+    }));
+  }
+
+  async function buildRepair367Preview() {
+    const state = await collectRepair367State();
+    const checks = [];
+    const unfinished = state.queue.filter(item => UNSYNCED.has(item.status));
+    const payload = repair367PayloadAnalysis(state.queue367);
+    const localShape = repair367NumberShape(state.localSpreads);
+    const serverShape = repair367NumberShape(state.serverSpreads);
+    const localIds = repair367Ids(state.localSpreads);
+    const serverIds = repair367Ids(state.serverSpreads);
+    const sameSet = localIds.length === serverIds.length
+      && new Set(localIds).size === localIds.length
+      && new Set(serverIds).size === serverIds.length
+      && localIds.every(id => serverIds.includes(id));
+    const sameRelativeOrder = sameSet && repair367SameIds(localIds, serverIds);
+    const serverOrderCorrect = sameRelativeOrder && serverShape.contiguous;
+
+    repair910Check(checks, 'production backend', backendOrigin() === REPAIR_367.backendOrigin, backendOrigin());
+    repair910Check(checks, 'online + authenticated', isOnline() && isAuthed(), {online:isOnline(), authenticated:isAuthed()});
+    repair910Check(checks, 'spread_order capability', enabled('spread_order'), null);
+    repair910Check(checks, 'notebook #367 mapping', !!state.notebook
+      && state.notebook.id === REPAIR_367.localNotebookId
+      && state.notebook.server_id === REPAIR_367.serverNotebookId
+      && !state.notebook.deleted_at && !state.notebook.hidden_no_access,
+      {local_id:state.notebook?.id || null, server_id:state.notebook?.server_id || null, title:state.notebook?.title || null});
+    repair910Check(checks, 'queue #367 exact', !!state.queue367 && state.queue367.entity === 'spread_order'
+      && state.queue367.local_id === REPAIR_367.localNotebookId && state.queue367.status === 'failed'
+      && state.queue367.last_error === 'invalid_order' && Number(state.queue367.retry_count) > 0,
+      state.queue367 ? explicitQueueFields(state.queue367) : null);
+    repair910Check(checks, 'only #367 unfinished', unfinished.length === 1 && String(unfinished[0].id) === String(REPAIR_367.queueId),
+      unfinished.map(item => ({id:item.id, entity:item.entity, status:item.status, local_id:item.local_id || null})));
+    repair910Check(checks, 'old payload is the known broken payload', payload.item_count === REPAIR_367.expectedSpreadCount
+      && payload.unique_spread_ids === REPAIR_367.expectedSpreadCount - 1
+      && payload.duplicates.length === 1
+      && payload.known_duplicate_count === 2 && payload.missing_expected_number_32, payload);
+    repair910Check(checks, 'server GET', !state.serverError, state.serverError);
+    repair910Check(checks, '50 active local spreads with unique mappings', state.localSpreads.length === REPAIR_367.expectedSpreadCount
+      && localShape.unique && state.localSpreads.every(row => !!row.server_id)
+      && new Set(state.localSpreads.map(row => row.server_id)).size === REPAIR_367.expectedSpreadCount,
+      {count:state.localSpreads.length, numbers:localShape.numbers});
+    repair910Check(checks, '50 active server spreads with known number shape', state.serverSpreads.length === REPAIR_367.expectedSpreadCount
+      && new Set(state.serverSpreads.map(row => row.id)).size === REPAIR_367.expectedSpreadCount
+      && (serverShape.contiguous || serverShape.legacy_gap_32),
+      {count:state.serverSpreads.length, contiguous:serverShape.contiguous, legacy_gap_32:serverShape.legacy_gap_32,
+        numbers:serverShape.numbers});
+    repair910Check(checks, 'local/server spread sets match exactly', sameSet,
+      {local_only:localIds.filter(id => !serverIds.includes(id)), server_only:serverIds.filter(id => !localIds.includes(id))});
+
+    const eligible = checks.every(check => check.pass);
+    const action = serverOrderCorrect ? 'retire_only' : 'fresh_reorder_then_retire';
+    const backup = sanitizeDiagnosticValue({
+      created_at:nowISO(), purpose:'Repair #367 before-image; no spread, photo, blob, note or auth data is changed directly',
+      queue_367:state.queue367, notebook:state.notebook,
+      payload_analysis:payload,
+      local_order:repair367Ordered(state.localSpreads).map(row => ({local_id:row.id, server_id:row.server_id,
+        number:row.number, title:row.title, revision:row.revision ?? null})),
+      server_order:repair367Ordered(state.serverSpreads).map(row => ({server_id:row.id, client_ref:row.client_ref || null,
+        number:row.number, title:row.title, revision:row.revision})),
+    });
+    return {
+      eligible, checks, backup, guard:repair367Guard(state),
+      notebook:{local_id:REPAIR_367.localNotebookId, server_id:REPAIR_367.serverNotebookId,
+        title:state.notebook?.title || null},
+      comparison:{same_relative_order:sameRelativeOrder, server_numbers_contiguous:serverShape.contiguous,
+        server_has_legacy_gap_32:serverShape.legacy_gap_32, action},
+      plan:action === 'retire_only'
+        ? {action:'Server order is already canonical; retire only queue #367 without an API write.'}
+        : {action:'Build a new reorder from current local order and current server revisions/numbers; retire #367 only after server success.',
+          item_count:localIds.length, old_payload:'never reused'},
+      _state:state,
+    };
+  }
+
+  async function retireRepair367(expectedQueue) {
+    await window.vNextAtomic('notebooks', REPAIR_367.localNotebookId, current => {
+      if (!current || current.server_id !== REPAIR_367.serverNotebookId) throw new Error('STOP: notebook mapping changed');
+      return {retired:[{...expectedQueue, status:'done', next_attempt_at:null, last_error:null,
+        retired_at:nowISO(), retired_reason:'Repair #367 verified current order',
+        retired_previous_error:expectedQueue.last_error || null}]};
+    });
+  }
+
+  async function applyRepair367(expectedGuard) {
+    if (!expectedGuard) throw new Error('Сначала выполните Preview и скопируйте backup JSON');
+    if (syncing) throw new Error('STOP: уже выполняется синхронизация');
+    syncing = true;
+    await updateSyncIndicator();
+    try {
+      const preview = await buildRepair367Preview();
+      if (!preview.eligible || preview.guard !== expectedGuard) throw new Error('STOP: состояние изменилось после Preview; ничего не применено');
+      const state = preview._state;
+      if (preview.comparison.action === 'fresh_reorder_then_retire') {
+        const desiredIds = repair367Ids(state.localSpreads);
+        const serverById = new Map(state.serverSpreads.map(row => [row.id,row]));
+        const items = desiredIds.map(id => serverById.get(id)).map(row => ({
+          spread_id:row.id, expected_revision:Number(row.revision), expected_number:Number(row.number),
+        }));
+        if (items.length !== REPAIR_367.expectedSpreadCount
+            || new Set(items.map(row => row.spread_id)).size !== REPAIR_367.expectedSpreadCount) {
+          throw new Error('STOP: fresh reorder is ambiguous');
+        }
+        const data = await api(`/api/notebooks/${encodeURIComponent(REPAIR_367.serverNotebookId)}/spreads/order`, {method:'PUT', json:{
+          client_ref:'repair-spread-order-367-v1', items,
+        }});
+        const reordered = Array.isArray(data?.spreads) ? data.spreads : [];
+        const reorderedIds = repair367Ids(reordered);
+        if (reordered.length !== REPAIR_367.expectedSpreadCount
+            || !repair367NumberShape(reordered).contiguous || !repair367SameIds(desiredIds,reorderedIds)) {
+          throw new Error('STOP: server returned an unexpected order');
+        }
+        await applyChangeBatch({spreads:reordered});
+      }
+      const currentQueue = await get('sync_queue', REPAIR_367.queueId);
+      if (JSON.stringify(sanitizeDiagnosticValue(currentQueue)) !== JSON.stringify(sanitizeDiagnosticValue(state.queue367))) {
+        throw new Error('STOP: queue #367 changed before retirement');
+      }
+      await retireRepair367(currentQueue);
+      const [finalQueue, finalSpreads, finalQueueAll] = await Promise.all([
+        get('sync_queue', REPAIR_367.queueId), getAll('spreads'), getAll('sync_queue'),
+      ]);
+      const finalLocal = finalSpreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
+      return {
+        completed:true, action:preview.comparison.action, notebook:preview.notebook,
+        queue_367_status:finalQueue?.status || null, totals:queueStatusCounts(finalQueueAll),
+        spread_count:finalLocal.length, data_preserved:finalLocal.length === REPAIR_367.expectedSpreadCount,
+      };
+    } finally {
+      syncing = false;
+      await updateSyncIndicator();
+    }
+  }
+
+  async function openRepair367() {
+    let preview = null, copiedGuard = null;
+    const {el,close} = openSheet(`<div class="sheet-handle"></div><div class="v352-diag-head">
+      <h2>Repair #367</h2><button class="icon-btn" data-r367-close aria-label="Закрыть Repair #367">✕</button></div>
+      <p class="warn-box">Временный инструмент только для failed spread_order #367. Старый payload никогда не повторяется.</p>
+      <button class="btn-secondary" data-r367-preview>Preview / READ-ONLY</button>
+      <div data-r367-report></div>
+      <details hidden data-r367-backup-wrap><summary>Backup JSON</summary><pre data-r367-backup></pre></details>
+      <div class="btn-row"><button class="btn-secondary" data-r367-copy disabled>Копировать backup JSON</button>
+      <button class="btn-primary" data-r367-apply disabled>Apply Repair</button></div>`);
+    el.querySelector('[data-r367-close]').onclick = close;
+    const reportHost = el.querySelector('[data-r367-report]');
+    const backupWrap = el.querySelector('[data-r367-backup-wrap]');
+    const backupHost = el.querySelector('[data-r367-backup]');
+    const previewButton = el.querySelector('[data-r367-preview]');
+    const copyButton = el.querySelector('[data-r367-copy]');
+    const applyButton = el.querySelector('[data-r367-apply]');
+    previewButton.onclick = async () => {
+      previewButton.disabled = true; copyButton.disabled = true; applyButton.disabled = true; copiedGuard = null;
+      reportHost.textContent = 'Сравниваю локальный и серверный порядок только через GET…';
+      try {
+        preview = await buildRepair367Preview();
+        reportHost.innerHTML = `<h3>${preview.eligible ? 'Все проверки PASS' : 'STOP: есть несовпадения'}</h3>
+          <ul>${preview.checks.map(check => `<li>${check.pass ? '✅' : '❌'} ${esc(check.key)}${check.detail === null ? '' : `<details><summary>Детали</summary>${diagnosticPre(check.detail)}</details>`}</li>`).join('')}</ul>
+          <h3>Сравнение и план</h3>${diagnosticPre({notebook:preview.notebook, comparison:preview.comparison, plan:preview.plan})}`;
+        backupHost.textContent = JSON.stringify(preview.backup, null, 2);
+        backupWrap.hidden = false; copyButton.disabled = false;
+      } catch (error) {
+        preview = null; reportHost.innerHTML = `<p class="warn-box">STOP: ${esc(error.message || error)}</p>`;
+      } finally { previewButton.disabled = false; }
+    };
+    copyButton.onclick = async () => {
+      if (!preview) return;
+      copyButton.disabled = true;
+      try {
+        const copied = await copyDiagnosticText(JSON.stringify(preview.backup, null, 2));
+        if (!copied) throw new Error('clipboard copy failed');
+        copiedGuard = preview.guard; applyButton.disabled = !preview.eligible;
+        toast('Backup JSON скопирован. Apply доступен только для неизменившегося PASS-состояния.');
+      } catch (error) { copiedGuard = null; applyButton.disabled = true; toast('Не удалось скопировать backup JSON'); }
+      finally { copyButton.disabled = false; }
+    };
+    applyButton.onclick = async () => {
+      applyButton.disabled = true; previewButton.disabled = true; copyButton.disabled = true;
+      reportHost.innerHTML = '<p>Выполняется точечный repair #367…</p>';
+      try {
+        const result = await applyRepair367(copiedGuard);
+        reportHost.innerHTML = `<h3>Repair #367 завершён</h3>${diagnosticPre(result)}`;
+        toast('Repair #367 завершён');
+      } catch (error) {
+        reportHost.innerHTML = `<p class="warn-box">${esc(error.message || error)}</p><p>Остановлено. Другие queue rows не очищались.</p>`;
+      } finally { previewButton.disabled = false; copyButton.disabled = !preview; }
+    };
+  }
+
   async function openReadOnlySyncDiagnostics() {
     const report = await buildReadOnlyDiagnosticReport();
     const serverChecks = new Map();
@@ -1797,11 +2056,13 @@
   window.v340Sync = {retryDelay, retryDue, mapServerPhoto, diagnostics, conflictGroups, openConflictDiagnostics,
     assessLegacySpreadConflict, safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts,
     buildReadOnlyDiagnosticReport, checkSpreadOnServerReadOnly, openReadOnlySyncDiagnostics,
-    buildRepair910Preview, applyRepair910, repair910OrderedRows};
+    buildRepair910Preview, applyRepair910, repair910OrderedRows,
+    buildRepair367Preview, applyRepair367};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
   window.v350OpenSyncDiagnostics = openReadOnlySyncDiagnostics;
   window.v350BuildSyncDiagnosticReport = buildReadOnlyDiagnosticReport;
   window.v353OpenRepair910 = openRepair910;
+  window.v354OpenRepair367 = openRepair367;
   const baseQueueEntityChange = typeof queueEntityChange === 'function' ? queueEntityChange : async (entity, localId, extra = {}) => {
     await put('sync_queue', {entity, local_id:localId, status:'pending', retry_count:0, ...extra});
   };

@@ -741,8 +741,118 @@ async function testRepair910StopsIfStateChangesAfterPreview() {
   assert.equal(runtime.db.sync_queue.get(287).status, 'conflict');
 }
 
+function repair367Fixture({serverContiguous = false} = {}) {
+  const backend = 'https://blocknot-proxy.mastif1235.workers.dev';
+  const localNotebookId = 'mtk0pu3k5wrwma';
+  const serverNotebookId = '2225c8d5-ed4e-435f-93da-8d365c4fc112';
+  const duplicatedId = '47eabd6b-abc0-4b9a-8ddf-c83980b36219';
+  const serverSpreads = Array.from({length:50}, (_,index) => ({
+    id:index === 0 ? duplicatedId : `order-server-${index + 1}`,
+    client_ref:`order-local-${index + 1}`, notebook_id:serverNotebookId,
+    number:serverContiguous || index < 31 ? index + 1 : index + 2,
+    title:`Order ${index + 1}`, status:'Актуально', note_short:null, note_full:null,
+    revision:index + 1, current_photo_id:null, deleted_at:null,
+  }));
+  const localSpreads = serverSpreads.map((row,index) => ({
+    id:row.client_ref, server_id:row.id, notebook_id:localNotebookId, number:index + 1,
+    title:row.title, status:row.status, note_short:null, note_full:null,
+    revision:row.revision, current_photo_id:null, deleted_at:null,
+  }));
+  const brokenItems = serverSpreads.map((row,index) => ({spread_id:row.id, expected_revision:row.revision,
+    expected_number:index < 31 ? index + 1 : index + 2}));
+  brokenItems[brokenItems.length - 1].spread_id = duplicatedId;
+  return {
+    backend, localNotebookId, serverNotebookId, duplicatedId, serverSpreads,
+    seed:{
+      settings:{backend_url:backend, team_capabilities:{scope:`${backend}|u1`, flags:{spread_order:true}}},
+      notebooks:[{id:localNotebookId, server_id:serverNotebookId, title:'Notebook #367'}],
+      spreads:localSpreads,
+      sync_queue:[{id:367, entity:'spread_order', local_id:localNotebookId, scope:`${backend}|u1`,
+        status:'failed', retry_count:97, last_error:'invalid_order', payload:{client_ref:'broken-367', items:brokenItems}}],
+    },
+  };
+}
+
+async function testRepair367PreviewAndFreshReorder() {
+  const fixture = repair367Fixture();
+  const runtime = createRuntime(fixture.seed);
+  let serverSpreads = structuredClone(fixture.serverSpreads);
+  let putCalls = 0;
+  const before = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
+  runtime.setApi(async (path, options) => {
+    if (!options) return {spreads:structuredClone(serverSpreads)};
+    assert.equal(path, `/api/notebooks/${fixture.serverNotebookId}/spreads/order`);
+    assert.equal(options.method, 'PUT');
+    putCalls++;
+    assert.equal(options.json.client_ref, 'repair-spread-order-367-v1');
+    assert.equal(options.json.items.length, 50);
+    assert.equal(new Set(options.json.items.map(row => row.spread_id)).size, 50, 'fresh reorder cannot contain duplicate IDs');
+    assert.notEqual(options.json.client_ref, 'broken-367', 'old payload identity cannot be reused');
+    const desiredIds = options.json.items.map(row => row.spread_id);
+    serverSpreads = desiredIds.map((id,index) => {
+      const current = serverSpreads.find(row => row.id === id);
+      return {...current, number:index + 1, revision:current.revision + 1};
+    });
+    return {spreads:structuredClone(serverSpreads)};
+  });
+  const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+  assert.equal(preview.eligible, true);
+  assert.equal(preview.notebook.local_id, fixture.localNotebookId);
+  assert.equal(preview.notebook.server_id, fixture.serverNotebookId);
+  assert.equal(preview.comparison.server_has_legacy_gap_32, true);
+  assert.equal(preview.comparison.action, 'fresh_reorder_then_retire');
+  assert.equal(preview.backup.queue_367.id, 367);
+  assert.equal(putCalls, 0, 'Preview must be GET-only');
+  const afterPreview = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
+  assert.deepEqual(afterPreview, before, 'Preview must not mutate local data');
+  const result = await runtime.context.window.v340Sync.applyRepair367(preview.guard);
+  assert.equal(result.completed, true);
+  assert.equal(result.action, 'fresh_reorder_then_retire');
+  assert.equal(putCalls, 1);
+  assert.equal(runtime.db.sync_queue.get(367).status, 'done');
+  assert.equal(runtime.db.spreads.size, 50);
+  assert.equal(runtime.db.photos.size, 0);
+  assert.equal(runtime.db.blobs.size, 0);
+}
+
+async function testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect() {
+  const fixture = repair367Fixture({serverContiguous:true});
+  const runtime = createRuntime(fixture.seed);
+  let mutations = 0;
+  runtime.setApi(async (path, options) => {
+    if (options) mutations++;
+    return {spreads:structuredClone(fixture.serverSpreads)};
+  });
+  const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+  assert.equal(preview.eligible, true);
+  assert.equal(preview.comparison.action, 'retire_only');
+  const result = await runtime.context.window.v340Sync.applyRepair367(preview.guard);
+  assert.equal(result.action, 'retire_only');
+  assert.equal(mutations, 0);
+  assert.equal(runtime.db.sync_queue.get(367).status, 'done');
+}
+
+async function testRepair367StopsOnAmbiguousMapping() {
+  const fixture = repair367Fixture();
+  fixture.seed.spreads.pop();
+  const runtime = createRuntime(fixture.seed);
+  let mutations = 0;
+  runtime.setApi(async (path, options) => {
+    if (options) mutations++;
+    return {spreads:structuredClone(fixture.serverSpreads)};
+  });
+  const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+  assert.equal(preview.eligible, false);
+  await assert.rejects(runtime.context.window.v340Sync.applyRepair367(preview.guard), /ничего не применено/);
+  assert.equal(mutations, 0);
+  assert.equal(runtime.db.sync_queue.get(367).status, 'failed');
+}
+
 await testRepair910PreviewIsReadOnly();
 await testRepair910ApplyTouchesOnly286And287();
 await testRepair910StopsIfStateChangesAfterPreview();
+await testRepair367PreviewAndFreshReorder();
+await testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect();
+await testRepair367StopsOnAmbiguousMapping();
 
-console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repair 9-10)');
+console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repairs 9-10/#367)');
