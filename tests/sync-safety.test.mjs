@@ -748,10 +748,10 @@ function repair367Fixture({serverContiguous = false} = {}) {
   const duplicatedId = '47eabd6b-abc0-4b9a-8ddf-c83980b36219';
   const serverSpreads = Array.from({length:50}, (_,index) => ({
     id:index === 0 ? duplicatedId : `order-server-${index + 1}`,
-    client_ref:`order-local-${index + 1}`, notebook_id:serverNotebookId,
+    client_ref:index === 0 ? 'mtk12qcznnzdex' : `order-local-${index + 1}`, notebook_id:serverNotebookId,
     number:serverContiguous || index < 31 ? index + 1 : index + 2,
-    title:`Order ${index + 1}`, status:'Актуально', note_short:null, note_full:null,
-    revision:index + 1, current_photo_id:null, deleted_at:null,
+    title:index === 0 ? '1-2' : `Order ${index + 1}`, status:'Актуально', note_short:null, note_full:null,
+    revision:index === 0 ? 20 : index + 1, current_photo_id:null, deleted_at:null,
   }));
   const localSpreads = serverSpreads.map((row,index) => ({
     id:row.client_ref, server_id:row.id, notebook_id:localNotebookId, number:index + 1,
@@ -761,6 +761,7 @@ function repair367Fixture({serverContiguous = false} = {}) {
   const brokenItems = serverSpreads.map((row,index) => ({spread_id:row.id, expected_revision:row.revision,
     expected_number:index < 31 ? index + 1 : index + 2}));
   brokenItems[brokenItems.length - 1].spread_id = duplicatedId;
+  localSpreads.push({...localSpreads[0], id:duplicatedId});
   return {
     backend, localNotebookId, serverNotebookId, duplicatedId, serverSpreads,
     seed:{
@@ -801,6 +802,11 @@ async function testRepair367PreviewAndFreshReorder() {
   assert.equal(preview.notebook.server_id, fixture.serverNotebookId);
   assert.equal(preview.comparison.server_has_legacy_gap_32, true);
   assert.equal(preview.comparison.action, 'fresh_reorder_then_retire');
+  assert.equal(preview.comparison.local_rows_before, 51);
+  assert.equal(preview.comparison.local_rows_after_legacy_retire, 50);
+  assert.equal(preview.comparison.legacy_reference_count, 0);
+  assert.equal(preview.backup.canonical_spread.id, 'mtk12qcznnzdex');
+  assert.equal(preview.backup.legacy_spread.id, fixture.duplicatedId);
   assert.equal(preview.backup.queue_367.id, 367);
   assert.equal(putCalls, 0, 'Preview must be GET-only');
   const afterPreview = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
@@ -811,6 +817,8 @@ async function testRepair367PreviewAndFreshReorder() {
   assert.equal(putCalls, 1);
   assert.equal(runtime.db.sync_queue.get(367).status, 'done');
   assert.equal(runtime.db.spreads.size, 50);
+  assert.equal(runtime.db.spreads.has(fixture.duplicatedId), false);
+  assert.equal(runtime.db.spreads.has('mtk12qcznnzdex'), true);
   assert.equal(runtime.db.photos.size, 0);
   assert.equal(runtime.db.blobs.size, 0);
 }
@@ -848,11 +856,31 @@ async function testRepair367StopsOnAmbiguousMapping() {
   assert.equal(runtime.db.sync_queue.get(367).status, 'failed');
 }
 
+async function testRepair367StopsWhenLegacyHasAReference() {
+  const fixture = repair367Fixture();
+  fixture.seed.photos = [{id:'legacy-photo', spread_id:fixture.duplicatedId, upload_status:'synced'}];
+  const runtime = createRuntime(fixture.seed);
+  let mutations = 0;
+  runtime.setApi(async (path, options) => {
+    if (options) mutations++;
+    return {spreads:structuredClone(fixture.serverSpreads)};
+  });
+  const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+  assert.equal(preview.eligible, false);
+  assert.equal(preview.comparison.legacy_reference_count, 1);
+  assert.equal(preview.backup.legacy_references.photos[0].id, 'legacy-photo');
+  await assert.rejects(runtime.context.window.v340Sync.applyRepair367(preview.guard), /ничего не применено/);
+  assert.equal(mutations, 0);
+  assert.equal(runtime.db.spreads.has(fixture.duplicatedId), true);
+  assert.equal(runtime.db.photos.has('legacy-photo'), true);
+}
+
 await testRepair910PreviewIsReadOnly();
 await testRepair910ApplyTouchesOnly286And287();
 await testRepair910StopsIfStateChangesAfterPreview();
 await testRepair367PreviewAndFreshReorder();
 await testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect();
 await testRepair367StopsOnAmbiguousMapping();
+await testRepair367StopsWhenLegacyHasAReference();
 
 console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repairs 9-10/#367)');
