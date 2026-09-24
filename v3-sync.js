@@ -2,7 +2,7 @@
 (function () {
   const RETRY_BASE_MS = 15000;
   const RETRY_MAX_MS = 5 * 60 * 1000;
-  const UNSYNCED = new Set(['pending', 'syncing', 'failed', 'conflict']);
+  const UNSYNCED = new Set(['pending', 'syncing', 'failed', 'conflict', 'blocked']);
   const FIELD_NAMES = ['number', 'title', 'status', 'note_short', 'note_full'];
   const NULLABLE_TEXT_FIELDS = new Set(['title', 'note_short', 'note_full']);
   const scope = () => settings.backend_url.replace(/\/$/, '') + '|' + (settings.user_id || '');
@@ -521,10 +521,32 @@
 
   function retryDue(item, forceRetry) {
     if (item.status === 'pending') return true;
+    if (item.status === 'blocked') return !!forceRetry; // permanent errors: manual retry only
     if (item.status !== 'failed') return false;
     if (forceRetry) return true;
     const due = Date.parse(item.next_attempt_at || '');
     return !Number.isFinite(due) || due <= Date.now();
+  }
+
+  // Transient errors retry with backoff; permanent ones stop automatic retries but keep
+  // the payload (and local data) intact. A manual sync (forceRetry) may retry blocked items.
+  function classifyPushError(error) {
+    const status = Number(error && error.status) || 0;
+    if (!status) return 'transient'; // network/channel failure without an HTTP status
+    if (status === 401 || status === 403) return 'auth';
+    if (status === 409) return 'conflict';
+    if (status === 413) return 'too_large';
+    if (status >= 500 || status === 429) return 'transient';
+    return 'permanent'; // remaining 4xx: the server will reject this payload again
+  }
+
+  function markBlocked(item, error, reason) {
+    item.status = 'blocked';
+    item.blocked_reason = reason;
+    item.retry_count = (item.retry_count || 0) + 1;
+    item.last_attempt_at = nowISO();
+    item.next_attempt_at = null;
+    item.last_error = String(error && error.message ? error.message : error || 'sync failed').slice(0, 500);
   }
 
   function markRetry(item, error) {
@@ -565,6 +587,29 @@
   pushNotebook = async function (item) {
     const nb = await get('notebooks', item.local_id);
     if (!nb) return queueResult('discarded', 'local notebook no longer exists');
+    if (item.payload && item.payload.op === 'delete') {
+      // Persistent outbox delete: replaces the old fire-and-forget call that silently
+      // reverted when the request failed offline.
+      const deletedAt = nb.deleted_at || nowISO();
+      if (!nb.server_id) {
+        await put('notebooks', {...nb, deleted_at:deletedAt});
+        return queueResult('sent');
+      }
+      try { await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}`, {method:'DELETE'}); }
+      catch (error) {
+        if (!error || error.status !== 404) throw error;
+      }
+      await put('notebooks', {...nb, deleted_at:deletedAt});
+      return queueResult('sent');
+    }
+    if (item.payload && item.payload.op === 'restore') {
+      if (!nb.server_id) return queueResult('sent'); // never reached the server
+      try { await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}/restore`, {method:'POST'}); }
+      catch (error) {
+        if (!error || error.status !== 404) throw error;
+      }
+      return queueResult('sent');
+    }
     if (!nb.server_id) {
       const data = await api('/api/notebooks', {method:'POST', json:{title:nb.title, description:nb.description, client_ref:nb.id}});
       nb.server_id = data.notebook.id;
@@ -596,6 +641,25 @@
         if (!error || error.status !== 404) throw error;
       }
       await put('spreads', {...sp, deleted_at:deletedAt});
+      return queueResult('sent');
+    }
+    if (item.payload && item.payload.op === 'restore') {
+      // Restore clears the local tombstone locally at restore-from-trash time; this op makes
+      // the server follow. Pull skips this spread while the op is unsynced, so a stale server
+      // tombstone cannot re-delete it (regression test covers the full F1 chain).
+      if (!sp.server_id) return queueResult('sent'); // never reached the server
+      const nbRestore = await get('notebooks', sp.notebook_id);
+      if (!nbRestore || !nbRestore.server_id) return queueResult('deferred', 'notebook has no server id');
+      try {
+        const data = await api(`/api/spreads/${encodeURIComponent(sp.server_id)}/restore`, {method:'POST'});
+        if (data && data.spread) {
+          const latest = await get('spreads', sp.id);
+          if (latest) await put('spreads', {...latest, revision:data.spread.revision, deleted_at:null});
+        }
+      } catch (error) {
+        if (error && error.status === 404) return queueResult('sent', 'spread is gone on the server');
+        throw error;
+      }
       return queueResult('sent');
     }
     const nb = await get('notebooks', sp.notebook_id);
@@ -709,6 +773,8 @@
         if (['spread_note','spread_fields','spread_order'].includes(item.entity)) {
           if (error?.status === 409) {
             item.status = 'conflict'; item.last_error = error.message; item.conflicts = error.data;
+          } else if (['permanent','too_large','auth'].includes(classifyPushError(error))) {
+            markBlocked(item, error, classifyPushError(error));
           } else markRetry(item, error);
           await put('sync_queue', item);
           if (item.entity === 'spread_fields' && error?.data?.conflicts) {
@@ -732,6 +798,11 @@
             local.conflict = item.server_copy || true;
             await put(item.entity === 'notebook' ? 'notebooks' : 'spreads', local);
           }
+        } else if (['permanent','too_large','auth'].includes(classifyPushError(error))) {
+          // 4xx the server will keep rejecting: stop automatic retries, keep payload local.
+          markBlocked(item, error, classifyPushError(error));
+          await put('sync_queue', item);
+          console.warn('Deferred sync item blocked (permanent error)', item.entity, item.local_id, error);
         } else {
           markRetry(item, error);
           await put('sync_queue', item);
@@ -749,7 +820,8 @@
     fd.append('file', blobRec.blob, `spread_${photo.spread_id}_v${photo.version}`);
     fd.append('client_upload_id', photo.id);
     if (thumbRec) fd.append('preview', thumbRec.blob, 'thumb.webp');
-    const path = isAuthed() ? `/api/spreads/${spread.server_id}/photos` : '/upload';
+    if (!isAuthed()) throw Object.assign(new Error('auth_required'), {status:401});
+    const path = `/api/spreads/${spread.server_id}/photos`;
     const headers = {};
     if (settings.auth_token) headers.Authorization = 'Bearer ' + settings.auth_token;
     const resp = await fetch(settings.backend_url.replace(/\/$/, '') + path, {method:'POST', body:fd, headers});
@@ -762,6 +834,7 @@
   }
 
   pushPhotoQueue = async function (forceRetry, options = {}) {
+    if (!isAuthed()) return; // photos wait for sign-in locally; there is no unauthenticated upload
     const onlyItemIds = options.onlyItemIds ? new Set(options.onlyItemIds.map(String)) : null;
     const queue = (await getAll('sync_queue')).filter(item =>
       item.entity === 'photo' && retryDue(item, !!forceRetry)
@@ -811,7 +884,11 @@
         } else {
           photo.upload_status = 'upload_failed';
           await put('photos', photo);
-          markRetry(item, error);
+          if (['permanent','too_large','auth'].includes(classifyPushError(error))) {
+            markBlocked(item, error, classifyPushError(error)); // e.g. oversize file: no endless retry
+          } else {
+            markRetry(item, error);
+          }
           await put('sync_queue', item);
         }
         console.warn(options.restoreOnFailure ? 'Photo upload failed; local state restored' : 'Photo upload failed; retry scheduled', photo.id, error);
@@ -1098,9 +1175,13 @@
         await pullChanges();
         try { await window.v340RetryCovers?.(); }
         catch (error) { recordFailure('covers', error); }
+        try { await window.v340PruneOldPhotos?.(); }
+        catch (error) { console.warn('Photo retention enforcement failed', error); }
         if (sessionVerified) void window.v340MigrateLegacyCovers?.().catch(error => console.warn('Legacy cover migration failed', error));
       } else {
-        await pushPhotoQueue(!!manual);
+        // Unauthenticated sessions never touch the network: photos stay local with the
+        // "ожидает" badge and are uploaded after sign-in via the authenticated endpoint.
+        await pushPhotoQueue(!!manual); // no-op without auth (kept for clarity/safety)
       }
       const remaining = (await getAll('sync_queue')).some(item => UNSYNCED.has(item.status));
       settings.sync_status = settings.sync_errors.length ? 'error' : remaining ? 'pending' : 'idle';
@@ -2502,7 +2583,52 @@
     buildReadOnlyDiagnosticReport, checkSpreadOnServerReadOnly, openReadOnlySyncDiagnostics,
     buildRepair910Preview, applyRepair910, repair910OrderedRows,
     buildRepair367Preview, applyRepair367, fieldValuesEquivalent, prepareFieldPayload};
-  window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
+  // Restore-from-trash that actually syncs: atomic local un-tombstone + outbox restore op,
+  // and any still-pending delete for the same entity is retired in the same transaction.
+  async function restoreFromTrash(entity, localId) {
+    const store = entity === 'notebook' ? 'notebooks' : 'spreads';
+    const current = await get(store, localId);
+    if (!current || !current.deleted_at) return false;
+    const queue = await getAll('sync_queue');
+    const retired = queue.filter(item => item.entity === entity && item.local_id === localId
+        && UNSYNCED.has(item.status) && item.payload && item.payload.op === 'delete')
+      .map(item => ({...item, status:'done', last_error:'superseded by restore'}));
+    await window.vNextAtomic(store, localId, row => {
+      if (!row || !row.deleted_at) throw new Error('Запись уже восстановлена');
+      return {row:{...row, deleted_at:null, updated_at:nowISO()},
+        item:{entity, local_id:localId, status:'pending', retry_count:0, payload:{op:'restore'}},
+        retired};
+    });
+    if (entity === 'notebook') {
+      const latest = await get('notebooks', localId);
+      if (latest && latest.hidden_no_access) await put('notebooks', {...latest, hidden_no_access:false});
+    }
+    void fullSync();
+    return true;
+  }
+
+  // Notebook delete as a persistent outbox operation (was fire-and-forget; offline deletes
+  // silently reverted on the next pull, see F3).
+  async function deleteNotebookToTrash(localNotebookId) {
+    const nb = await get('notebooks', localNotebookId);
+    if (!nb || nb.deleted_at) return false;
+    const queue = await getAll('sync_queue');
+    const retired = queue.filter(item => item.entity === 'notebook' && item.local_id === localNotebookId
+        && UNSYNCED.has(item.status))
+      .map(item => ({...item, status:'done', last_error:'superseded by notebook delete'}));
+    await window.vNextAtomic('notebooks', localNotebookId, row => {
+      if (!row) throw new Error('Блокнот недоступен');
+      const now = nowISO();
+      return {row:{...row, deleted_at:row.deleted_at || now, updated_at:now},
+        item:{entity:'notebook', local_id:localNotebookId, status:'pending', retry_count:0, payload:{op:'delete'}},
+        retired};
+    });
+    void fullSync();
+    return true;
+  }
+
+  window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh,
+    restoreFromTrash, deleteNotebookToTrash, classifyPushError};
   window.v350OpenSyncDiagnostics = openReadOnlySyncDiagnostics;
   window.v350BuildSyncDiagnosticReport = buildReadOnlyDiagnosticReport;
   window.v353OpenRepair910 = openRepair910;

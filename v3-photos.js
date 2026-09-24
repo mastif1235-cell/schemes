@@ -1,7 +1,46 @@
 /* Blocknot Scan v3.4.0: photo state, original resolution and leak-free viewer. */
 (function () {
-  const UNSYNCED_QUEUE = new Set(['pending','syncing','failed','conflict']);
+  const UNSYNCED_QUEUE = new Set(['pending','syncing','failed','conflict','blocked']);
 
+
+  // keep_old_photos_policy was a dead setting: old photo versions accumulated blobs forever.
+  // Conservative enforcement: runs at most once per day after a successful sync, only when
+  // signed in (so pruned originals are recoverable from the server), and only removes the
+  // ORIGINAL blob of a fully-synced non-current version beyond the keep limit. Thumbnails,
+  // metadata, current photos, pending/retrying uploads and photos of deleted spreads are
+  // never touched.
+  window.v340PruneOldPhotos = async function (options = {}) {
+    const POLICY_KEEP = {none:0, last1:1, last3:3, all:Infinity};
+    const keep = POLICY_KEEP[settings.keep_old_photos_policy];
+    if (!Number.isFinite(keep)) return {pruned:0};
+    if (!isAuthed()) return {pruned:0};
+    if (!options.force) {
+      const lastRun = Date.parse(settings.last_photo_retention_at || '');
+      if (Number.isFinite(lastRun) && Date.now() - lastRun < 24 * 3600 * 1000) return {pruned:0, throttled:true};
+    }
+    let pruned = 0;
+    const queue = await getAll('sync_queue');
+    const spreads = await getAll('spreads');
+    for (const spread of spreads) {
+      if (!spread || spread.deleted_at) continue;
+      const versions = (await getAllByIndex('photos', 'spread_id', spread.id))
+        .filter(photo => photo && !photo.is_current)
+        .sort((a, b) => (Number(b.version) || 0) - (Number(a.version) || 0));
+      let kept = 0;
+      for (const photo of versions) {
+        const busy = queue.some(item => item.entity === 'photo' && item.photo_id === photo.id
+          && UNSYNCED_QUEUE.has(item.status));
+        if (busy) continue; // still needed for retry — never prune, and don't spend keep-slots on it
+        if (!photo.server_id || photo.upload_status !== 'synced') continue;
+        if (kept < keep) { kept++; continue; }
+        try { await del('blobs', photo.id + '_orig'); pruned++; }
+        catch (error) { console.warn('Old photo version blob could not be pruned', photo.id, error); }
+      }
+    }
+    settings.last_photo_retention_at = nowISO();
+    try { await saveSettings(); } catch (error) { console.warn('Retention timestamp could not be saved', error); }
+    return {pruned};
+  };
 
   function getTelegramPhotoLink(photo) {
     const link = typeof photo?.telegram_link === 'string' ? photo.telegram_link.trim() : '';
@@ -399,7 +438,7 @@
       const telegramLink = getTelegramPhotoLink(photo);
       overlay.innerHTML = `<div class="viewer-top">
         <button class="icon-btn" data-action="close" aria-label="Закрыть">✕</button>
-        <span class="num">№${spread.number} · ${index + 1}/${spreads.length}</span><div class="spacer"></div>
+        <span class="num">№${esc(spread.number)} · ${index + 1}/${spreads.length}</span><div class="spacer"></div>
         <button class="icon-btn" data-action="favorite" aria-label="Избранное">${spread.favorite ? '⭐' : '☆'}</button>
         <button class="icon-btn" data-action="edit" aria-label="Редактировать">✎</button></div>
         <div class="viewer-stage" data-stage>

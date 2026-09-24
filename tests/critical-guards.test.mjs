@@ -73,7 +73,7 @@ sandbox.BlocknotV3.photoTarget.clear();
 assert.equal(sandbox.BlocknotV3.photoTarget.current().notebookId, null);
 const photos = read('v3-photos.js');
 assert.match(photos, /window\.v340ValidatePhotoTarget\(latest, target\)/, 'the guard must re-run on the value read inside the write transaction');
-assert.match(photos, /const UNSYNCED_QUEUE = new Set\(\['pending','syncing','failed','conflict'\]\)/);
+assert.match(photos, /const UNSYNCED_QUEUE = new Set\(\['pending','syncing','failed','conflict','blocked'\]\)/, 'retire set must cover every unsynced status incl. blocked');
 assert.match(camera, /window\.BlocknotV3\.photoTarget\.set\(\{notebookId:targetNotebookId, spreadId:null\}\)/);
 
 // --- CRITICAL 3: spread delete stays queued and is not overwritten by a snapshot ------------
