@@ -4,6 +4,7 @@
   const RETRY_MAX_MS = 5 * 60 * 1000;
   const UNSYNCED = new Set(['pending', 'syncing', 'failed', 'conflict']);
   const FIELD_NAMES = ['number', 'title', 'status', 'note_short', 'note_full'];
+  const NULLABLE_TEXT_FIELDS = new Set(['title', 'note_short', 'note_full']);
   const scope = () => settings.backend_url.replace(/\/$/, '') + '|' + (settings.user_id || '');
   const metadata = row => Object.fromEntries(FIELD_NAMES.map(key => [key, row[key] ?? (key === 'number' ? 0 : '')]));
   const enabled = name => settings.team_capabilities?.scope === scope() && settings.team_capabilities.flags?.[name] === true;
@@ -467,11 +468,31 @@
     void fullSync();
   }
 
+  function fieldValuesEquivalent(key, left, right) {
+    if (NULLABLE_TEXT_FIELDS.has(key) && (left === null || left === '') && (right === null || right === '')) return true;
+    return left === right;
+  }
+
+  async function prepareFieldPayload(spread, payload) {
+    const baseValues = payload?.base_values || {};
+    const keys = Object.keys(payload?.changes || {}).filter(key => NULLABLE_TEXT_FIELDS.has(key)
+      && (baseValues[key] === null || baseValues[key] === ''));
+    if (!keys.length) return payload;
+    const server = (await api(`/api/spreads/${encodeURIComponent(spread.server_id)}`))?.spread;
+    if (!server || server.id !== spread.server_id || server.deleted_at) throw new Error('spread server state unavailable');
+    const normalizedBase = {...baseValues};
+    for (const key of keys) {
+      if (fieldValuesEquivalent(key,baseValues[key],server[key])) normalizedBase[key] = server[key];
+    }
+    return {...payload, base_values:normalizedBase};
+  }
+
   async function pushFields(item) {
     if (item.scope !== scope() || !enabled('field_merge')) return queueResult('deferred', 'waiting for account/server capability');
     const spread = await get('spreads', item.local_id);
     if (!spread?.server_id) return queueResult('deferred', 'spread has no server id');
-    const data = await api(`/api/spreads/${spread.server_id}`, {method:'PATCH', json:item.payload});
+    const payload = await prepareFieldPayload(spread,item.payload);
+    const data = await api(`/api/spreads/${spread.server_id}`, {method:'PATCH', json:payload});
     assertScope(item.scope);
     const latest = await get('spreads', item.local_id);
     await put('spreads', {...latest, ...metadata(data.spread), revision:data.spread.revision,
@@ -1739,6 +1760,12 @@
     expectedSpreadCount:50,
     expectedLocalCountBefore:51,
     backendOrigin:'https://blocknot-proxy.mastif1235.workers.dev',
+    fieldRepairs:Object.freeze([
+      Object.freeze({queueId:782, localId:'mtwpwsgv6yctqj', serverId:'9204e6e2-040d-46cb-b57c-a5d122d145f7',
+        number:26, mine:'Пер пионерский', clientRef:'repair-field-782-title-v1'}),
+      Object.freeze({queueId:783, localId:'mtwppwd4f7po1n', serverId:'22f7dbe6-f34a-4f68-ac66-d39909f686cc',
+        number:8, mine:'Теплична', clientRef:'repair-field-783-title-v1'}),
+    ]),
   });
 
   function repair367Ordered(rows) {
@@ -1817,6 +1844,7 @@
     try { if (typeof v3LoadRecents === 'function') recents = v3LoadRecents(); }
     catch (error) { console.warn('Repair #367 could not read recents', error); }
     let serverSpreads = [], serverError = null;
+    const fieldServers = {}, fieldServerErrors = {};
     if (isOnline() && isAuthed() && notebook?.server_id === REPAIR_367.serverNotebookId
         && backendOrigin() === REPAIR_367.backendOrigin) {
       try {
@@ -1825,9 +1853,16 @@
       } catch (error) {
         serverError = String(error && error.message ? error.message : error);
       }
+      await Promise.all(REPAIR_367.fieldRepairs.map(async repair => {
+        try {
+          fieldServers[repair.queueId] = (await api(`/api/spreads/${encodeURIComponent(repair.serverId)}`))?.spread || null;
+        } catch (error) {
+          fieldServerErrors[repair.queueId] = String(error && error.message ? error.message : error);
+        }
+      }));
     }
     return {
-      notebook, queue, allSpreads, serverSpreads, serverError,
+      notebook, queue, allSpreads, serverSpreads, serverError, fieldServers, fieldServerErrors,
       photos, notes, spreadTags, favorites, notebooks, tags, photoBlobs, activity, recents,
       queue367:repair910Queue(queue, REPAIR_367.queueId),
       localSpreads:allSpreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at),
@@ -1840,9 +1875,45 @@
     return JSON.stringify(sanitizeDiagnosticValue({
       notebook:state.notebook, queue367:state.queue367, queue:state.queue,
       localSpreads:state.localSpreads, serverSpreads:state.serverSpreads,
+      fieldServers:state.fieldServers,
       canonicalRefs, legacyRefs,
       sharedServerActivity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
     }));
+  }
+
+  function repair367FieldAssessment(state, repair) {
+    const item = repair910Queue(state.queue,repair.queueId);
+    const local = state.allSpreads.find(row => row.id === repair.localId) || null;
+    const server = state.fieldServers[repair.queueId] || null;
+    const conflicts = storedConflicts(item);
+    const serverCopy = storedServerCopy(item);
+    const queueExact = !!item && item.entity === 'spread_fields' && item.local_id === repair.localId
+      && item.scope === scope() && item.payload?.changes?.title === repair.mine
+      && Object.keys(item.payload?.changes || {}).length === 1
+      && fieldValuesEquivalent('title',item.payload?.base_values?.title,'')
+      && item.last_error === 'field_conflict';
+    const localExact = !!local && local.server_id === repair.serverId && Number(local.number) === repair.number
+      && local.title === repair.mine && !local.deleted_at;
+    const storedConflictExact = !!conflicts?.title && fieldValuesEquivalent('title',conflicts.title.base,'')
+      && conflicts.title.mine === repair.mine && fieldValuesEquivalent('title',conflicts.title.server,null)
+      && !!serverCopy && serverCopy.id === repair.serverId && Number(serverCopy.revision) === 2
+      && fieldValuesEquivalent('title',serverCopy.title,null);
+    const freshEmpty = !!server && server.id === repair.serverId && Number(server.revision) === 2
+      && fieldValuesEquivalent('title',server.title,null) && server.client_ref === repair.localId && !server.deleted_at;
+    const freshMine = !!server && server.id === repair.serverId && Number(server.revision) >= 3
+      && server.title === repair.mine && server.client_ref === repair.localId && !server.deleted_at;
+    const completed = item?.status === 'done' && item.retired_reason === `Repair #367 field ${repair.queueId} confirmed`
+      && localExact && freshMine && Number(local.revision) === Number(server.revision);
+    const pending = item?.status === 'conflict' && queueExact && localExact && Number(local.revision) === 2
+      && storedConflictExact && (freshEmpty || freshMine);
+    return {
+      repair, item, local, server,
+      valid:completed || pending,
+      mode:completed ? 'complete' : pending ? (freshMine ? 'confirm_retry' : 'patch') : 'invalid',
+      detail:{queue_status:item?.status || null, local_revision:local?.revision ?? null,
+        server_revision:server?.revision ?? null, local_title:local?.title ?? null,
+        server_title:server?.title ?? null, server_error:state.fieldServerErrors[repair.queueId] || null},
+    };
   }
 
   async function buildRepair367Preview() {
@@ -1866,6 +1937,9 @@
       && localIds.every(id => serverIds.includes(id));
     const sameRelativeOrder = sameSet && repair367SameIds(localIds, serverIds);
     const serverOrderCorrect = sameRelativeOrder && serverShape.contiguous;
+    const fieldAssessments = REPAIR_367.fieldRepairs.map(repair => repair367FieldAssessment(state,repair));
+    const expectedUnfinished = new Set([String(REPAIR_367.queueId),
+      ...fieldAssessments.filter(row => row.mode !== 'complete').map(row => String(row.repair.queueId))]);
 
     repair910Check(checks, 'production backend', backendOrigin() === REPAIR_367.backendOrigin, backendOrigin());
     repair910Check(checks, 'online + authenticated', isOnline() && isAuthed(), {online:isOnline(), authenticated:isAuthed()});
@@ -1879,7 +1953,8 @@
       && state.queue367.local_id === REPAIR_367.localNotebookId && state.queue367.status === 'failed'
       && state.queue367.last_error === 'invalid_order' && Number(state.queue367.retry_count) > 0,
       state.queue367 ? explicitQueueFields(state.queue367) : null);
-    repair910Check(checks, 'only #367 unfinished', unfinished.length === 1 && String(unfinished[0].id) === String(REPAIR_367.queueId),
+    repair910Check(checks, 'only expected repair rows unfinished', unfinished.length === expectedUnfinished.size
+      && unfinished.every(item => expectedUnfinished.has(String(item.id))),
       unfinished.map(item => ({id:item.id, entity:item.entity, status:item.status, local_id:item.local_id || null})));
     repair910Check(checks, 'old payload is the known broken payload', payload.item_count === REPAIR_367.expectedSpreadCount
       && payload.unique_spread_ids === REPAIR_367.expectedSpreadCount - 1
@@ -1913,11 +1988,15 @@
         numbers:serverShape.numbers});
     repair910Check(checks, 'local/server spread sets match exactly', sameSet,
       {local_only:localIds.filter(id => !serverIds.includes(id)), server_only:serverIds.filter(id => !localIds.includes(id))});
+    for (const assessment of fieldAssessments) {
+      repair910Check(checks, `field repair #${assessment.repair.queueId} exact`, assessment.valid,
+        {...assessment.detail, mode:assessment.mode, local_id:assessment.repair.localId, server_id:assessment.repair.serverId});
+    }
 
     const eligible = checks.every(check => check.pass);
     const action = serverOrderCorrect ? 'retire_only' : 'fresh_reorder_then_retire';
     const backup = sanitizeDiagnosticValue({
-      created_at:nowISO(), purpose:'Repair #367 before-image; no spread, photo, blob, note or auth data is changed directly',
+      created_at:nowISO(), purpose:'Before-image for Repair #367 and field conflicts #782/#783; photos, blobs, notes and auth are never changed',
       queue_367:state.queue367, notebook:state.notebook,
       payload_analysis:payload,
       canonical_spread:canonical,
@@ -1925,6 +2004,8 @@
       canonical_references:canonicalRefs,
       legacy_references:legacyRefs,
       shared_server_activity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
+      field_repairs:fieldAssessments.map(assessment => ({queue:assessment.item, local_spread:assessment.local,
+        fresh_server:assessment.server, mode:assessment.mode})),
       local_order:repair367Ordered(state.localSpreads).map(row => ({local_id:row.id, server_id:row.server_id,
         number:row.number, title:row.title, revision:row.revision ?? null})),
       server_order:repair367Ordered(state.serverSpreads).map(row => ({server_id:row.id, client_ref:row.client_ref || null,
@@ -1937,12 +2018,13 @@
       comparison:{same_relative_order:sameRelativeOrder, server_numbers_contiguous:serverShape.contiguous,
         server_has_legacy_gap_32:serverShape.legacy_gap_32, action,
         local_rows_before:state.localSpreads.length, local_rows_after_legacy_retire:effectiveLocal.length,
-        legacy_reference_count:repair367ReferenceCount(legacyRefs)},
+        legacy_reference_count:repair367ReferenceCount(legacyRefs),
+        field_repairs:fieldAssessments.map(row => ({queue_id:row.repair.queueId, mode:row.mode}))},
       plan:action === 'retire_only'
         ? {action:'Retire only the proven legacy local spread, refresh canonical rows from the already-correct server order, then retire queue #367.'}
         : {action:'Retire the proven legacy local spread, build a new reorder from the remaining 50 rows and current server revisions/numbers, then retire #367 only after server success.',
           item_count:localIds.length, old_payload:'never reused'},
-      _state:state,
+      _state:state, _fieldAssessments:fieldAssessments,
     };
   }
 
@@ -1953,6 +2035,36 @@
         retired_at:nowISO(), retired_reason:'Repair #367 verified current order',
         retired_previous_error:expectedQueue.last_error || null}]};
     });
+  }
+
+  async function applyRepair367Field(assessment) {
+    if (assessment.mode === 'complete') return {queue_id:assessment.repair.queueId, status:'already_done'};
+    const repair = assessment.repair;
+    const fresh = (await api(`/api/spreads/${encodeURIComponent(repair.serverId)}`))?.spread;
+    if (!fresh || fresh.id !== repair.serverId || fresh.client_ref !== repair.localId || fresh.deleted_at
+        || !(fieldValuesEquivalent('title',fresh.title,null) && Number(fresh.revision) === 2
+          || fresh.title === repair.mine && Number(fresh.revision) >= 3)) {
+      throw new Error(`STOP: server state changed for field repair #${repair.queueId}`);
+    }
+    const data = await api(`/api/spreads/${encodeURIComponent(repair.serverId)}`, {method:'PATCH', json:{
+      client_ref:repair.clientRef, changes:{title:repair.mine}, base_values:{title:fresh.title},
+    }});
+    const server = data?.spread;
+    if (!server || server.id !== repair.serverId || server.title !== repair.mine
+        || Number(server.revision) < Number(fresh.revision) || server.deleted_at) {
+      throw new Error(`STOP: field repair #${repair.queueId} was not confirmed by server`);
+    }
+    await window.vNextAtomic('spreads',repair.localId,current => {
+      if (!current || current.server_id !== repair.serverId || current.title !== repair.mine || current.deleted_at) {
+        throw new Error(`STOP: local spread changed for field repair #${repair.queueId}`);
+      }
+      return {row:{...current, ...metadata(server), revision:server.revision, updated_at:server.updated_at || current.updated_at,
+        metadata_base:metadata(server), field_conflicts:null, fields_pending:false},
+      retired:[{...assessment.item, status:'done', next_attempt_at:null, last_error:null, conflicts:null,
+        retired_at:nowISO(), retired_reason:`Repair #367 field ${repair.queueId} confirmed`,
+        retired_previous_error:assessment.item.last_error || null}]};
+    });
+    return {queue_id:repair.queueId, status:'done', revision:server.revision, title:server.title};
   }
 
   async function applyRepair367(expectedGuard) {
@@ -1966,6 +2078,8 @@
       const preview = await buildRepair367Preview();
       if (!preview.eligible || preview.guard !== expectedGuard) throw new Error('STOP: состояние изменилось после Preview; ничего не применено');
       const state = preview._state;
+      const fieldResults = [];
+      for (const assessment of preview._fieldAssessments) fieldResults.push(await applyRepair367Field(assessment));
       const canonicalBefore = state.localSpreads.find(row => row.id === REPAIR_367.canonicalLocalId);
       deletedLegacy = state.localSpreads.find(row => row.id === REPAIR_367.legacyLocalId);
       const effectiveLocal = state.localSpreads.filter(row => row.id !== REPAIR_367.legacyLocalId);
@@ -2027,7 +2141,8 @@
         spread_count:synchronizedLocal.length, unique_server_ids:new Set(synchronizedLocal.map(row => row.server_id)).size,
         numbers_contiguous:repair367NumberShape(synchronizedLocal).contiguous,
         canonical_preserved:synchronizedLocal.some(row => row.id === REPAIR_367.canonicalLocalId),
-        legacy_removed:!synchronizedLocal.some(row => row.id === REPAIR_367.legacyLocalId), data_preserved:true,
+        legacy_removed:!synchronizedLocal.some(row => row.id === REPAIR_367.legacyLocalId),
+        field_repairs:fieldResults, data_preserved:true,
       };
     } catch (error) {
       if (deletedLegacy && !repairCommitted && !(await get('spreads', REPAIR_367.legacyLocalId))) {
@@ -2044,7 +2159,7 @@
     let preview = null, copiedGuard = null;
     const {el,close} = openSheet(`<div class="sheet-handle"></div><div class="v352-diag-head">
       <h2>Repair #367</h2><button class="icon-btn" data-r367-close aria-label="Закрыть Repair #367">✕</button></div>
-      <p class="warn-box">Временный инструмент только для failed spread_order #367. Старый payload никогда не повторяется.</p>
+      <p class="warn-box">Временный инструмент только для spread_order #367 и подтверждённых field conflicts #782/#783. Старый payload #367 никогда не повторяется.</p>
       <button class="btn-secondary" data-r367-preview>Preview / READ-ONLY</button>
       <div data-r367-report></div>
       <details hidden data-r367-backup-wrap><summary>Backup JSON</summary><pre data-r367-backup></pre></details>
@@ -2164,7 +2279,7 @@
     assessLegacySpreadConflict, safeResolveDuplicateSpreadConflicts, notebookConflictGroups, resolveNotebookConflict, reconcileNotebookConflicts,
     buildReadOnlyDiagnosticReport, checkSpreadOnServerReadOnly, openReadOnlySyncDiagnostics,
     buildRepair910Preview, applyRepair910, repair910OrderedRows,
-    buildRepair367Preview, applyRepair367};
+    buildRepair367Preview, applyRepair367, fieldValuesEquivalent, prepareFieldPayload};
   window.vNextSync = {scope, enabled, metadata, saveNote, noteConflict, resolveNote, saveFields, applyTeamChanges, cacheNote, requestRemoteRefresh};
   window.v350OpenSyncDiagnostics = openReadOnlySyncDiagnostics;
   window.v350BuildSyncDiagnosticReport = buildReadOnlyDiagnosticReport;

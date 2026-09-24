@@ -741,6 +741,56 @@ async function testRepair910StopsIfStateChangesAfterPreview() {
   assert.equal(runtime.db.sync_queue.get(287).status, 'conflict');
 }
 
+async function testNullableTextConflictNormalization() {
+  const runtime = createRuntime({
+    settings:{team_capabilities:{scope:'https://example.test|u1',flags:{field_merge:true}}},
+    spreads:[{id:'nullable-local',server_id:'nullable-server',notebook_id:'nb',number:26,
+      title:'Пер пионерский',note_short:null,note_full:null,revision:2,current_photo_id:'photo-kept'}],
+    sync_queue:[{id:782,entity:'spread_fields',local_id:'nullable-local',server_id:'nullable-server',
+      scope:'https://example.test|u1',status:'pending',retry_count:0,
+      payload:{client_ref:'nullable-test',changes:{title:'Пер пионерский'},base_values:{title:''}}}],
+  });
+  const sync = runtime.context.window.v340Sync;
+  assert.equal(sync.fieldValuesEquivalent('title','',null),true);
+  assert.equal(sync.fieldValuesEquivalent('note_short',null,''),true);
+  assert.equal(sync.fieldValuesEquivalent('note_full','Локально','Сервер'),false);
+  assert.equal(sync.fieldValuesEquivalent('status','',null),false);
+  let patchPayload = null;
+  runtime.setApi(async (path,options) => {
+    assert.equal(path,'/api/spreads/nullable-server');
+    if (!options) return {spread:{id:'nullable-server',title:null,revision:2,deleted_at:null}};
+    patchPayload = structuredClone(options.json);
+    return {spread:{id:'nullable-server',number:26,title:'Пер пионерский',status:'Актуально',
+      note_short:null,note_full:null,revision:3,current_photo_id:'server-photo',deleted_at:null}};
+  });
+  await runtime.context.pushEntityQueue(false);
+  assert.equal(patchPayload.base_values.title,null,'empty base uses the exact fresh server representation');
+  assert.equal(runtime.db.sync_queue.get(782).payload.base_values.title,'','stored queue backup remains unchanged');
+  assert.equal(runtime.db.sync_queue.get(782).status,'done','queue closes only after confirmed PATCH');
+  assert.equal(runtime.db.spreads.get('nullable-local').title,'Пер пионерский');
+  assert.equal(runtime.db.spreads.get('nullable-local').current_photo_id,'photo-kept');
+
+  const realConflict = createRuntime({
+    settings:{team_capabilities:{scope:'https://example.test|u1',flags:{field_merge:true}}},
+    spreads:[{id:'real-local',server_id:'real-server',notebook_id:'nb',title:'Моё',revision:2}],
+    sync_queue:[{id:900,entity:'spread_fields',local_id:'real-local',server_id:'real-server',
+      scope:'https://example.test|u1',status:'pending',retry_count:0,
+      payload:{changes:{title:'Моё'},base_values:{title:''}}}],
+  });
+  let sentBase;
+  realConflict.setApi(async (path,options) => {
+    if (!options) return {spread:{id:'real-server',title:'Чужое',revision:3,deleted_at:null}};
+    sentBase = options.json.base_values.title;
+    const error = new Error('field_conflict'); error.status = 409;
+    error.data = {conflicts:{title:{base:'',mine:'Моё',server:'Чужое'}}};
+    throw error;
+  });
+  await realConflict.context.pushEntityQueue(false);
+  assert.equal(sentBase,'','different nonempty server text must not be normalized away');
+  assert.equal(realConflict.db.sync_queue.get(900).status,'conflict');
+  assert.equal(realConflict.db.spreads.get('real-local').title,'Моё');
+}
+
 function repair367Fixture({serverContiguous = false} = {}) {
   const backend = 'https://blocknot-proxy.mastif1235.workers.dev';
   const localNotebookId = 'mtk0pu3k5wrwma';
@@ -762,40 +812,79 @@ function repair367Fixture({serverContiguous = false} = {}) {
     expected_number:index < 31 ? index + 1 : index + 2}));
   brokenItems[brokenItems.length - 1].spread_id = duplicatedId;
   localSpreads.push({...localSpreads[0], id:duplicatedId});
+  const fieldRepairs = [
+    {queueId:782, localId:'mtwpwsgv6yctqj', serverId:'9204e6e2-040d-46cb-b57c-a5d122d145f7',
+      number:26, mine:'Пер пионерский'},
+    {queueId:783, localId:'mtwppwd4f7po1n', serverId:'22f7dbe6-f34a-4f68-ac66-d39909f686cc',
+      number:8, mine:'Теплична'},
+  ];
+  const fieldServers = Object.fromEntries(fieldRepairs.map(repair => [repair.serverId, {
+    id:repair.serverId, notebook_id:'8acccef3-4747-4bda-b7da-ad97fedf7d83', number:repair.number,
+    title:null, status:'Актуально', note_short:null, note_full:null, revision:2,
+    current_photo_id:`server-photo-${repair.queueId}`, client_ref:repair.localId, deleted_at:null,
+  }]));
+  localSpreads.push(...fieldRepairs.map(repair => ({
+    id:repair.localId, server_id:repair.serverId, notebook_id:'mtwpkdb563vhqm', number:repair.number,
+    title:repair.mine, status:'Актуально', note_short:null, note_full:null, revision:2,
+    current_photo_id:`local-photo-${repair.queueId}`, deleted_at:null,
+    fields_pending:true, field_conflicts:{title:{base:'', mine:repair.mine, server:null}},
+  })));
   return {
-    backend, localNotebookId, serverNotebookId, duplicatedId, serverSpreads,
+    backend, localNotebookId, serverNotebookId, duplicatedId, serverSpreads, fieldRepairs, fieldServers,
     seed:{
-      settings:{backend_url:backend, team_capabilities:{scope:`${backend}|u1`, flags:{spread_order:true}}},
-      notebooks:[{id:localNotebookId, server_id:serverNotebookId, title:'Notebook #367'}],
+      settings:{backend_url:backend, team_capabilities:{scope:`${backend}|u1`, flags:{spread_order:true, field_merge:true}}},
+      notebooks:[{id:localNotebookId, server_id:serverNotebookId, title:'Notebook #367'},
+        {id:'mtwpkdb563vhqm', server_id:'8acccef3-4747-4bda-b7da-ad97fedf7d83', title:'Field repairs'}],
       spreads:localSpreads,
       sync_queue:[{id:367, entity:'spread_order', local_id:localNotebookId, scope:`${backend}|u1`,
-        status:'failed', retry_count:97, last_error:'invalid_order', payload:{client_ref:'broken-367', items:brokenItems}}],
+        status:'failed', retry_count:110, last_error:'invalid_order', payload:{client_ref:'broken-367', items:brokenItems}},
+      ...fieldRepairs.map(repair => ({id:repair.queueId, entity:'spread_fields', local_id:repair.localId,
+        server_id:repair.serverId, scope:`${backend}|u1`, status:'conflict', retry_count:0,
+        last_error:'field_conflict', payload:{client_ref:`old-${repair.queueId}`, changes:{title:repair.mine},
+          base_values:{title:''}}, conflicts:{conflicts:{title:{base:'', mine:repair.mine, server:null}},
+          server_copy:structuredClone(fieldServers[repair.serverId])}}))],
     },
   };
+}
+
+function installRepair367Api(runtime, fixture, {serverContiguous = false} = {}) {
+  let orderSpreads = structuredClone(fixture.serverSpreads);
+  const fieldServers = structuredClone(fixture.fieldServers);
+  const calls = [];
+  runtime.setApi(async (path, options) => {
+    calls.push({path, options:structuredClone(options)});
+    if (path === `/api/notebooks/${fixture.serverNotebookId}/spreads`) return {spreads:structuredClone(orderSpreads)};
+    const fieldRepair = fixture.fieldRepairs.find(repair => path === `/api/spreads/${repair.serverId}`);
+    if (fieldRepair) {
+      if (!options) return {spread:structuredClone(fieldServers[fieldRepair.serverId])};
+      assert.equal(options.method, 'PATCH');
+      assert.deepEqual(JSON.parse(JSON.stringify(options.json.changes)), {title:fieldRepair.mine});
+      assert.equal(options.json.base_values.title, null, 'repair must use the fresh server null as optimistic base');
+      const current = fieldServers[fieldRepair.serverId];
+      fieldServers[fieldRepair.serverId] = {...current, title:fieldRepair.mine, revision:current.revision + 1};
+      return {spread:structuredClone(fieldServers[fieldRepair.serverId])};
+    }
+    assert.equal(path, `/api/notebooks/${fixture.serverNotebookId}/spreads/order`);
+    assert.equal(options.method, 'PUT');
+    assert.equal(serverContiguous, false, 'already-correct order must not be written');
+    assert.equal(options.json.client_ref, 'repair-spread-order-367-v1');
+    assert.equal(options.json.items.length, 50);
+    assert.equal(new Set(options.json.items.map(row => row.spread_id)).size, 50, 'fresh reorder cannot contain duplicate IDs');
+    assert.notEqual(options.json.client_ref, 'broken-367', 'old payload identity cannot be reused');
+    orderSpreads = options.json.items.map((item,index) => {
+      const current = orderSpreads.find(row => row.id === item.spread_id);
+      return {...current, number:index + 1, revision:current.revision + 1};
+    });
+    return {spreads:structuredClone(orderSpreads)};
+  });
+  return {calls, fieldServers};
 }
 
 async function testRepair367PreviewAndFreshReorder() {
   const fixture = repair367Fixture();
   const runtime = createRuntime(fixture.seed);
-  let serverSpreads = structuredClone(fixture.serverSpreads);
-  let putCalls = 0;
+  const api = installRepair367Api(runtime,fixture);
   const before = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
-  runtime.setApi(async (path, options) => {
-    if (!options) return {spreads:structuredClone(serverSpreads)};
-    assert.equal(path, `/api/notebooks/${fixture.serverNotebookId}/spreads/order`);
-    assert.equal(options.method, 'PUT');
-    putCalls++;
-    assert.equal(options.json.client_ref, 'repair-spread-order-367-v1');
-    assert.equal(options.json.items.length, 50);
-    assert.equal(new Set(options.json.items.map(row => row.spread_id)).size, 50, 'fresh reorder cannot contain duplicate IDs');
-    assert.notEqual(options.json.client_ref, 'broken-367', 'old payload identity cannot be reused');
-    const desiredIds = options.json.items.map(row => row.spread_id);
-    serverSpreads = desiredIds.map((id,index) => {
-      const current = serverSpreads.find(row => row.id === id);
-      return {...current, number:index + 1, revision:current.revision + 1};
-    });
-    return {spreads:structuredClone(serverSpreads)};
-  });
   const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
   assert.equal(preview.eligible, true);
   assert.equal(preview.notebook.local_id, fixture.localNotebookId);
@@ -808,17 +897,26 @@ async function testRepair367PreviewAndFreshReorder() {
   assert.equal(preview.backup.canonical_spread.id, 'mtk12qcznnzdex');
   assert.equal(preview.backup.legacy_spread.id, fixture.duplicatedId);
   assert.equal(preview.backup.queue_367.id, 367);
-  assert.equal(putCalls, 0, 'Preview must be GET-only');
+  assert.equal(api.calls.filter(call => call.options).length, 0, 'Preview must be GET-only');
   const afterPreview = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
   assert.deepEqual(afterPreview, before, 'Preview must not mutate local data');
   const result = await runtime.context.window.v340Sync.applyRepair367(preview.guard);
   assert.equal(result.completed, true);
   assert.equal(result.action, 'fresh_reorder_then_retire');
-  assert.equal(putCalls, 1);
+  assert.equal(api.calls.filter(call => call.options?.method === 'PUT').length, 1);
+  assert.equal(api.calls.filter(call => call.options?.method === 'PATCH').length, 2);
   assert.equal(runtime.db.sync_queue.get(367).status, 'done');
-  assert.equal(runtime.db.spreads.size, 50);
+  assert.equal(runtime.db.sync_queue.get(782).status, 'done');
+  assert.equal(runtime.db.sync_queue.get(783).status, 'done');
+  assert.equal(runtime.db.spreads.size, 52);
   assert.equal(runtime.db.spreads.has(fixture.duplicatedId), false);
   assert.equal(runtime.db.spreads.has('mtk12qcznnzdex'), true);
+  for (const repair of fixture.fieldRepairs) {
+    const local = runtime.db.spreads.get(repair.localId);
+    assert.equal(local.title, repair.mine);
+    assert.equal(local.revision, 3);
+    assert.equal(local.current_photo_id, `local-photo-${repair.queueId}`);
+  }
   assert.equal(runtime.db.photos.size, 0);
   assert.equal(runtime.db.blobs.size, 0);
 }
@@ -826,17 +924,14 @@ async function testRepair367PreviewAndFreshReorder() {
 async function testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect() {
   const fixture = repair367Fixture({serverContiguous:true});
   const runtime = createRuntime(fixture.seed);
-  let mutations = 0;
-  runtime.setApi(async (path, options) => {
-    if (options) mutations++;
-    return {spreads:structuredClone(fixture.serverSpreads)};
-  });
+  const api = installRepair367Api(runtime,fixture,{serverContiguous:true});
   const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
   assert.equal(preview.eligible, true);
   assert.equal(preview.comparison.action, 'retire_only');
   const result = await runtime.context.window.v340Sync.applyRepair367(preview.guard);
   assert.equal(result.action, 'retire_only');
-  assert.equal(mutations, 0);
+  assert.equal(api.calls.filter(call => call.options?.method === 'PUT').length, 0);
+  assert.equal(api.calls.filter(call => call.options?.method === 'PATCH').length, 2);
   assert.equal(runtime.db.sync_queue.get(367).status, 'done');
 }
 
@@ -878,6 +973,7 @@ async function testRepair367StopsWhenLegacyHasAReference() {
 await testRepair910PreviewIsReadOnly();
 await testRepair910ApplyTouchesOnly286And287();
 await testRepair910StopsIfStateChangesAfterPreview();
+await testNullableTextConflictNormalization();
 await testRepair367PreviewAndFreshReorder();
 await testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect();
 await testRepair367StopsOnAmbiguousMapping();
