@@ -837,7 +837,8 @@ function repair367Fixture({serverContiguous = false} = {}) {
   }));
   const brokenItems = serverSpreads.map((row,index) => ({spread_id:row.id, expected_revision:row.revision,
     expected_number:index < 31 ? index + 1 : index + 2}));
-  brokenItems[brokenItems.length - 1].spread_id = duplicatedId;
+  brokenItems.push({spread_id:duplicatedId, expected_revision:serverSpreads[0].revision,
+    expected_number:51});
   localSpreads[0].current_photo_id = 'mtkfmkwy79s1w8';
   localSpreads.push({...localSpreads[0], id:duplicatedId});
   const legacyPhotos = Array.from({length:7},(_,index) => ({
@@ -936,6 +937,12 @@ async function testRepair367PreviewAndFreshReorder() {
   const api = installRepair367Api(runtime,fixture);
   const before = structuredClone(Object.fromEntries(Object.entries(runtime.db).map(([key,value]) => [key,[...value.entries()]])));
   const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+  assert.deepEqual(JSON.parse(JSON.stringify(preview.backup.payload_analysis)),{
+    item_count:51,unique_spread_ids:50,
+    duplicates:[{spread_id:fixture.duplicatedId,count:2}],
+    missing_expected_number_32:true,known_duplicate_count:2,
+  });
+  assert.equal(preview.checks.find(check => check.key === 'old payload is the known broken payload').pass,true);
   assert.equal(preview.eligible, true);
   assert.equal(preview.notebook.local_id, fixture.localNotebookId);
   assert.equal(preview.notebook.server_id, fixture.serverNotebookId);
@@ -994,6 +1001,23 @@ async function testRepair367PreviewAndFreshReorder() {
   for (const event of fixture.seed.activity_events) {
     assert.deepEqual(runtime.db.activity_events.get(event.cache_id),event,
       'server activity spread_id/entity_id and all event metadata remain byte-equivalent');
+  }
+}
+
+async function testRepair367RejectsOtherBrokenPayloads() {
+  for (const change of [
+    items => items.pop(), // 50 rows / 50 IDs, not the production #367 shape.
+    items => { items[items.length - 1].spread_id = items[1].spread_id; }, // Wrong duplicate ID.
+    items => { items[items.length - 1].expected_number = 32; }, // No missing 32.
+  ]) {
+    const fixture = repair367Fixture();
+    change(fixture.seed.sync_queue[0].payload.items);
+    const runtime = createRuntime(fixture.seed);
+    const api = installRepair367Api(runtime,fixture);
+    const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+    assert.equal(preview.checks.find(check => check.key === 'old payload is the known broken payload').pass,false);
+    assert.equal(preview.eligible,false);
+    assert.equal(api.calls.filter(call => call.options).length,0,'rejected payload must remain read-only');
   }
 }
 
@@ -1092,6 +1116,7 @@ await testRepair910ApplyTouchesOnly286And287();
 await testRepair910StopsIfStateChangesAfterPreview();
 await testNullableTextConflictNormalization();
 await testRepair367PreviewAndFreshReorder();
+await testRepair367RejectsOtherBrokenPayloads();
 await testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect();
 await testRepair367StopsOnAmbiguousMapping();
 await testRepair367StopsWhenLegacyHasAReference();
