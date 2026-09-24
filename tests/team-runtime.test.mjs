@@ -440,6 +440,102 @@ try {
   assert.equal(diagnostic.spreadUnchanged,true,'safe cleanup does not change spread or current photo');
   assert.equal(diagnostic.onlyGets,true,'safe cleanup uses only read-only spread GET requests');
   assert.equal(diagnostic.syncCalls,0,'opening diagnostics does not start fullSync');
+  const historyUnread = await page.evaluate(async () => {
+    const originalApi = api;
+    settings.backend_url = 'https://history-test.invalid'; settings.user_id = 'u1';
+    settings.team_capabilities = {scope:window.vNextSync.scope(),flags:{activity:true,activity_seen:true,activity_spread_seen:true}};
+    const scope = window.vNextSync.scope();
+    const rows = [
+      {id:'unread-20',seq:20,spread_id:'remote-s1'},
+      {id:'read-19',seq:19,spread_id:'remote-s2'},
+      {id:'unread-18',seq:18,spread_id:null},
+      {id:'read-9',seq:9,spread_id:'remote-s1'},
+    ].map(row => ({...row,cache_id:scope+'|'+row.id,scope,notebook_id:'remote-nb',
+      actor_display_name:'Участник',action:'spread.updated',created_at:'2026-09-24T12:00:00Z'}));
+    for (const row of rows) await put('activity_events',row);
+    let cursors={notebooks:{'remote-nb':10},spreads:{'remote-s1':10,'remote-s2':19}};
+    let unread={notebooks:{'remote-nb':{count:2,max_seq:20}},spreads:{'remote-s1':{count:1,max_seq:20}},total:2};
+    api=async (path,options) => {
+      if(path==='/api/activity/read-cursors') return {cursors:structuredClone(cursors)};
+      if(path==='/api/activity/unread') return {unread:structuredClone(unread)};
+      if(path.includes('/activity/seen') && options?.method==='PUT') {
+        cursors={notebooks:{'remote-nb':20},spreads:{'remote-s1':20,'remote-s2':20}};
+        unread={notebooks:{},spreads:{},total:0};
+        return {unread:structuredClone(unread)};
+      }
+      if(path.includes('/activity?')) return {events:[],legacy_events:[]};
+      return originalApi(path,options);
+    };
+    await window.v340ApplyUnread(unread);
+    await window.v340OpenGlobalHistory();
+    const state = () => ({ids:[...document.querySelectorAll('[data-server-history] .v340-history-row')]
+      .map(item => item.dataset.eventId),
+      unread:[...document.querySelectorAll('[data-server-history] .v340-history-unread')].length,
+      dots:[...document.querySelectorAll('[data-server-history] .v340-history-unread-dot')].length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null});
+    const before=state();
+    const button=document.querySelector('[data-mark-all]');await button.onclick({target:button});
+    const after=state();
+    document.querySelector('[data-history-close]')?.click();
+    api=originalApi;
+    return {before,after,scope};
+  });
+  assert.equal(historyUnread.before.badge,'2');
+  assert.equal(historyUnread.before.unread,2);
+  assert.equal(historyUnread.before.dots,2);
+  assert.deepEqual(historyUnread.before.ids,['unread-20','unread-18','read-19','read-9'],
+    'unread first, newest first inside both groups');
+  assert.equal(historyUnread.after.badge,null,'mark all hides the badge');
+  assert.equal(historyUnread.after.unread,0,'mark all clears unread markers');
+  assert.equal(historyUnread.after.dots,0);
+  await page.reload();
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined');
+  const historyReload = await page.evaluate(async expectedScope => {
+    const originalApi=api;
+    fullSync=async()=>{};
+    const cursors={notebooks:{'remote-nb':20},spreads:{'remote-s1':20,'remote-s2':20}};
+    let unread={notebooks:{},spreads:{},total:0};
+    api=async (path,options) => {
+      if(path==='/api/activity/read-cursors') return {cursors:structuredClone(cursors)};
+      if(path==='/api/activity/unread') return {unread:structuredClone(unread)};
+      if(path.includes('/activity/seen') && options?.method==='PUT') {
+        cursors.notebooks['remote-nb']=21;
+        unread={notebooks:{},spreads:{},total:0};
+        return {unread:structuredClone(unread)};
+      }
+      if(path.includes('/activity?')) return {events:[],legacy_events:[]};
+      return originalApi(path,options);
+    };
+    const scope=window.vNextSync.scope();
+    await window.v340OpenGlobalHistory();
+    const persisted={scope,storedScope:settings.activity_read_cursors?.scope,
+      unread:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
+    document.querySelector('[data-history-close]')?.click();
+    const row={id:'new-21',cache_id:scope+'|new-21',scope,notebook_id:'remote-nb',spread_id:null,seq:21,
+      actor_display_name:'Участник',action:'notebook.updated',created_at:'2026-09-24T13:00:00Z'};
+    await put('activity_events',row);
+    unread={notebooks:{'remote-nb':{count:1,max_seq:21,level:1}},spreads:{},total:1};
+    await window.v340ApplyUnread(unread);
+    await window.v340OpenGlobalHistory();
+    const first=document.querySelector('[data-server-history] .v340-history-row');
+    const fresh={id:first?.dataset.eventId,dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
+    const button=first?.querySelector('[data-mark-notebook]');
+    if(button) button.click();
+    await new Promise(resolve=>setTimeout(resolve,80));
+    const notebook={badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null,
+      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length};
+    document.querySelector('[data-history-close]')?.click();
+    api=originalApi;
+    return {expectedScope,persisted,fresh,notebook};
+  },historyUnread.scope);
+  assert.equal(historyReload.persisted.scope,historyUnread.scope);
+  assert.equal(historyReload.persisted.storedScope,historyUnread.scope);
+  assert.equal(historyReload.persisted.unread,0,'read state survives reload');
+  assert.equal(historyReload.persisted.badge,null);
+  assert.deepEqual(historyReload.fresh,{id:'new-21',dots:1,badge:'1'},'one later event is unread and first');
+  assert.deepEqual(historyReload.notebook,{badge:null,dots:0},'read whole notebook refreshes global badge');
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

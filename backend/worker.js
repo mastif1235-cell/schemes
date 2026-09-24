@@ -1270,6 +1270,33 @@ on('GET', '/api/activity/unread', async (request, env) => {
   return json({unread: await unreadForUser(env, u.userId)});
 });
 
+// Read-only per-user cursors let history classify each cached event without changing events.
+on('GET', '/api/activity/read-cursors', async (request, env) => {
+  const u = await requireAuth(request, env);
+  const cursors = {notebooks:{}, spreads:{}};
+  if (!(await hasCoverSchema(env))) return err(503, 'seen_not_available');
+  const access = await env.DB.prepare(
+    `SELECT notebook_id FROM notebook_members WHERE user_id=? AND revoked_at IS NULL
+     UNION SELECT id AS notebook_id FROM notebooks WHERE owner_id=? AND deleted_at IS NULL`
+  ).bind(u.userId, u.userId).all();
+  const ids = access.results.map(row => row.notebook_id);
+  if (!ids.length) return json({cursors});
+  const ph = ids.map(() => '?').join(',');
+  const notebookRows = await env.DB.prepare(
+    `SELECT notebook_id, last_seen_seq FROM activity_seen WHERE user_id=? AND notebook_id IN (${ph})`
+  ).bind(u.userId, ...ids).all();
+  for (const row of notebookRows.results) cursors.notebooks[row.notebook_id] = Number(row.last_seen_seq) || 0;
+  if (await hasSpreadSeenSchema(env)) {
+    const spreadRows = await env.DB.prepare(
+      `SELECT ss.spread_id, ss.last_seen_seq FROM activity_spread_seen ss
+       JOIN spreads sp ON sp.id=ss.spread_id
+       WHERE ss.user_id=? AND sp.notebook_id IN (${ph})`
+    ).bind(u.userId, ...ids).all();
+    for (const row of spreadRows.results) cursors.spreads[row.spread_id] = Number(row.last_seen_seq) || 0;
+  }
+  return json({cursors});
+});
+
 // Per-spread read cursor: opening one spread clears only that spread's unread.
 on('PUT', '/api/spreads/:id/activity/seen', async (request, env, p) => {
   const u = await requireAuth(request, env);
