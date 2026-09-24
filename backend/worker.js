@@ -72,6 +72,11 @@ async function authenticate(request, env) {
   ).bind(hash).first();
   if (!row || row.revoked_at || new Date(row.expires_at) < new Date()) return null;
   env.DB.prepare('UPDATE sessions SET last_used_at=? WHERE id=?').bind(nowISO(), row.session_id).run().catch(() => {});
+  // Sliding renewal: an actively used session never reaches the 180-day wall.
+  if (new Date(row.expires_at) < new Date(Date.now() + 1000 * 60 * 60 * 24 * 90)) {
+    env.DB.prepare('UPDATE sessions SET expires_at=? WHERE id=? AND revoked_at IS NULL')
+      .bind(new Date(Date.now() + 1000 * 60 * 60 * 24 * 180).toISOString(), row.session_id).run().catch(() => {});
+  }
   return { userId: row.user_id, sessionId: row.session_id, displayName: row.display_name };
 }
 async function requireAuth(request, env) {
@@ -106,6 +111,38 @@ function requiredText(value, field, maxLength = 10000) {
   if (!text) throw new HttpError(400, `${field}_required`);
   if (text.length > maxLength) throw new HttpError(400, `${field}_too_long`);
   return text;
+}
+
+// Defense in depth: member-controlled text/number fields are validated before they are stored,
+// because several clients render spread number/status without escaping.
+function optionalText(value, field, maxLength = 10000) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') throw new HttpError(400, `${field}_invalid`);
+  if (value.length > maxLength) throw new HttpError(400, `${field}_too_long`);
+  return value;
+}
+
+function validateSpreadNumber(value) {
+  if (!Number.isSafeInteger(value) || value < 1) throw new HttpError(400, 'number_invalid');
+  return value;
+}
+
+function validateSpreadStatus(value) {
+  if (typeof value !== 'string' || !value.trim()) throw new HttpError(400, 'status_required');
+  if (value.length > 10000) throw new HttpError(400, 'status_too_long');
+  return value;
+}
+
+// Large previews broke the upload with "Maximum call stack size exceeded" when spread-call
+// argument limits were hit; chunked conversion is robust for any buffer size.
+function base64FromBuffer(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + CHUNK));
+  }
+  return btoa(binary);
 }
 
 function requiredClientRef(value) {
@@ -529,6 +566,9 @@ on('GET', '/api/notebooks', async (request, env) => {
 on('POST', '/api/notebooks', async (request, env) => {
   const u = await requireAuth(request, env);
   const body = await request.json();
+  optionalText(body.title, 'title');
+  optionalText(body.description, 'description');
+  if (body.sort_order !== undefined && body.sort_order !== null && !Number.isFinite(body.sort_order)) throw new HttpError(400, 'sort_order_invalid');
   if (body.client_ref) {
     const existing = await env.DB.prepare('SELECT * FROM notebooks WHERE created_by=? AND client_ref=?').bind(u.userId, body.client_ref).first();
     if (existing) return json({ notebook: existing });
@@ -566,6 +606,9 @@ on('PATCH', '/api/notebooks/:id', async (request, env, p) => {
   const body = await request.json();
   const current = await env.DB.prepare('SELECT * FROM notebooks WHERE id=?').bind(p.id).first();
   if (!current) return err(404, 'not_found');
+  optionalText(body.title, 'title');
+  optionalText(body.description, 'description');
+  if (body.sort_order !== undefined && body.sort_order !== null && !Number.isFinite(body.sort_order)) throw new HttpError(400, 'sort_order_invalid');
   if (body.revision !== undefined && body.revision !== current.revision) {
     return json({ error: 'conflict', server_copy: current }, 409);
   }
@@ -601,6 +644,25 @@ on('DELETE', '/api/notebooks/:id', async (request, env, p) => {
       action:'notebook.deleted', seq, clientRef:'notebook-delete:'+seq})]);
   await logHistory(env, { notebook_id: p.id, entity: 'notebook', entity_id: p.id, user_id: u.userId, action: 'notebook_deleted' });
   return json({ ok: true });
+});
+
+// Restore is the inverse of DELETE: tombstone is cleared, children are untouched (they were
+// never hard-deleted), and repeated calls are idempotent no-ops for lost-response retries.
+on('POST', '/api/notebooks/:id/restore', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  await requireMembership(env, u.userId, p.id, true);
+  const current = await env.DB.prepare('SELECT * FROM notebooks WHERE id=?').bind(p.id).first();
+  if (!current) return err(404, 'not_found');
+  if (!current.deleted_at) return json({ notebook: current, restored: false });
+  const seq = await nextSeq(env);
+  await env.DB.batch([
+    env.DB.prepare('UPDATE notebooks SET deleted_at=NULL, deleted_by=NULL, updated_at=?, revision=revision+1, seq=? WHERE id=? AND deleted_at IS NOT NULL')
+      .bind(nowISO(), seq, p.id),
+    activityStatement(env, {notebookId:p.id, entity:'notebook', entityId:p.id, actorUserId:u.userId,
+      action:'notebook.restored', seq, clientRef:'notebook-restore:'+seq})]);
+  await logHistory(env, { notebook_id: p.id, entity: 'notebook', entity_id: p.id, user_id: u.userId, action: 'notebook_restored' });
+  const restored = await env.DB.prepare('SELECT * FROM notebooks WHERE id=?').bind(p.id).first();
+  return json({ notebook: restored, restored: true });
 });
 
 on('GET', '/api/notebooks/:id/snapshot', async (request, env, p) => {
@@ -686,6 +748,11 @@ on('POST', '/api/notebooks/:id/spreads', async (request, env, p) => {
   const u = await requireAuth(request, env);
   await requireMembership(env, u.userId, p.id);
   const body = await request.json();
+  validateSpreadNumber(body.number);
+  optionalText(body.title, 'title');
+  optionalText(body.note_short, 'note_short');
+  optionalText(body.note_full, 'note_full');
+  if (body.status !== undefined && body.status !== null) validateSpreadStatus(body.status);
   if (body.client_ref) {
     const existing = await env.DB.prepare('SELECT * FROM spreads WHERE created_by=? AND client_ref=?').bind(u.userId, body.client_ref).first();
     if (existing) return json({ spread: existing });
@@ -780,6 +847,11 @@ on('PATCH', '/api/spreads/:id', async (request, env, p) => {
   const body = await request.json();
   if (Object.hasOwn(body, 'current_photo_id')) return err(400, 'photo_not_metadata');
   if (body.changes !== undefined) return patchSpreadFields(env, u, p.id, body);
+  if (body.number !== undefined) validateSpreadNumber(body.number);
+  optionalText(body.title, 'title');
+  optionalText(body.note_short, 'note_short');
+  optionalText(body.note_full, 'note_full');
+  if (body.status !== undefined) validateSpreadStatus(body.status);
   if (body.revision !== undefined && body.revision !== current.revision) {
     return json({ error: 'conflict', server_copy: current }, 409);
   }
@@ -825,6 +897,32 @@ on('DELETE', '/api/spreads/:id', async (request, env, p) => {
       actorUserId:u.userId, action:'spread.deleted', seq, clientRef:'spread-delete:'+seq})]);
   await logHistory(env, { notebook_id: current.notebook_id, entity: 'spread', entity_id: p.id, user_id: u.userId, action: 'spread_deleted' });
   return json({ ok: true });
+});
+
+// Restore clears the tombstone only: photos/notes/tags/current_photo_id were never touched
+// by DELETE, so nothing else needs rewriting. Idempotent for retry and lost-response safety.
+on('POST', '/api/spreads/:id/restore', async (request, env, p) => {
+  const u = await requireAuth(request, env);
+  const current = await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(p.id).first();
+  if (!current) return err(404, 'not_found');
+  await requireMembership(env, u.userId, current.notebook_id);
+  if (!current.deleted_at) return json({ spread: current, restored: false });
+  const parent = await env.DB.prepare('SELECT deleted_at FROM notebooks WHERE id=?').bind(current.notebook_id).first();
+  if (parent && parent.deleted_at) return err(409, 'notebook_deleted');
+  const seq = await nextSeq(env);
+  try {
+    await env.DB.batch([
+      env.DB.prepare('UPDATE spreads SET deleted_at=NULL, deleted_by=NULL, updated_by=?, updated_at=?, revision=revision+1, seq=? WHERE id=? AND deleted_at IS NOT NULL')
+        .bind(u.userId, nowISO(), seq, p.id),
+      activityStatement(env, {notebookId:current.notebook_id, spreadId:p.id, entity:'spread', entityId:p.id,
+        actorUserId:u.userId, action:'spread.restored', seq, clientRef:'spread-restore:'+seq})]);
+  } catch (e) {
+    if (/ux_spreads_notebook_number|spreads.notebook_id, spreads.number/.test(String(e))) return err(409, 'duplicate_number');
+    throw e;
+  }
+  await logHistory(env, { notebook_id: current.notebook_id, entity: 'spread', entity_id: p.id, user_id: u.userId, action: 'spread_restored' });
+  const restored = await env.DB.prepare('SELECT * FROM spreads WHERE id=?').bind(p.id).first();
+  return json({ spread: restored, restored: true });
 });
 
 on('PUT', '/api/notebooks/:id/spreads/order', async (request, env, p) => {
@@ -1132,7 +1230,7 @@ on('PUT', '/api/notebooks/:id/cover', async (request, env, p) => {
   let previewB64 = null, previewMime = null;
   if (preview) {
     const previewBuf = await preview.arrayBuffer();
-    previewB64 = btoa(String.fromCharCode(...new Uint8Array(previewBuf)));
+    previewB64 = base64FromBuffer(previewBuf);
     previewMime = preview.type || 'image/webp';
   }
   await env.DB.batch([
@@ -1350,7 +1448,7 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   ];
   if (preview) {
     const previewBuf = await preview.arrayBuffer();
-    const previewB64 = btoa(String.fromCharCode(...new Uint8Array(previewBuf)));
+    const previewB64 = base64FromBuffer(previewBuf);
     statements.push(env.DB.prepare(
       `INSERT INTO photo_previews (photo_id, preview_base64, mime_type, created_at) VALUES (?,?,?,?)`
     ).bind(photoId, previewB64, preview.type || 'image/webp', now));

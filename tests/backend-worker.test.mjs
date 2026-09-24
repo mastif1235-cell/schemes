@@ -90,6 +90,8 @@ CREATE TABLE notebooks (
   deleted_at TEXT,
   deleted_by TEXT
 );
+CREATE UNIQUE INDEX ux_notebooks_client_ref
+ON notebooks(created_by, client_ref) WHERE client_ref IS NOT NULL;
 CREATE TABLE notebook_members (
   notebook_id TEXT NOT NULL REFERENCES notebooks(id),
   user_id TEXT NOT NULL REFERENCES users(id),
@@ -122,6 +124,8 @@ CREATE TABLE spreads (
 );
 CREATE UNIQUE INDEX ux_spreads_notebook_number
 ON spreads(notebook_id, number) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX ux_spreads_client_ref
+ON spreads(created_by, client_ref) WHERE client_ref IS NOT NULL;
 CREATE TABLE photos (
   id TEXT PRIMARY KEY,
   spread_id TEXT NOT NULL REFERENCES spreads(id),
@@ -137,8 +141,10 @@ CREATE TABLE photos (
   created_by TEXT,
   created_at TEXT,
   seq INTEGER NOT NULL,
-  client_upload_id TEXT
+  client_upload_id TEXT UNIQUE
 );
+CREATE UNIQUE INDEX ux_photos_spread_version ON photos(spread_id, version);
+CREATE UNIQUE INDEX ux_photos_current ON photos(spread_id) WHERE is_current = 1;
 CREATE TABLE history (
   id TEXT PRIMARY KEY,
   notebook_id TEXT NOT NULL,
@@ -157,6 +163,7 @@ CREATE TABLE tags (
   seq INTEGER NOT NULL,
   deleted_at TEXT
 );
+CREATE UNIQUE INDEX ux_tags_notebook_norm ON tags(notebook_id, normalized_name);
 CREATE TABLE spread_tags (
   spread_id TEXT NOT NULL,
   tag_id TEXT NOT NULL,
@@ -659,4 +666,112 @@ assert.equal(coverage.find(row=>row.action==='notebook.created').count,1,'create
 assert.equal(coverage.find(row=>row.action==='spread.deleted').count,1,'delete retry does not duplicate activity');
 assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
 }
-console.log('backend: PASS (existing scenarios + 272-spread bidirectional delivery + OWNER fallback + server read-all)');
+
+// ---- AUDIT FIXES regression tests -----------------------------------------------------------
+{
+  // F1/F3: restore endpoints
+  const fx = createFixture();
+  // delete twice (idempotent), then restore
+  for (let i = 0; i < 2; i++) assert.equal((await api(fx.env, 'DELETE', '/api/spreads/s1', 'token-2')).status, 200);
+  const tombstoned = fx.sqlite.prepare('SELECT deleted_at FROM spreads WHERE id=?').get('s1');
+  assert.ok(tombstoned.deleted_at, 'spread tombstoned');
+  const revBefore = fx.sqlite.prepare('SELECT revision FROM spreads WHERE id=?').get('s1').revision;
+  const restored1 = await api(fx.env, 'POST', '/api/spreads/s1/restore', 'token-2');
+  assert.equal(restored1.status, 200, 'member can restore (consistent with member delete)');
+  assert.equal(restored1.data.restored, true);
+  const spreadAfter = fx.sqlite.prepare('SELECT * FROM spreads WHERE id=?').get('s1');
+  assert.equal(spreadAfter.deleted_at, null, 'tombstone cleared');
+  assert.equal(spreadAfter.revision, revBefore + 1, 'restore bumps revision');
+  const restored2 = await api(fx.env, 'POST', '/api/spreads/s1/restore', 'token-2');
+  assert.equal(restored2.status, 200);
+  assert.equal(restored2.data.restored, false, 'repeat restore is an idempotent no-op (lost response safe)');
+  const activityCount = fx.sqlite.prepare("SELECT COUNT(*) AS c FROM activity_events WHERE action='spread.restored'").get().c;
+  assert.equal(activityCount, 1, 'restore retry does not duplicate activity');
+  // restore of a never-deleted spread is a no-op too
+  const restored3 = await api(fx.env, 'POST', '/api/spreads/s1/restore', 'token-1');
+  assert.equal(restored3.data.restored, false);
+  // 404 for unknown spread
+  assert.equal((await api(fx.env, 'POST', '/api/spreads/nope/restore', 'token-1')).status, 404);
+  // restore forbidden when parent notebook is tombstoned
+  for (let i = 0; i < 2; i++) assert.equal((await api(fx.env, 'DELETE', '/api/spreads/s1', 'token-2')).status, 200);
+  assert.equal((await api(fx.env, 'DELETE', '/api/notebooks/n1', 'token-1')).status, 200);
+  const blockedRestore = await api(fx.env, 'POST', '/api/spreads/s1/restore', 'token-1');
+  assert.equal(blockedRestore.status, 409, 'spread restore refused while notebook is deleted');
+  // notebook restore by member → 403; by owner → 200; idempotent
+  const memberRestore = await api(fx.env, 'POST', '/api/notebooks/n1/restore', 'token-2');
+  assert.equal(memberRestore.status, 403, 'notebook restore requires owner');
+  const nbRestored = await api(fx.env, 'POST', '/api/notebooks/n1/restore', 'token-1');
+  assert.equal(nbRestored.status, 200);
+  assert.equal(nbRestored.data.restored, true);
+  assert.equal(fx.sqlite.prepare('SELECT deleted_at FROM notebooks WHERE id=?').get('n1').deleted_at, null);
+  assert.equal((await api(fx.env, 'POST', '/api/notebooks/n1/restore', 'token-1')).data.restored, false);
+  // after notebook restore the spread can be restored again
+  assert.equal((await api(fx.env, 'POST', '/api/spreads/s1/restore', 'token-1')).status, 200);
+  // photos/notes of the spread were never touched (children preserved through delete+restore)
+  assert.ok(fx.sqlite.prepare('SELECT COUNT(*) AS c FROM spread_notes WHERE spread_id=?').get('s1') !== undefined, 'notes queryable after restore');
+}
+{
+  // F2: input validation on legacy PATCH + create endpoints
+  const fx = createFixture();
+  const xssNumber = await api(fx.env, 'PATCH', '/api/spreads/s1', 'token-2', {number: '1<img src=x onerror=alert(1)>', revision: 1});
+  assert.equal(xssNumber.status, 400, 'legacy PATCH rejects non-numeric number');
+  assert.equal(fx.sqlite.prepare('SELECT number FROM spreads WHERE id=?').get('s1').number, 1, 'number unchanged');
+  const xssStatus = await api(fx.env, 'PATCH', '/api/spreads/s1', 'token-2', {status: 'Ок<script>alert(1)</script>', revision: 1});
+  assert.equal(xssStatus.status, 200, 'a normal string status is fine (escaping is a client duty)');
+  const badStatusType = await api(fx.env, 'PATCH', '/api/spreads/s1', 'token-2', {status: 42, revision: 1});
+  assert.equal(badStatusType.status, 400, 'status must be a string');
+  const hugeField = await api(fx.env, 'PATCH', '/api/spreads/s1', 'token-2', {note_full: 'x'.repeat(10001), revision: 1});
+  assert.equal(hugeField.status, 400, 'overlong field rejected');
+  const objTitle = await api(fx.env, 'PATCH', '/api/spreads/s1', 'token-2', {title: {nested: 1}, revision: 1});
+  assert.equal(objTitle.status, 400, 'non-string title rejected');
+  const badCreateNumber = await api(fx.env, 'POST', '/api/notebooks/n1/spreads', 'token-1', {number: '7'});
+  assert.equal(badCreateNumber.status, 400, 'create spread requires numeric number');
+  const badCreateZero = await api(fx.env, 'POST', '/api/notebooks/n1/spreads', 'token-1', {number: 0});
+  assert.equal(badCreateZero.status, 400, 'number must be >= 1');
+  const okCreate = await api(fx.env, 'POST', '/api/notebooks/n1/spreads', 'token-1', {number: 7, title: 'ok'});
+  assert.equal(okCreate.status, 200, 'valid create still works');
+  const badNbTitle = await api(fx.env, 'PATCH', '/api/notebooks/n1', 'token-1', {title: 42, revision: 1});
+  assert.equal(badNbTitle.status, 400, 'notebook title must be a string');
+  const okNbEdit = await api(fx.env, 'PATCH', '/api/notebooks/n1', 'token-1', {title: 'Новое имя', revision: 1});
+  assert.equal(okNbEdit.status, 200, 'valid notebook edit still works');
+}
+{
+  // F9: sliding session renewal
+  const fx = createFixture();
+  const soon = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+  const far = new Date(Date.now() + 120 * 24 * 3600 * 1000).toISOString();
+  fx.sqlite.prepare('UPDATE sessions SET expires_at=? WHERE id=?').run(soon, 'session-1');
+  fx.sqlite.prepare('UPDATE sessions SET expires_at=? WHERE id=?').run(far, 'session-2');
+  assert.equal((await api(fx.env, 'GET', '/api/me', 'token-1')).status, 200);
+  const renewed = fx.sqlite.prepare('SELECT expires_at FROM sessions WHERE id=?').get('session-1').expires_at;
+  assert.ok(new Date(renewed) > new Date(Date.now() + 170 * 24 * 3600 * 1000), 'active session near expiry is renewed');
+  const untouched = fx.sqlite.prepare('SELECT expires_at FROM sessions WHERE id=?').get('session-2').expires_at;
+  assert.equal(untouched, far, 'session with plenty of time left is not rewritten');
+  fx.sqlite.prepare('UPDATE sessions SET expires_at=? WHERE id=?').run(new Date(Date.now() - 1000).toISOString(), 'session-2');
+  assert.equal((await api(fx.env, 'GET', '/api/me', 'token-2')).status, 401, 'expired session stays expired');
+}
+{
+  // F8: large preview must not crash the photo upload
+  const fx = createFixture();
+  const nativeFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    assert.ok(String(url).startsWith('https://api.telegram.org/'));
+    return Response.json({ ok: true, result: { message_id: 555, document: {
+      file_id: 'big-file', file_unique_id: 'big-unique', file_size: 4, mime_type: 'image/jpeg' } } });
+  };
+  try {
+    const form = new FormData();
+    form.append('file', new Blob(['test'], { type: 'image/jpeg' }), 'test.jpg');
+    form.append('client_upload_id', 'big-preview-upload');
+    const bigPreview = new Uint8Array(260000);
+    for (let i = 0; i < bigPreview.length; i++) bigPreview[i] = (i * 31) % 251;
+    form.append('preview', new Blob([bigPreview], { type: 'image/webp' }), 'thumb.webp');
+    const res = await worker.fetch(new Request('https://worker.test/api/spreads/s1/photos', {
+      method: 'POST', headers: { Authorization: 'Bearer token-1' }, body: form,
+    }), { ...fx.env, CHAT_ID: 'fixture-chat', BOT_TOKEN: 'fixture-only' });
+    assert.equal(res.status, 200, '260KB preview uploads without RangeError');
+    const row = fx.sqlite.prepare('SELECT preview_base64 FROM photo_previews p JOIN photos ph ON ph.id=p.photo_id WHERE ph.client_upload_id=?').get('big-preview-upload');
+    assert.ok(row && row.preview_base64.length > 300000, 'preview stored as base64');
+  } finally { globalThis.fetch = nativeFetch; }
+}
+console.log('backend: PASS (existing scenarios + 272-spread bidirectional delivery + OWNER fallback + server read-all + audit fixes F1/F2/F3/F8/F9)');
