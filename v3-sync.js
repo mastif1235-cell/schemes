@@ -581,7 +581,12 @@
   }
 
   async function queueHasUnsynced(queue, entity, localId) {
-    return queue.some(item => item.entity === entity && item.local_id === localId && UNSYNCED.has(item.status));
+    const has = rows => rows.some(item => item.entity === entity && item.local_id === localId && UNSYNCED.has(item.status));
+    if (has(queue)) return true;
+    // The caller's queue snapshot may predate a concurrent user action (e.g. a trash restore
+    // while a pull is in flight). A negative answer is only trusted after a fresh re-check,
+    // otherwise a stale server tombstone could overwrite a just-made local change (F1/F3).
+    return has(await getAll('sync_queue'));
   }
 
   pushNotebook = async function (item) {

@@ -10,6 +10,7 @@
     "test:idb": "node tests/indexeddb-upgrade.test.mjs",
     "preview:team": "node tests/serve-team-preview.mjs",
     "build:rollback": "node tools/build-rollback.mjs",
-    "test:rollback": "node tests/rollback-contract.test.mjs"
+    "test:rollback": "node tests/rollback-contract.test.mjs",
+    "test:audit-fixes": "node tests/audit-fixes.test.mjs"
   }
 }

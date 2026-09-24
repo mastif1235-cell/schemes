@@ -3,23 +3,23 @@
   "files": [
     {
       "path": "chunk1.txt",
-      "sha256": "8c241263ac41b66455e957b7d45a294d0a6954d00dc4423b969b067966d08c6b"
+      "sha256": "60c3a8c72620e3144e63696484accd7dfcb45d0496aa066b4f549f45986eef5a"
     },
     {
       "path": "chunk2.txt",
-      "sha256": "ba0d29d46ee75746720721254c0318fd431c421473f4aa2d17925b2d02f40ef8"
+      "sha256": "a98c2be299e4ca7799e7e7a97aa728c23aa10921e1fae4494457cfa9b3fc7ea6"
     },
     {
       "path": "chunk3.txt",
-      "sha256": "6a41e5d0979e39cc5ce7997543bff40278d33e525d37f2be1a7a15eaf6f431b4"
+      "sha256": "176e6bda2e3b62d1a994b50dd2c5beeafb26e89f31847d8725ccd6e35edeb3d2"
     },
     {
       "path": "chunk4.txt",
-      "sha256": "a1b8f9dcf78cbdb7ffd88cff897335cf4b261c6a249924147d92aa2acb0e7ecc"
+      "sha256": "5f1a30bb04c6865a1c8a350b24af55f74bf4ac744457180eb59cc7824dacb125"
     },
     {
       "path": "v3-sync.js",
-      "sha256": "2115a9f314ae3dd75a79ee9e77de7521377d7f8deec7a2faad51212957b04caa"
+      "sha256": "d0d456926fa930b1b8799a718d60db38e97d7a230a945edacff0b289b5f952cb"
     },
     {
       "path": "v3-core.js",
@@ -27,7 +27,7 @@
     },
     {
       "path": "v3-photos.js",
-      "sha256": "0660e75326c7abe7c71da3e43d7707352ee13a3ec9cadf18ba122b068e76412e"
+      "sha256": "bcdb1f51425be8a8e074baad30709b1478a11a3690e05879e1821e1e3052fb6c"
     },
     {
       "path": "v3-camera.js",

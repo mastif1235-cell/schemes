@@ -38,7 +38,7 @@ function createRuntime(seed = {}) {
     nowISO: () => new Date().toISOString(),
     normalize: value => String(value || '').toLowerCase(),
     uid: (() => { let i = 0; return () => `generated-${++i}`; })(),
-    isAuthed: () => true,
+    isAuthed: () => seed.isAuthed !== false,
     isOnline: () => true,
     toast: () => {},
     updateSyncIndicator: () => {},
@@ -1123,4 +1123,153 @@ await testRepair367StopsWhenLegacyHasAReference();
 await testRepair367AbortKeepsLegacyAndChildren();
 await testRepair367StopsOnAmbiguousActivityReference();
 
-console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repairs 9-10/#367)');
+
+// ---- AUDIT FIXES regression tests -----------------------------------------------------------
+async function testRestoreFromTrashRetiresPendingDelete() {
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', deleted_at:'2026-09-24T00:00:00.000Z', revision:3}],
+    sync_queue:[{id:41, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0, payload:{op:'delete'}}]
+  });
+  runtime.context.fullSync = async () => {};
+  const ok = await runtime.context.window.vNextSync.restoreFromTrash('spread', 'sp-local');
+  assert.equal(ok, true);
+  assert.equal(runtime.db.spreads.get('sp-local').deleted_at, null, 'local tombstone cleared');
+  assert.equal(runtime.db.sync_queue.get(41).status, 'done', 'pending delete retired');
+  const restoreOps = [...runtime.db.sync_queue.values()].filter(item => item.payload?.op === 'restore');
+  assert.equal(restoreOps.length, 1, 'restore op enqueued');
+  assert.equal(restoreOps[0].status, 'pending');
+  // repeat restore is a no-op (idempotent)
+  assert.equal(await runtime.context.window.vNextSync.restoreFromTrash('spread', 'sp-local'), false);
+  assert.equal([...runtime.db.sync_queue.values()].filter(item => item.payload?.op === 'restore' && item.status === 'pending').length, 1);
+}
+
+async function testRestoreOpPushesRestoreEndpoint() {
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', deleted_at:null, revision:3}],
+    sync_queue:[{id:42, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0, payload:{op:'restore'}}]
+  });
+  const calls = [];
+  runtime.setApi(async (path, options) => { calls.push([path, options?.method]); return {spread:{id:'sp-server', revision:4}}; });
+  await runtime.context.pushEntityQueue(false);
+  assert.equal(calls.length, 1, 'restore op issues exactly one request');
+  assert.ok(calls[0][0].includes('/restore') && calls[0][1] === 'POST', 'restore uses POST /restore');
+  assert.equal(runtime.db.sync_queue.get(42).status, 'done');
+  assert.equal(runtime.db.spreads.get('sp-local').revision, 4, 'local revision follows restored server row');
+}
+
+async function testPullCannotResurrectWhileRestorePending() {
+  // THE F1 chain regression: server tombstone must not re-delete a spread with a pending restore.
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server', title:'NB'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', deleted_at:null, revision:4, number:1, title:'A'}],
+    sync_queue:[{id:43, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0, payload:{op:'restore'}}]
+  });
+  await runtime.context.applyChangeBatch({spreads:[{id:'sp-server', notebook_id:'nb-server', number:1, title:'A',
+    deleted_at:'2026-09-24T12:00:00.000Z', revision:3, updated_at:'2026-09-24T12:00:00.000Z', created_at:'2026-09-01T00:00:00.000Z'}]});
+  assert.equal(runtime.db.spreads.get('sp-local').deleted_at, null, 'pending restore protects against re-tombstoning');
+}
+
+async function testNotebookDeleteIsPersistentOutbox() {
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server', title:'NB'}],
+    sync_queue:[]
+  });
+  runtime.context.fullSync = async () => {};
+  assert.equal(await runtime.context.window.vNextSync.deleteNotebookToTrash('nb-local'), true);
+  const nb = runtime.db.notebooks.get('nb-local');
+  assert.ok(nb.deleted_at, 'local tombstone set atomically');
+  const ops = [...runtime.db.sync_queue.values()].filter(item => item.entity === 'notebook' && item.payload?.op === 'delete');
+  assert.equal(ops.length, 1, 'delete op persisted for retry');
+  // offline pull must not resurrect the notebook while delete is pending
+  await runtime.context.applyChangeBatch({notebooks:[{id:'nb-server', title:'NB', description:null, archived:0,
+    revision:2, deleted_at:null, updated_at:'2026-09-24T00:00:00.000Z', created_at:'2026-09-01T00:00:00.000Z'}]});
+  assert.ok(runtime.db.notebooks.get('nb-local').deleted_at, 'pull does not resurrect notebook with pending delete');
+  // online push deletes on the server
+  const calls = [];
+  runtime.setApi(async (path, options) => { calls.push([path, options?.method]); return {ok:true}; });
+  await runtime.context.pushEntityQueue(false);
+  assert.deepEqual(calls[0][1], 'DELETE');
+  assert.equal(ops[0].status === undefined || runtime.db.sync_queue.get(ops[0].id)?.status, 'done');
+  // restore after the delete reached the server: enqueues restore op, clears tombstone
+  assert.equal(await runtime.context.window.vNextSync.restoreFromTrash('notebook', 'nb-local'), true);
+  assert.equal(runtime.db.notebooks.get('nb-local').deleted_at, null);
+  const restoreOps = [...runtime.db.sync_queue.values()].filter(item => item.payload?.op === 'restore' && item.status === 'pending');
+  assert.equal(restoreOps.length, 1);
+  runtime.setApi(async (path, options) => { calls.push([path, options?.method]); return {notebook:{id:'nb-server', revision:3}}; });
+  await runtime.context.pushEntityQueue(false);
+  assert.ok(calls.at(-1)[0].endsWith('/restore'), 'notebook restore hits /restore');
+}
+
+async function testPermanentErrorsBlockedNotRetried() {
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', revision:1}],
+    sync_queue:[{id:44, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0}]
+  });
+  let calls = 0;
+  runtime.setApi(async () => { calls++; throw Object.assign(new Error('number_invalid'), {status:400}); });
+  await runtime.context.pushEntityQueue(false);
+  assert.equal(runtime.db.sync_queue.get(44).status, 'blocked', 'permanent 400 stops automatic retries');
+  assert.equal(runtime.db.sync_queue.get(44).blocked_reason, 'permanent');
+  await runtime.context.pushEntityQueue(false);
+  assert.equal(calls, 1, 'no automatic retry for blocked items');
+  await runtime.context.pushEntityQueue(true);
+  assert.equal(calls, 2, 'manual sync may retry blocked items');
+  // transient still uses backoff retry
+  const runtime2 = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', revision:1}],
+    sync_queue:[{id:45, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0}]
+  });
+  runtime2.setApi(async () => { throw Object.assign(new Error('boom'), {status:500}); });
+  await runtime2.context.pushEntityQueue(false);
+  assert.equal(runtime2.db.sync_queue.get(45).status, 'failed', '5xx stays transient');
+  assert.ok(Date.parse(runtime2.db.sync_queue.get(45).next_attempt_at) > Date.now(), 'backoff scheduled');
+}
+
+async function testPhotoOversizeBlockedButBlobKept() {
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local'}],
+    photos:[{id:'ph-1', spread_id:'sp-local', version:1, is_current:1, upload_status:'local_pending'}],
+    blobs:[{id:'ph-1_orig', blob:{size:99999999}}, {id:'ph-1_thumb', blob:{size:1000}}],
+    sync_queue:[{id:46, entity:'photo', photo_id:'ph-1', status:'pending', retry_count:0}]
+  });
+  runtime.setFetch(async () => ({ok:false, status:413, json:async()=>({})}));
+  await runtime.context.pushPhotoQueue(false);
+  const item = runtime.db.sync_queue.get(46);
+  assert.equal(item.status, 'blocked', '413 blocks the item instead of infinite retry');
+  assert.equal(item.blocked_reason, 'too_large');
+  assert.equal(runtime.db.photos.get('ph-1').upload_status, 'upload_failed');
+  assert.ok(runtime.db.blobs.has('ph-1_orig'), 'original blob stays local (no data loss)');
+  await runtime.context.pushPhotoQueue(false);
+  assert.equal(runtime.db.photos.get('ph-1').upload_status, 'upload_failed');
+}
+
+async function testPhotosWaitForSignInWithoutNetwork() {
+  const runtime = createRuntime({
+    isAuthed:false,
+    notebooks:[{id:'nb-local'}],
+    spreads:[{id:'sp-local', notebook_id:'nb-local'}],
+    photos:[{id:'ph-2', spread_id:'sp-local', version:1, is_current:1, upload_status:'local_pending'}],
+    blobs:[{id:'ph-2_orig', blob:{size:100}}],
+    sync_queue:[{id:47, entity:'photo', photo_id:'ph-2', status:'pending', retry_count:0}]
+  });
+  let fetches = 0;
+  runtime.setFetch(async () => { fetches++; return {ok:true, json:async()=>({})}; });
+  await runtime.context.pushPhotoQueue(false);
+  assert.equal(fetches, 0, 'no /upload attempts without auth');
+  assert.equal(runtime.db.sync_queue.get(47).status, 'pending', 'photo op waits for sign-in');
+  assert.equal(runtime.db.photos.get('ph-2').upload_status, 'local_pending', 'badge stays "ожидает"');
+}
+
+await testRestoreFromTrashRetiresPendingDelete();
+await testRestoreOpPushesRestoreEndpoint();
+await testPullCannotResurrectWhileRestorePending();
+await testNotebookDeleteIsPersistentOutbox();
+await testPermanentErrorsBlockedNotRetried();
+await testPhotoOversizeBlockedButBlobKept();
+await testPhotosWaitForSignInWithoutNetwork();
+console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repairs 9-10/#367, outbox delete/restore, retry classification, auth-gated uploads)');

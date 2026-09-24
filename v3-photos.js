@@ -33,8 +33,9 @@
         if (busy) continue; // still needed for retry — never prune, and don't spend keep-slots on it
         if (!photo.server_id || photo.upload_status !== 'synced') continue;
         if (kept < keep) { kept++; continue; }
-        try { await del('blobs', photo.id + '_orig'); pruned++; }
-        catch (error) { console.warn('Old photo version blob could not be pruned', photo.id, error); }
+        try {
+          if (await get('blobs', photo.id + '_orig')) { await del('blobs', photo.id + '_orig'); pruned++; }
+        } catch (error) { console.warn('Old photo version blob could not be pruned', photo.id, error); }
       }
     }
     settings.last_photo_retention_at = nowISO();
