@@ -1822,6 +1822,7 @@
       notebooks:matches(state.notebooks, ['current_spread_id','cover_spread_id','last_spread_id']),
       tags:matches(state.tags, ['spread_id','local_spread_id']),
       activity_local:matches(state.activity, ['local_spread_id','spread_local_id']),
+      activity_server:matches(state.activity, ['spread_id','entity_id']),
       history:matches(state.history, ['spread_id','local_spread_id','spread_local_id']),
       settings:matches(state.storedSettings, ['spread_id','local_spread_id','spread_local_id','current_spread_id','cover_spread_id','last_spread_id']),
       recents:state.recents.filter(row => row?.id === localId),
@@ -1839,7 +1840,8 @@
       photos:['spread_id','local_spread_id'],tags:['spread_id','local_spread_id'],
       spread_tags:['spread_id','local_spread_id'],user_favorites:['spread_id','local_spread_id'],
       spread_notes:['spread_id','local_spread_id'],history:['spread_id','local_spread_id','spread_local_id'],
-      sync_queue:['local_id','spread_id','local_spread_id'],activity_events:['local_spread_id','spread_local_id']};
+      sync_queue:['local_id','spread_id','local_spread_id'],
+      activity_events:['local_spread_id','spread_local_id','spread_id','entity_id']};
     const found = [];
     for (const [store,rows] of Object.entries(stores)) for (const row of rows) for (const [field,value] of Object.entries(row)) {
       if (value !== REPAIR_367.legacyLocalId || !/spread|^local_id$|^entity_id$/i.test(field)) continue;
@@ -1852,6 +1854,19 @@
     const reasons = [];
     const unclassified = repair367UnclassifiedReferences(state);
     if (unclassified.length) reasons.push('unclassified direct legacy references');
+    const activityAmbiguous = [];
+    for (const event of [...new Set([...legacyRefs.activity_server,...legacyRefs.activity_local])]) {
+      const fields = ['spread_id','entity_id','local_spread_id','spread_local_id']
+        .filter(field => event[field] === REPAIR_367.legacyLocalId);
+      const serverEvent = event.scope === scope() && typeof event.id === 'string' && !!event.id
+        && event.cache_id === scope() + '|' + (event.legacy ? 'legacy:' : '') + event.id
+        && event.notebook_id === REPAIR_367.serverNotebookId
+        && !fields.includes('local_spread_id') && !fields.includes('spread_local_id')
+        && (!fields.includes('entity_id') || event.entity === 'spread');
+      if (!serverEvent) activityAmbiguous.push({cache_id:event.cache_id ?? null,id:event.id ?? null,fields,
+        scope:event.scope ?? null,entity:event.entity ?? null,notebook_id:event.notebook_id ?? null});
+    }
+    if (activityAmbiguous.length) reasons.push('activity event reference has no proven server-id provenance');
     const photos = legacyRefs.photos;
     const versions = photos.map(row => Number(row.version)).sort((a,b) => a-b);
     if (photos.length !== 7 || versions.some((number,index) => number !== index + 1)
@@ -1881,9 +1896,9 @@
     }
     if (legacyRefs.spread_tags.some(row => canonicalRefs.spread_tags.some(other => other.tag_id === row.tag_id))
         || legacyRefs.favorites.length && canonicalRefs.favorites.length) reasons.push('active reference would collide');
-    return {valid:reasons.length === 0, reasons, unclassified,
+    return {valid:reasons.length === 0, reasons, unclassified, activityAmbiguous,
       migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,legacyRefs[store]])),
-      preserve:{history:legacyRefs.history, activity_events:legacyRefs.activity_local,
+      preserve:{history:legacyRefs.history, activity_events:legacyRefs.activity_server,
         sync_queue_history:legacyRefs.queue, recents:legacyRefs.recents},
       photo_blobs:legacyRefs.photo_blobs};
   }
@@ -1940,7 +1955,6 @@
       localSpreads:state.localSpreads, serverSpreads:state.serverSpreads,
       fieldServers:state.fieldServers,
       canonicalRefs, legacyRefs, storeNames:state.storeNames,
-      sharedServerActivity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
     }));
   }
 
@@ -2039,6 +2053,7 @@
         title:serverCanonical.title, revision:serverCanonical.revision} : null);
     repair910Check(checks, 'legacy active references can migrate without data loss', migration.valid,
       {reasons:migration.reasons, unclassified:migration.unclassified,
+        ambiguous_activity_events:migration.activityAmbiguous,
         migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,migration.migrate[store].length])),
         preserve:{history:migration.preserve.history.length, activity_events:migration.preserve.activity_events.length,
           sync_queue_history:migration.preserve.sync_queue_history.length}});
@@ -2070,12 +2085,13 @@
       canonical_references:canonicalRefs,
       legacy_references:legacyRefs,
       reference_plan:{valid:migration.valid,reasons:migration.reasons,unclassified:migration.unclassified,
+        ambiguous_activity_events:migration.activityAmbiguous,
         migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,migration.migrate[store].map(row => row.id || row.cache_id || row.spread_id)])),
         preserve:{history:migration.preserve.history.map(row => row.id),
-          activity_events:migration.preserve.activity_events.map(row => row.cache_id),
+          activity_events:migration.preserve.activity_events.map(row => ({cache_id:row.cache_id,
+            preserved_server_id_fields:['spread_id','entity_id'].filter(field => row[field] === REPAIR_367.duplicatedServerId)})),
           sync_queue_history:migration.preserve.sync_queue_history.map(row => row.id)}},
       indexeddb_stores:state.storeNames,
-      shared_server_activity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
       field_repairs:fieldAssessments.map(assessment => ({queue:assessment.item, local_spread:assessment.local,
         fresh_server:assessment.server, mode:assessment.mode})),
       local_order:repair367Ordered(state.localSpreads).map(row => ({local_id:row.id, server_id:row.server_id,
@@ -2092,16 +2108,21 @@
         local_rows_before:state.localSpreads.length, local_rows_after_legacy_retire:effectiveLocal.length,
         legacy_reference_count:repair367ReferenceCount(legacyRefs),
         references_to_migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,migration.migrate[store].length])),
+        activity_events_to_migrate:0,
+        activity_event_fields_to_change:[],
+        server_id_activity_events_preserved:migration.preserve.activity_events.length,
         immutable_references_to_preserve:{history:migration.preserve.history.length,
           activity_events:migration.preserve.activity_events.length, sync_queue_history:migration.preserve.sync_queue_history.length},
         field_repairs:fieldAssessments.map(row => ({queue_id:row.repair.queueId, mode:row.mode}))},
       reference_inventory:{active_to_rebind:Object.fromEntries(REPAIR_367_ACTIVE.map(store =>
         [store,migration.migrate[store].map(row => row.id ?? row.cache_id ?? row.spread_id ?? null)])),
         immutable_preserved:{history:migration.preserve.history.map(row => row.id),
-          activity_events:migration.preserve.activity_events.map(row => row.cache_id),
+          activity_events:migration.preserve.activity_events.map(row => ({cache_id:row.cache_id,
+            preserved_server_id_fields:['spread_id','entity_id'].filter(field => row[field] === REPAIR_367.duplicatedServerId)})),
           sync_queue:migration.preserve.sync_queue_history.map(row => row.id),
           recents:migration.preserve.recents.map(row => row.id)},
-        photo_blob_checks:migration.photo_blobs, unclassified:migration.unclassified},
+        photo_blob_checks:migration.photo_blobs, unclassified:migration.unclassified,
+        ambiguous_activity_events:migration.activityAmbiguous},
       plan:action === 'retire_only'
         ? {action:'Atomically move verified active child references to canonical, retain immutable history, retire legacy and #367 after confirming server order.'}
         : {action:'Build fresh reorder from current canonical mappings, verify server success, then atomically move active child references and retire legacy/#367.',

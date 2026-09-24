@@ -877,7 +877,14 @@ function repair367Fixture({serverContiguous = false} = {}) {
       spread_notes:[{cache_id:'legacy-note',id:'server-note',spread_id:duplicatedId,
         server_spread_id:duplicatedId,body:'preserve note',revision:1}],
       history:[{id:1,spread_id:duplicatedId,action:'photo.added'}],
-      activity_events:[{cache_id:'activity-1',local_spread_id:duplicatedId,action:'photo.added'}],
+      activity_events:[
+        {id:'activity-1',cache_id:`${backend}|u1|activity-1`,scope:`${backend}|u1`,
+          notebook_id:serverNotebookId,spread_id:duplicatedId,entity:'spread',entity_id:duplicatedId,
+          action:'spread.updated',created_at:'2026-09-24T12:00:00Z',seq:10,payload:{title:'1-2'}},
+        {id:'activity-2',cache_id:`${backend}|u1|activity-2`,scope:`${backend}|u1`,
+          notebook_id:serverNotebookId,spread_id:duplicatedId,entity:'photo',entity_id:'photo-server-2',
+          action:'photo.added',created_at:'2026-09-24T12:01:00Z',seq:11,payload:{version:2}},
+      ],
       sync_queue:[{id:367, entity:'spread_order', local_id:localNotebookId, scope:`${backend}|u1`,
         status:'failed', retry_count:110, last_error:'invalid_order', payload:{client_ref:'broken-367', items:brokenItems}},
       ...fieldRepairs.map(repair => ({id:repair.queueId, entity:'spread_fields', local_id:repair.localId,
@@ -936,10 +943,15 @@ async function testRepair367PreviewAndFreshReorder() {
   assert.equal(preview.comparison.action, 'fresh_reorder_then_retire');
   assert.equal(preview.comparison.local_rows_before, 51);
   assert.equal(preview.comparison.local_rows_after_legacy_retire, 50);
-  assert.equal(preview.comparison.legacy_reference_count, 10);
+  assert.equal(preview.comparison.legacy_reference_count, 11);
   assert.equal(preview.comparison.references_to_migrate.photos, 7);
   assert.equal(preview.comparison.references_to_migrate.notes, 1);
   assert.equal(preview.comparison.immutable_references_to_preserve.history, 1);
+  assert.equal(preview.comparison.activity_events_to_migrate,0);
+  assert.equal(preview.comparison.server_id_activity_events_preserved,2);
+  assert.deepEqual(JSON.parse(JSON.stringify(preview.reference_inventory.immutable_preserved.activity_events[0].preserved_server_id_fields)),
+    ['spread_id','entity_id']);
+  assert.equal(preview.backup.legacy_references.activity_server.length,2);
   assert.equal(preview.backup.reference_plan.migrate.photos.length, 7);
   assert.equal(preview.backup.canonical_spread.id, 'mtk12qcznnzdex');
   assert.equal(preview.backup.legacy_spread.id, fixture.duplicatedId);
@@ -979,7 +991,10 @@ async function testRepair367PreviewAndFreshReorder() {
   assert.equal(runtime.db.spreads.get('mtk12qcznnzdex').current_photo_id,'mtkfmkwy79s1w8');
   assert.equal(runtime.db.spread_notes.get('legacy-note').spread_id,'mtk12qcznnzdex');
   assert.equal(runtime.db.history.get(1).spread_id,fixture.duplicatedId,'immutable history remains unchanged');
-  assert.equal(runtime.db.activity_events.get('activity-1').local_spread_id,fixture.duplicatedId);
+  for (const event of fixture.seed.activity_events) {
+    assert.deepEqual(runtime.db.activity_events.get(event.cache_id),event,
+      'server activity spread_id/entity_id and all event metadata remain byte-equivalent');
+  }
 }
 
 async function testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect() {
@@ -1023,7 +1038,7 @@ async function testRepair367StopsWhenLegacyHasAReference() {
   });
   const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
   assert.equal(preview.eligible, false);
-  assert.equal(preview.comparison.legacy_reference_count, 11);
+  assert.equal(preview.comparison.legacy_reference_count, 12);
   assert.equal(preview.backup.legacy_references.photos.at(-1).id, 'unexpected-photo');
   await assert.rejects(runtime.context.window.v340Sync.applyRepair367(preview.guard), /ничего не применено/);
   assert.equal(mutations, 0);
@@ -1049,6 +1064,29 @@ async function testRepair367AbortKeepsLegacyAndChildren() {
   assert.equal(runtime.db.blobs.size,14);
 }
 
+async function testRepair367StopsOnAmbiguousActivityReference() {
+  for (const modify of [
+    event => { event.scope = 'unknown-scope'; },
+    event => { event.entity = 'photo'; },
+    event => { event.local_spread_id = event.spread_id; },
+  ]) {
+    const fixture = repair367Fixture();
+    modify(fixture.seed.activity_events[0]);
+    const runtime = createRuntime(fixture.seed);
+    const api = installRepair367Api(runtime,fixture);
+    const before = structuredClone([...runtime.db.activity_events.values()]);
+    const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+    assert.equal(preview.eligible,false,'ambiguous activity reference must block Apply');
+    assert.ok(preview.backup.legacy_references.activity_server.length >= 1);
+    assert.ok(preview.reference_inventory.ambiguous_activity_events.length >= 1);
+    await assert.rejects(runtime.context.window.v340Sync.applyRepair367(preview.guard),/STOP:/);
+    assert.deepEqual([...runtime.db.activity_events.values()],before);
+    assert.equal(runtime.db.sync_queue.get(367).status,'failed');
+    assert.equal(runtime.db.spreads.has(fixture.duplicatedId),true);
+    assert.equal(api.calls.filter(call => call.options).length,0);
+  }
+}
+
 await testRepair910PreviewIsReadOnly();
 await testRepair910ApplyTouchesOnly286And287();
 await testRepair910StopsIfStateChangesAfterPreview();
@@ -1058,5 +1096,6 @@ await testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect();
 await testRepair367StopsOnAmbiguousMapping();
 await testRepair367StopsWhenLegacyHasAReference();
 await testRepair367AbortKeepsLegacyAndChildren();
+await testRepair367StopsOnAmbiguousActivityReference();
 
 console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repairs 9-10/#367)');
