@@ -2034,9 +2034,10 @@
     repair910Check(checks, 'only expected repair rows unfinished', unfinished.length === expectedUnfinished.size
       && unfinished.every(item => expectedUnfinished.has(String(item.id))),
       unfinished.map(item => ({id:item.id, entity:item.entity, status:item.status, local_id:item.local_id || null})));
-    repair910Check(checks, 'old payload is the known broken payload', payload.item_count === REPAIR_367.expectedSpreadCount
-      && payload.unique_spread_ids === REPAIR_367.expectedSpreadCount - 1
+    repair910Check(checks, 'old payload is the known broken payload', payload.item_count === REPAIR_367.expectedLocalCountBefore
+      && payload.unique_spread_ids === REPAIR_367.expectedSpreadCount
       && payload.duplicates.length === 1
+      && payload.duplicates[0].spread_id === REPAIR_367.duplicatedServerId
       && payload.known_duplicate_count === 2 && payload.missing_expected_number_32, payload);
     repair910Check(checks, 'server GET', !state.serverError, state.serverError);
     repair910Check(checks, 'canonical local spread exact', !!canonical
