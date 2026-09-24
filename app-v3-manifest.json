@@ -1,5 +1,5 @@
 {
-  "version": "3.5.7",
+  "version": "3.5.8",
   "files": [
     {
       "path": "chunk1.txt",
@@ -19,7 +19,7 @@
     },
     {
       "path": "v3-sync.js",
-      "sha256": "285beff64bc4e2829fdf1ca344f2788cf1fdff4918a292c28830afea8c23fb4f"
+      "sha256": "4a90e9489c89c4c807a528f2eed88db8fe62f1a2e8fb4f7a9376cc86cb50960a"
     },
     {
       "path": "v3-core.js",
