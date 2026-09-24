@@ -1822,8 +1822,70 @@
       notebooks:matches(state.notebooks, ['current_spread_id','cover_spread_id','last_spread_id']),
       tags:matches(state.tags, ['spread_id','local_spread_id']),
       activity_local:matches(state.activity, ['local_spread_id','spread_local_id']),
+      history:matches(state.history, ['spread_id','local_spread_id','spread_local_id']),
+      settings:matches(state.storedSettings, ['spread_id','local_spread_id','spread_local_id','current_spread_id','cover_spread_id','last_spread_id']),
       recents:state.recents.filter(row => row?.id === localId),
     };
+  }
+
+  const REPAIR_367_STORES = ['notebooks','spreads','photos','tags','spread_tags','history','sync_queue',
+    'settings','blobs','user_favorites','spread_notes','activity_events'];
+  const REPAIR_367_ACTIVE = ['photos','notes','spread_tags','favorites','notebooks','tags'];
+  function repair367UnclassifiedReferences(state) {
+    const stores = {notebooks:state.notebooks,spreads:state.allSpreads,photos:state.photos,tags:state.tags,
+      spread_tags:state.spreadTags,history:state.history,sync_queue:state.queue,settings:state.storedSettings,
+      user_favorites:state.favorites,spread_notes:state.notes,activity_events:state.activity};
+    const allowed = {notebooks:['current_spread_id','cover_spread_id','last_spread_id'],
+      photos:['spread_id','local_spread_id'],tags:['spread_id','local_spread_id'],
+      spread_tags:['spread_id','local_spread_id'],user_favorites:['spread_id','local_spread_id'],
+      spread_notes:['spread_id','local_spread_id'],history:['spread_id','local_spread_id','spread_local_id'],
+      sync_queue:['local_id','spread_id','local_spread_id'],activity_events:['local_spread_id','spread_local_id']};
+    const found = [];
+    for (const [store,rows] of Object.entries(stores)) for (const row of rows) for (const [field,value] of Object.entries(row)) {
+      if (value !== REPAIR_367.legacyLocalId || !/spread|^local_id$|^entity_id$/i.test(field)) continue;
+      if (field === 'server_id' || field === 'server_spread_id') continue;
+      if (!(allowed[store] || []).includes(field)) found.push({store,id:row.id ?? row.cache_id ?? row.key ?? null,field});
+    }
+    return found;
+  }
+  function repair367MigrationAssessment(state, legacyRefs, canonicalRefs, canonical) {
+    const reasons = [];
+    const unclassified = repair367UnclassifiedReferences(state);
+    if (unclassified.length) reasons.push('unclassified direct legacy references');
+    const photos = legacyRefs.photos;
+    const versions = photos.map(row => Number(row.version)).sort((a,b) => a-b);
+    if (photos.length !== 7 || versions.some((number,index) => number !== index + 1)
+        || canonicalRefs.photos.length || photos.filter(row => row.is_current === true || row.is_current === 1).length !== 1
+        || photos.find(row => row.is_current === true || row.is_current === 1)?.id !== 'mtkfmkwy79s1w8'
+        || photos.find(row => row.id === 'mtkfmkwy79s1w8')?.server_id !== '5522f6df-359f-4740-a572-efa36ed75cde'
+        || canonical?.current_photo_id !== 'mtkfmkwy79s1w8') reasons.push('seven legacy photos/current photo do not match');
+    if (photos.some(photo => !photo.id || photo.spread_id !== REPAIR_367.legacyLocalId
+        || photo.local_spread_id && photo.local_spread_id !== REPAIR_367.legacyLocalId
+        || !['orig','thumb'].every(kind => {
+          const blob = state.photoBlobs[photo.id]?.[kind];
+          return blob?.exists && Number.isFinite(blob.size) && blob.size > 0 && !blob.error;
+        }))) reasons.push('photo identity or original/thumbnail blob is unverified');
+    if (state.storeNames.length !== REPAIR_367_STORES.length
+        || !REPAIR_367_STORES.every(name => state.storeNames.includes(name))) reasons.push('unknown or missing IndexedDB store');
+    if (legacyRefs.settings.length) reasons.push('unhandled settings reference');
+    if (legacyRefs.queue.some(row => UNSYNCED.has(row.status))) reasons.push('unfinished legacy queue reference');
+    for (const store of REPAIR_367_ACTIVE) {
+      const fields = store === 'notebooks' ? ['current_spread_id','cover_spread_id','last_spread_id'] : ['spread_id','local_spread_id'];
+      if (legacyRefs[store].some(row => fields.every(field => row[field] !== REPAIR_367.legacyLocalId))) {
+        reasons.push(`unclassified ${store} reference`);
+      }
+    }
+    if (legacyRefs.notes.some(row => row.server_spread_id && row.server_spread_id !== REPAIR_367.duplicatedServerId)
+        || legacyRefs.photos.some(row => row.server_spread_id && row.server_spread_id !== REPAIR_367.duplicatedServerId)) {
+      reasons.push('child server spread mapping differs');
+    }
+    if (legacyRefs.spread_tags.some(row => canonicalRefs.spread_tags.some(other => other.tag_id === row.tag_id))
+        || legacyRefs.favorites.length && canonicalRefs.favorites.length) reasons.push('active reference would collide');
+    return {valid:reasons.length === 0, reasons, unclassified,
+      migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,legacyRefs[store]])),
+      preserve:{history:legacyRefs.history, activity_events:legacyRefs.activity_local,
+        sync_queue_history:legacyRefs.queue, recents:legacyRefs.recents},
+      photo_blobs:legacyRefs.photo_blobs};
   }
 
   function repair367ReferenceCount(refs) {
@@ -1831,10 +1893,10 @@
   }
 
   async function collectRepair367State() {
-    const [notebook, queue, allSpreads, photos, notes, spreadTags, favorites, notebooks, tags, activity] = await Promise.all([
+    const [notebook, queue, allSpreads, photos, notes, spreadTags, favorites, notebooks, tags, activity, history, storedSettings, connection] = await Promise.all([
       get('notebooks', REPAIR_367.localNotebookId), getAll('sync_queue'), getAll('spreads'), getAll('photos'),
       getAll('spread_notes'), getAll('spread_tags'), getAll('user_favorites'), getAll('notebooks'), getAll('tags'),
-      getAll('activity_events'),
+      getAll('activity_events'), getAll('history'), getAll('settings'), openDB(),
     ]);
     const linkedPhotoIds = photos.filter(row => [REPAIR_367.canonicalLocalId,REPAIR_367.legacyLocalId].includes(row.spread_id)).map(row => row.id);
     const photoBlobs = Object.fromEntries(await Promise.all(linkedPhotoIds.map(async id => [id,{
@@ -1863,7 +1925,8 @@
     }
     return {
       notebook, queue, allSpreads, serverSpreads, serverError, fieldServers, fieldServerErrors,
-      photos, notes, spreadTags, favorites, notebooks, tags, photoBlobs, activity, recents,
+      photos, notes, spreadTags, favorites, notebooks, tags, photoBlobs, activity, history, storedSettings,
+      storeNames:[...connection.objectStoreNames], recents,
       queue367:repair910Queue(queue, REPAIR_367.queueId),
       localSpreads:allSpreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at),
     };
@@ -1876,7 +1939,7 @@
       notebook:state.notebook, queue367:state.queue367, queue:state.queue,
       localSpreads:state.localSpreads, serverSpreads:state.serverSpreads,
       fieldServers:state.fieldServers,
-      canonicalRefs, legacyRefs,
+      canonicalRefs, legacyRefs, storeNames:state.storeNames,
       sharedServerActivity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
     }));
   }
@@ -1927,6 +1990,7 @@
     const effectiveLocal = state.localSpreads.filter(row => row.id !== REPAIR_367.legacyLocalId);
     const canonicalRefs = repair367DirectReferences(state, REPAIR_367.canonicalLocalId);
     const legacyRefs = repair367DirectReferences(state, REPAIR_367.legacyLocalId);
+    const migration = repair367MigrationAssessment(state, legacyRefs, canonicalRefs, canonical);
     const localShape = repair367NumberShape(effectiveLocal);
     const serverShape = repair367NumberShape(state.serverSpreads);
     const localIds = repair367Ids(effectiveLocal);
@@ -1973,9 +2037,11 @@
       && ['status','note_short','note_full'].every(key => (serverCanonical[key] ?? null) === (canonical?.[key] ?? null)),
       serverCanonical ? {id:serverCanonical.id, client_ref:serverCanonical.client_ref, number:serverCanonical.number,
         title:serverCanonical.title, revision:serverCanonical.revision} : null);
-    repair910Check(checks, 'legacy has no unique local references', repair367ReferenceCount(legacyRefs) === 0,
-      {legacy_reference_count:repair367ReferenceCount(legacyRefs), references:legacyRefs,
-        canonical_reference_count:repair367ReferenceCount(canonicalRefs)});
+    repair910Check(checks, 'legacy active references can migrate without data loss', migration.valid,
+      {reasons:migration.reasons, unclassified:migration.unclassified,
+        migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,migration.migrate[store].length])),
+        preserve:{history:migration.preserve.history.length, activity_events:migration.preserve.activity_events.length,
+          sync_queue_history:migration.preserve.sync_queue_history.length}});
     repair910Check(checks, '51 local rows reduce to 50 unique mappings', state.localSpreads.length === REPAIR_367.expectedLocalCountBefore
       && effectiveLocal.length === REPAIR_367.expectedSpreadCount && localShape.unique
       && effectiveLocal.every(row => !!row.server_id)
@@ -2003,6 +2069,12 @@
       legacy_spread:legacy,
       canonical_references:canonicalRefs,
       legacy_references:legacyRefs,
+      reference_plan:{valid:migration.valid,reasons:migration.reasons,unclassified:migration.unclassified,
+        migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,migration.migrate[store].map(row => row.id || row.cache_id || row.spread_id)])),
+        preserve:{history:migration.preserve.history.map(row => row.id),
+          activity_events:migration.preserve.activity_events.map(row => row.cache_id),
+          sync_queue_history:migration.preserve.sync_queue_history.map(row => row.id)}},
+      indexeddb_stores:state.storeNames,
       shared_server_activity:state.activity.filter(row => row?.spread_id === REPAIR_367.duplicatedServerId),
       field_repairs:fieldAssessments.map(assessment => ({queue:assessment.item, local_spread:assessment.local,
         fresh_server:assessment.server, mode:assessment.mode})),
@@ -2019,21 +2091,142 @@
         server_has_legacy_gap_32:serverShape.legacy_gap_32, action,
         local_rows_before:state.localSpreads.length, local_rows_after_legacy_retire:effectiveLocal.length,
         legacy_reference_count:repair367ReferenceCount(legacyRefs),
+        references_to_migrate:Object.fromEntries(REPAIR_367_ACTIVE.map(store => [store,migration.migrate[store].length])),
+        immutable_references_to_preserve:{history:migration.preserve.history.length,
+          activity_events:migration.preserve.activity_events.length, sync_queue_history:migration.preserve.sync_queue_history.length},
         field_repairs:fieldAssessments.map(row => ({queue_id:row.repair.queueId, mode:row.mode}))},
+      reference_inventory:{active_to_rebind:Object.fromEntries(REPAIR_367_ACTIVE.map(store =>
+        [store,migration.migrate[store].map(row => row.id ?? row.cache_id ?? row.spread_id ?? null)])),
+        immutable_preserved:{history:migration.preserve.history.map(row => row.id),
+          activity_events:migration.preserve.activity_events.map(row => row.cache_id),
+          sync_queue:migration.preserve.sync_queue_history.map(row => row.id),
+          recents:migration.preserve.recents.map(row => row.id)},
+        photo_blob_checks:migration.photo_blobs, unclassified:migration.unclassified},
       plan:action === 'retire_only'
-        ? {action:'Retire only the proven legacy local spread, refresh canonical rows from the already-correct server order, then retire queue #367.'}
-        : {action:'Retire the proven legacy local spread, build a new reorder from the remaining 50 rows and current server revisions/numbers, then retire #367 only after server success.',
+        ? {action:'Atomically move verified active child references to canonical, retain immutable history, retire legacy and #367 after confirming server order.'}
+        : {action:'Build fresh reorder from current canonical mappings, verify server success, then atomically move active child references and retire legacy/#367.',
           item_count:localIds.length, old_payload:'never reused'},
       _state:state, _fieldAssessments:fieldAssessments,
     };
   }
 
-  async function retireRepair367(expectedQueue) {
-    await window.vNextAtomic('notebooks', REPAIR_367.localNotebookId, current => {
-      if (!current || current.server_id !== REPAIR_367.serverNotebookId) throw new Error('STOP: notebook mapping changed');
-      return {retired:[{...expectedQueue, status:'done', next_attempt_at:null, last_error:null,
-        retired_at:nowISO(), retired_reason:'Repair #367 verified current order',
-        retired_previous_error:expectedQueue.last_error || null}]};
+  async function migrateRepair367References(state, verifiedServerRows) {
+    const connection = await openDB();
+    const storeNames = REPAIR_367_STORES.filter(name => name !== 'settings');
+    const sourcePhotos = repair367DirectReferences(state,REPAIR_367.legacyLocalId).photos;
+    const blobKeys = sourcePhotos.flatMap(photo => [photo.id + '_orig',photo.id + '_thumb']);
+    return new Promise((resolve,reject) => {
+      const transaction = connection.transaction(storeNames,'readwrite');
+      const results = {}, blobRows = {};
+      let remaining = storeNames.length + blobKeys.length;
+      let failed = false, verified = false;
+      const stop = error => { if (failed) return; failed = true; transaction.abort(); reject(error); };
+      transaction.onabort = () => { if (!failed) reject(transaction.error || new Error('STOP: reference migration aborted')); };
+      transaction.oncomplete = () => verified ? resolve({migrated:sourcePhotos.length, legacy_removed:true})
+        : reject(new Error('STOP: reference migration completed without verification'));
+      const verifyWrites = () => {
+        const checked = {};
+        const names = ['photos','spread_notes','spreads','sync_queue'];
+        let left = names.length;
+        for (const name of names) {
+          const request = transaction.objectStore(name).getAll();
+          request.onsuccess = () => {
+            checked[name] = request.result;
+            if (--left || failed) return;
+            try {
+              const local = checked.spreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
+              const canonical = local.find(row => row.id === REPAIR_367.canonicalLocalId);
+              if (local.length !== 50 || new Set(local.map(row => row.server_id)).size !== 50
+                  || !repair367NumberShape(local).contiguous || !canonical
+                  || canonical.current_photo_id !== 'mtkfmkwy79s1w8'
+                  || checked.spreads.some(row => row.id === REPAIR_367.legacyLocalId)
+                  || checked.sync_queue.find(row => String(row.id) === String(REPAIR_367.queueId))?.status !== 'done') {
+                throw new Error('STOP: canonical rows or queue failed transaction verification');
+              }
+              for (const photo of sourcePhotos) {
+                const after = checked.photos.find(row => row.id === photo.id);
+                if (!after || after.spread_id !== REPAIR_367.canonicalLocalId
+                    || after.server_id !== photo.server_id || after.version !== photo.version
+                    || after.is_current !== photo.is_current || after.telegram_message_id !== photo.telegram_message_id
+                    || after.telegram_link !== photo.telegram_link) {
+                  throw new Error('STOP: photo metadata failed transaction verification');
+                }
+              }
+              for (const note of repair367DirectReferences(state,REPAIR_367.legacyLocalId).notes) {
+                const after = checked.spread_notes.find(row => row.cache_id === note.cache_id);
+                if (!after || after.spread_id !== REPAIR_367.canonicalLocalId || after.id !== note.id) {
+                  throw new Error('STOP: note failed transaction verification');
+                }
+              }
+              verified = true;
+            } catch (error) { stop(error); }
+          };
+          request.onerror = () => stop(request.error || new Error(`STOP: verifying ${name} failed`));
+        }
+      };
+      const finishRead = () => {
+        if (--remaining || failed) return;
+        try {
+          const current = {...state, queue:results.sync_queue, allSpreads:results.spreads, photos:results.photos,
+            notes:results.spread_notes, spreadTags:results.spread_tags, favorites:results.user_favorites,
+            notebooks:results.notebooks, tags:results.tags, activity:results.activity_events, history:results.history};
+          current.queue367 = repair910Queue(current.queue,REPAIR_367.queueId);
+          current.localSpreads = current.allSpreads.filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
+          if (repair367Guard(current) !== repair367Guard(state)) throw new Error('STOP: local references changed before migration');
+          for (const photo of sourcePhotos) for (const kind of ['orig','thumb']) {
+            const key = photo.id + '_' + kind;
+            const before = state.photoBlobs[photo.id]?.[kind];
+            const actual = blobRows[key]?.blob;
+            if (!before?.exists || !actual || actual.size !== before.size || (actual.type || null) !== before.mime_type) {
+              throw new Error(`STOP: photo blob ${key} changed before migration`);
+            }
+          }
+          const legacyRefs = repair367DirectReferences(current,REPAIR_367.legacyLocalId);
+          const canonicalRefs = repair367DirectReferences(current,REPAIR_367.canonicalLocalId);
+          const canonical = current.localSpreads.find(row => row.id === REPAIR_367.canonicalLocalId);
+          if (!repair367MigrationAssessment(current,legacyRefs,canonicalRefs,canonical).valid) {
+            throw new Error('STOP: legacy references failed migration preflight');
+          }
+          const serverById = new Map(verifiedServerRows.map(row => [row.id,row]));
+          const effectiveLocal = current.localSpreads.filter(row => row.id !== REPAIR_367.legacyLocalId);
+          if (effectiveLocal.length !== 50 || serverById.size !== 50
+              || !repair367NumberShape(verifiedServerRows).contiguous) throw new Error('STOP: canonical order changed');
+          for (const [label,store] of [['photos','photos'],['notes','spread_notes'],['spread_tags','spread_tags'],
+            ['favorites','user_favorites'],['notebooks','notebooks'],['tags','tags']]) {
+            for (const row of legacyRefs[label]) {
+              const moved = {...row};
+              for (const field of (label === 'notebooks'
+                ? ['current_spread_id','cover_spread_id','last_spread_id'] : ['spread_id','local_spread_id'])) {
+                if (moved[field] === REPAIR_367.legacyLocalId) moved[field] = REPAIR_367.canonicalLocalId;
+              }
+              if (label === 'favorites') transaction.objectStore(store).delete(REPAIR_367.legacyLocalId);
+              transaction.objectStore(store).put(moved);
+            }
+          }
+          for (const local of effectiveLocal) {
+            const server = serverById.get(local.server_id);
+            if (!server) throw new Error('STOP: current server order lacks canonical mapping');
+            transaction.objectStore('spreads').put({...local, ...metadata(server), revision:server.revision,
+              updated_at:server.updated_at || local.updated_at, metadata_base:metadata(server),
+              searchableText:normalize([server.number,server.title,server.note_short,server.note_full].join(' '))});
+          }
+          transaction.objectStore('spreads').delete(REPAIR_367.legacyLocalId);
+          transaction.objectStore('sync_queue').put({...state.queue367,status:'done',next_attempt_at:null,last_error:null,
+            retired_at:nowISO(),retired_reason:'Repair #367 verified fresh order and migrated active references',
+            retired_previous_error:state.queue367.last_error || null});
+          verifyWrites();
+        } catch (error) { stop(error); }
+      };
+      for (const store of storeNames) {
+        const request = transaction.objectStore(store).getAll();
+        request.onsuccess = () => { results[store] = request.result; finishRead(); };
+        request.onerror = () => stop(request.error || new Error(`STOP: reading ${store} failed`));
+      }
+      for (const key of blobKeys) {
+        const request = transaction.objectStore('blobs').get(key);
+        request.onsuccess = () => { blobRows[key] = request.result; finishRead(); };
+        request.onerror = () => stop(request.error || new Error(`STOP: reading blob ${key} failed`));
+      }
     });
   }
 
@@ -2072,25 +2265,20 @@
     if (syncing) throw new Error('STOP: уже выполняется синхронизация');
     syncing = true;
     await updateSyncIndicator();
-    let deletedLegacy = null;
-    let repairCommitted = false;
     try {
       const preview = await buildRepair367Preview();
       if (!preview.eligible || preview.guard !== expectedGuard) throw new Error('STOP: состояние изменилось после Preview; ничего не применено');
-      const state = preview._state;
+      let state = preview._state;
       const fieldResults = [];
       for (const assessment of preview._fieldAssessments) fieldResults.push(await applyRepair367Field(assessment));
-      const canonicalBefore = state.localSpreads.find(row => row.id === REPAIR_367.canonicalLocalId);
-      deletedLegacy = state.localSpreads.find(row => row.id === REPAIR_367.legacyLocalId);
-      const effectiveLocal = state.localSpreads.filter(row => row.id !== REPAIR_367.legacyLocalId);
-      await del('spreads', REPAIR_367.legacyLocalId);
-      const afterDelete = (await getAll('spreads')).filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
-      const canonicalAfterDelete = afterDelete.find(row => row.id === REPAIR_367.canonicalLocalId);
-      if (afterDelete.length !== REPAIR_367.expectedSpreadCount
-          || new Set(afterDelete.map(row => row.server_id)).size !== REPAIR_367.expectedSpreadCount
-          || JSON.stringify(sanitizeDiagnosticValue(canonicalAfterDelete)) !== JSON.stringify(sanitizeDiagnosticValue(canonicalBefore))) {
-        throw new Error('STOP: local legacy retirement did not produce the exact canonical set');
+      const afterFields = await buildRepair367Preview();
+      if (!afterFields.eligible || afterFields.comparison.action !== preview.comparison.action
+          || JSON.stringify(sanitizeDiagnosticValue(afterFields._state.queue367))
+            !== JSON.stringify(sanitizeDiagnosticValue(state.queue367))) {
+        throw new Error('STOP: #367 state changed after field repairs');
       }
+      state = afterFields._state;
+      const effectiveLocal = state.localSpreads.filter(row => row.id !== REPAIR_367.legacyLocalId);
       let verifiedServerRows = state.serverSpreads;
       if (preview.comparison.action === 'fresh_reorder_then_retire') {
         const desiredIds = repair367Ids(effectiveLocal);
@@ -2113,7 +2301,7 @@
         }
         verifiedServerRows = reordered;
       }
-      await applyChangeBatch({spreads:verifiedServerRows});
+      await migrateRepair367References(state,verifiedServerRows);
       const synchronizedLocal = (await getAll('spreads')).filter(row => row.notebook_id === REPAIR_367.localNotebookId && !row.deleted_at);
       const synchronizedIds = repair367Ids(synchronizedLocal);
       const verifiedIds = repair367Ids(verifiedServerRows);
@@ -2129,11 +2317,27 @@
         throw new Error('STOP: local/server verification after fresh reorder failed');
       }
       const currentQueue = await get('sync_queue', REPAIR_367.queueId);
-      if (JSON.stringify(sanitizeDiagnosticValue(currentQueue)) !== JSON.stringify(sanitizeDiagnosticValue(state.queue367))) {
-        throw new Error('STOP: queue #367 changed before retirement');
+      if (currentQueue?.status !== 'done') throw new Error('STOP: queue #367 was not retired atomically');
+      const afterPhotos = await getAll('photos');
+      const beforePhotos = repair367DirectReferences(state,REPAIR_367.legacyLocalId).photos;
+      if (beforePhotos.length !== 7 || beforePhotos.some(before => {
+        const after = afterPhotos.find(row => row.id === before.id);
+        return !after || after.spread_id !== REPAIR_367.canonicalLocalId || after.server_id !== before.server_id
+          || after.version !== before.version || after.is_current !== before.is_current;
+      })) throw new Error('STOP: photo references failed post-migration verification');
+      for (const photo of beforePhotos) for (const kind of ['orig','thumb']) {
+        const actual = await blobDiagnostic(photo.id + '_' + kind);
+        const before = state.photoBlobs[photo.id][kind];
+        if (!actual.exists || actual.size !== before.size || actual.mime_type !== before.mime_type) {
+          throw new Error('STOP: photo blob failed post-migration verification');
+        }
       }
-      await retireRepair367(currentQueue);
-      repairCommitted = true;
+      const beforeNotes = repair367DirectReferences(state,REPAIR_367.legacyLocalId).notes;
+      const afterNotes = await getAll('spread_notes');
+      if (beforeNotes.some(before => {
+        const after = afterNotes.find(row => row.cache_id === before.cache_id);
+        return !after || after.spread_id !== REPAIR_367.canonicalLocalId || after.id !== before.id;
+      })) throw new Error('STOP: notes failed post-migration verification');
       const finalQueueAll = await getAll('sync_queue');
       return {
         completed:true, action:preview.comparison.action, notebook:preview.notebook,
@@ -2144,11 +2348,6 @@
         legacy_removed:!synchronizedLocal.some(row => row.id === REPAIR_367.legacyLocalId),
         field_repairs:fieldResults, data_preserved:true,
       };
-    } catch (error) {
-      if (deletedLegacy && !repairCommitted && !(await get('spreads', REPAIR_367.legacyLocalId))) {
-        await put('spreads', deletedLegacy);
-      }
-      throw error;
     } finally {
       syncing = false;
       await updateSyncIndicator();
@@ -2179,7 +2378,8 @@
         preview = await buildRepair367Preview();
         reportHost.innerHTML = `<h3>${preview.eligible ? 'Все проверки PASS' : 'STOP: есть несовпадения'}</h3>
           <ul>${preview.checks.map(check => `<li>${check.pass ? '✅' : '❌'} ${esc(check.key)}${check.detail === null ? '' : `<details><summary>Детали</summary>${diagnosticPre(check.detail)}</details>`}</li>`).join('')}</ul>
-          <h3>Сравнение и план</h3>${diagnosticPre({notebook:preview.notebook, comparison:preview.comparison, plan:preview.plan})}`;
+          <h3>Сравнение и план</h3>${diagnosticPre({notebook:preview.notebook, comparison:preview.comparison,
+            references:preview.reference_inventory, plan:preview.plan})}`;
         backupHost.textContent = JSON.stringify(preview.backup, null, 2);
         backupWrap.hidden = false; copyButton.disabled = false;
       } catch (error) {

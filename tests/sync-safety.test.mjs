@@ -10,11 +10,13 @@ function createRuntime(seed = {}) {
     spreads: new Map((seed.spreads || []).map(row => [row.id, structuredClone(row)])),
     tags: new Map((seed.tags || []).map(row => [row.id, structuredClone(row)])),
     photos: new Map((seed.photos || []).map(row => [row.id, structuredClone(row)])),
+    history: new Map((seed.history || []).map(row => [row.id, structuredClone(row)])),
+    settings: new Map((seed.storedSettings || []).map(row => [row.key, structuredClone(row)])),
     spread_notes: new Map((seed.spread_notes || []).map(row => [row.cache_id, structuredClone(row)])),
-    activity_events: new Map(),
+    activity_events: new Map((seed.activity_events || []).map(row => [row.cache_id, structuredClone(row)])),
     blobs: new Map((seed.blobs || []).map(row => [row.id, structuredClone(row)])),
-    spread_tags: new Map(),
-    user_favorites: new Map(),
+    spread_tags: new Map((seed.spread_tags || []).map(row => [row.id, structuredClone(row)])),
+    user_favorites: new Map((seed.user_favorites || []).map(row => [row.spread_id, structuredClone(row)])),
     sync_queue: new Map((seed.sync_queue || []).map(row => [row.id, structuredClone(row)]))
   };
   let apiImpl = async () => { throw new Error('Unexpected API request'); };
@@ -46,6 +48,31 @@ function createRuntime(seed = {}) {
     renderSyncStatus: () => {},
     document: {getElementById: () => null},
     fetch: (...args) => fetchImpl(...args),
+    openDB: async () => ({objectStoreNames:Object.keys(db), transaction(stores) {
+      const draft = Object.fromEntries(Object.entries(db).map(([name,rows]) => [name,new Map([...rows.entries()].map(([key,row]) => [key,structuredClone(row)]))]));
+      let pending = 0, aborted = false, completionQueued = false;
+      const tx = {oncomplete:null,onabort:null,error:null,abort() { aborted = true; tx.onabort?.(); },
+        objectStore(name) { assert.ok(stores.includes(name)); return {
+          getAll() { return read(() => [...draft[name].values()].map(row => structuredClone(row))); },
+          get(key) { return read(() => structuredClone(draft[name].get(key))); },
+          put(row) { const key = name === 'user_favorites' ? row.spread_id : name === 'sync_queue' ? row.id
+            : name === 'spread_notes' || name === 'activity_events' ? row.cache_id : row.id;
+            draft[name].set(key,structuredClone(row)); },
+          delete(key) { draft[name].delete(key); },
+        }; }};
+      function read(value) {
+        pending++; const request = {result:undefined,onsuccess:null,onerror:null};
+        queueMicrotask(() => { if (aborted) return; request.result = value(); pending--; request.onsuccess?.();
+          if (!pending && !completionQueued) { completionQueued = true; queueMicrotask(() => {
+            if (aborted) return;
+            for (const [name,rows] of Object.entries(draft)) db[name] = rows;
+            tx.oncomplete?.();
+          }); }
+        });
+        return request;
+      }
+      return tx;
+    }}),
     FormData: class { append() {} },
     api: (...args) => apiImpl(...args),
     get: async (store, id) => structuredClone(db[store].get(id)),
@@ -811,7 +838,17 @@ function repair367Fixture({serverContiguous = false} = {}) {
   const brokenItems = serverSpreads.map((row,index) => ({spread_id:row.id, expected_revision:row.revision,
     expected_number:index < 31 ? index + 1 : index + 2}));
   brokenItems[brokenItems.length - 1].spread_id = duplicatedId;
+  localSpreads[0].current_photo_id = 'mtkfmkwy79s1w8';
   localSpreads.push({...localSpreads[0], id:duplicatedId});
+  const legacyPhotos = Array.from({length:7},(_,index) => ({
+    id:index === 6 ? 'mtkfmkwy79s1w8' : `legacy-photo-${index + 1}`,
+    server_id:index === 6 ? '5522f6df-359f-4740-a572-efa36ed75cde' : `server-photo-${index + 1}`,
+    spread_id:duplicatedId,version:index + 1,is_current:index === 6,upload_status:'synced',
+    telegram_message_id:`telegram-${index + 1}`,
+  }));
+  const legacyBlobs = legacyPhotos.flatMap(photo => ['orig','thumb'].map(kind => ({
+    id:`${photo.id}_${kind}`,blob:new Blob([`${kind}-${photo.id}`],{type:'image/jpeg'}),
+  })));
   const fieldRepairs = [
     {queueId:782, localId:'mtwpwsgv6yctqj', serverId:'9204e6e2-040d-46cb-b57c-a5d122d145f7',
       number:26, mine:'Пер пионерский'},
@@ -836,6 +873,11 @@ function repair367Fixture({serverContiguous = false} = {}) {
       notebooks:[{id:localNotebookId, server_id:serverNotebookId, title:'Notebook #367'},
         {id:'mtwpkdb563vhqm', server_id:'8acccef3-4747-4bda-b7da-ad97fedf7d83', title:'Field repairs'}],
       spreads:localSpreads,
+      photos:legacyPhotos, blobs:legacyBlobs,
+      spread_notes:[{cache_id:'legacy-note',id:'server-note',spread_id:duplicatedId,
+        server_spread_id:duplicatedId,body:'preserve note',revision:1}],
+      history:[{id:1,spread_id:duplicatedId,action:'photo.added'}],
+      activity_events:[{cache_id:'activity-1',local_spread_id:duplicatedId,action:'photo.added'}],
       sync_queue:[{id:367, entity:'spread_order', local_id:localNotebookId, scope:`${backend}|u1`,
         status:'failed', retry_count:110, last_error:'invalid_order', payload:{client_ref:'broken-367', items:brokenItems}},
       ...fieldRepairs.map(repair => ({id:repair.queueId, entity:'spread_fields', local_id:repair.localId,
@@ -847,7 +889,7 @@ function repair367Fixture({serverContiguous = false} = {}) {
   };
 }
 
-function installRepair367Api(runtime, fixture, {serverContiguous = false} = {}) {
+function installRepair367Api(runtime, fixture, {serverContiguous = false, onOrder = null} = {}) {
   let orderSpreads = structuredClone(fixture.serverSpreads);
   const fieldServers = structuredClone(fixture.fieldServers);
   const calls = [];
@@ -875,6 +917,7 @@ function installRepair367Api(runtime, fixture, {serverContiguous = false} = {}) 
       const current = orderSpreads.find(row => row.id === item.spread_id);
       return {...current, number:index + 1, revision:current.revision + 1};
     });
+    onOrder?.();
     return {spreads:structuredClone(orderSpreads)};
   });
   return {calls, fieldServers};
@@ -893,7 +936,11 @@ async function testRepair367PreviewAndFreshReorder() {
   assert.equal(preview.comparison.action, 'fresh_reorder_then_retire');
   assert.equal(preview.comparison.local_rows_before, 51);
   assert.equal(preview.comparison.local_rows_after_legacy_retire, 50);
-  assert.equal(preview.comparison.legacy_reference_count, 0);
+  assert.equal(preview.comparison.legacy_reference_count, 10);
+  assert.equal(preview.comparison.references_to_migrate.photos, 7);
+  assert.equal(preview.comparison.references_to_migrate.notes, 1);
+  assert.equal(preview.comparison.immutable_references_to_preserve.history, 1);
+  assert.equal(preview.backup.reference_plan.migrate.photos.length, 7);
   assert.equal(preview.backup.canonical_spread.id, 'mtk12qcznnzdex');
   assert.equal(preview.backup.legacy_spread.id, fixture.duplicatedId);
   assert.equal(preview.backup.queue_367.id, 367);
@@ -917,8 +964,22 @@ async function testRepair367PreviewAndFreshReorder() {
     assert.equal(local.revision, 3);
     assert.equal(local.current_photo_id, `local-photo-${repair.queueId}`);
   }
-  assert.equal(runtime.db.photos.size, 0);
-  assert.equal(runtime.db.blobs.size, 0);
+  assert.equal(runtime.db.photos.size, 7);
+  assert.equal(runtime.db.blobs.size, 14);
+  for (const beforePhoto of fixture.seed.photos) {
+    const afterPhoto = runtime.db.photos.get(beforePhoto.id);
+    assert.equal(afterPhoto.spread_id,'mtk12qcznnzdex');
+    assert.equal(afterPhoto.server_id,beforePhoto.server_id);
+    assert.equal(afterPhoto.telegram_message_id,beforePhoto.telegram_message_id);
+    for (const kind of ['orig','thumb']) {
+      const id = `${beforePhoto.id}_${kind}`;
+      assert.equal(runtime.db.blobs.get(id).blob.size,fixture.seed.blobs.find(row => row.id === id).blob.size);
+    }
+  }
+  assert.equal(runtime.db.spreads.get('mtk12qcznnzdex').current_photo_id,'mtkfmkwy79s1w8');
+  assert.equal(runtime.db.spread_notes.get('legacy-note').spread_id,'mtk12qcznnzdex');
+  assert.equal(runtime.db.history.get(1).spread_id,fixture.duplicatedId,'immutable history remains unchanged');
+  assert.equal(runtime.db.activity_events.get('activity-1').local_spread_id,fixture.duplicatedId);
 }
 
 async function testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect() {
@@ -953,7 +1014,7 @@ async function testRepair367StopsOnAmbiguousMapping() {
 
 async function testRepair367StopsWhenLegacyHasAReference() {
   const fixture = repair367Fixture();
-  fixture.seed.photos = [{id:'legacy-photo', spread_id:fixture.duplicatedId, upload_status:'synced'}];
+  fixture.seed.photos.push({id:'unexpected-photo', spread_id:fixture.duplicatedId, version:8, upload_status:'synced'});
   const runtime = createRuntime(fixture.seed);
   let mutations = 0;
   runtime.setApi(async (path, options) => {
@@ -962,12 +1023,30 @@ async function testRepair367StopsWhenLegacyHasAReference() {
   });
   const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
   assert.equal(preview.eligible, false);
-  assert.equal(preview.comparison.legacy_reference_count, 1);
-  assert.equal(preview.backup.legacy_references.photos[0].id, 'legacy-photo');
+  assert.equal(preview.comparison.legacy_reference_count, 11);
+  assert.equal(preview.backup.legacy_references.photos.at(-1).id, 'unexpected-photo');
   await assert.rejects(runtime.context.window.v340Sync.applyRepair367(preview.guard), /ничего не применено/);
   assert.equal(mutations, 0);
   assert.equal(runtime.db.spreads.has(fixture.duplicatedId), true);
-  assert.equal(runtime.db.photos.has('legacy-photo'), true);
+  assert.equal(runtime.db.photos.has('unexpected-photo'), true);
+}
+
+async function testRepair367AbortKeepsLegacyAndChildren() {
+  const fixture = repair367Fixture();
+  const runtime = createRuntime(fixture.seed);
+  installRepair367Api(runtime,fixture,{onOrder:() => {
+    runtime.db.photos.get('legacy-photo-1').upload_status = 'changed-during-reorder';
+  }});
+  const preview = await runtime.context.window.v340Sync.buildRepair367Preview();
+  assert.equal(preview.eligible,true);
+  await assert.rejects(runtime.context.window.v340Sync.applyRepair367(preview.guard),
+    /STOP: local references changed before migration/);
+  assert.equal(runtime.db.sync_queue.get(367).status,'failed');
+  assert.equal(runtime.db.spreads.has(fixture.duplicatedId),true);
+  assert.equal(runtime.db.photos.size,7);
+  assert.equal(runtime.db.photos.get('mtkfmkwy79s1w8').spread_id,fixture.duplicatedId);
+  assert.equal(runtime.db.spread_notes.get('legacy-note').spread_id,fixture.duplicatedId);
+  assert.equal(runtime.db.blobs.size,14);
 }
 
 await testRepair910PreviewIsReadOnly();
@@ -978,5 +1057,6 @@ await testRepair367PreviewAndFreshReorder();
 await testRepair367RetiresWithoutWriteWhenServerAlreadyCorrect();
 await testRepair367StopsOnAmbiguousMapping();
 await testRepair367StopsWhenLegacyHasAReference();
+await testRepair367AbortKeepsLegacyAndChildren();
 
 console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repairs 9-10/#367)');
