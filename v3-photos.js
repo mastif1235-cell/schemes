@@ -10,9 +10,14 @@
   // metadata, current photos, pending/retrying uploads and photos of deleted spreads are
   // never touched.
   window.v340PruneOldPhotos = async function (options = {}) {
+    // Retention is strictly OPT-IN: the pre-existing default policy value ('none' since the
+    // setting was introduced dead in v3.x) must never start deleting existing local blobs on
+    // upgrade. Pruning is allowed only after the user explicitly picks a policy in Settings,
+    // which sets photo_retention_configured=true (local marker — no D1 migration needed).
+    if (!settings.photo_retention_configured) return {pruned:0, notOptedIn:true};
     const POLICY_KEEP = {none:0, last1:1, last3:3, all:Infinity};
     const keep = POLICY_KEEP[settings.keep_old_photos_policy];
-    if (!Number.isFinite(keep)) return {pruned:0};
+    if (!Number.isFinite(keep)) return {pruned:0}; // 'all' (and any unknown policy) never deletes
     if (!isAuthed()) return {pruned:0};
     if (!options.force) {
       const lastRun = Date.parse(settings.last_photo_retention_at || '');

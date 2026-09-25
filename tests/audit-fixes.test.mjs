@@ -28,7 +28,7 @@ try {
   await context.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
 
   // Synthetic backend state, controlled per scenario.
-  const apiState = {spreads:{}, notebooks:{}, log:[], dropNextRestore:false, online:true};
+  const apiState = {spreads:{}, notebooks:{}, log:[], dropNextRestore:false, online:true, oldWorker:false, photoAttempts:0};
   await page.route(origin + '/api/**', async route => {
     const url = new URL(route.request().url());
     const method = route.request().method();
@@ -36,7 +36,8 @@ try {
     if (!apiState.online) return route.abort();
     apiState.log.push(method + ' ' + path);
     const J = (o, status=200) => route.fulfill({status, contentType:'application/json', body:JSON.stringify(o)});
-    if (path === '/api/me') return J({user:{id:'u1', display_name:'U'}, devices:[], capabilities:{}});
+    if (path === '/api/me') return J({user:{id:'u1', display_name:'U'}, devices:[],
+      capabilities:{field_merge:true, team_notes:true, spread_order:true}});
     if (path === '/api/notebooks' && method === 'GET') {
       while (apiState.holdMembership) await new Promise(r => setTimeout(r, 25));
       return J({notebooks:Object.values(apiState.notebooks).filter(nb => !nb.deleted_at)});
@@ -47,8 +48,17 @@ try {
       if (!sp) return J({error:'not_found'}, 404);
       sp.deleted_at = '2026-09-24T10:00:00.000Z'; return J({ok:true});
     }
+    if (m && method === 'PATCH') {
+      const sp = apiState.spreads[m[1]];
+      if (!sp) return J({error:'not_found'}, 404);
+      const body = JSON.parse(route.request().postData() || '{}');
+      Object.assign(sp, {title:body.title ?? sp.title, note_short:body.note_short ?? sp.note_short,
+        revision:(sp.revision || 1) + 1, updated_at:'2026-09-25T00:00:00.000Z'});
+      return J({spread:sp});
+    }
     m = path.match(/^\/api\/spreads\/([^/]+)\/restore$/);
     if (m && method === 'POST') {
+      if (apiState.oldWorker) return J({error:'no_such_route'}, 404); // v3.5.9 worker: no such route
       if (apiState.dropNextRestore) { apiState.dropNextRestore = false; return route.abort(); } // lost response
       const sp = apiState.spreads[m[1]];
       if (!sp) return J({error:'not_found'}, 404);
@@ -64,6 +74,7 @@ try {
     }
     m = path.match(/^\/api\/notebooks\/([^/]+)\/restore$/);
     if (m && method === 'POST') {
+      if (apiState.oldWorker) return J({error:'no_such_route'}, 404);
       const nb = apiState.notebooks[m[1]];
       if (!nb) return J({error:'not_found'}, 404);
       const restored = !!nb.deleted_at;
@@ -197,6 +208,19 @@ try {
       }
       return predicate();
     };
+    window.__testDeleteSpread = async spreadId => {
+      const queue = await getAll('sync_queue');
+      const photoIds = new Set((await getAll('photos')).filter(row => row.spread_id === spreadId).map(row => row.id));
+      const retired = queue.filter(item => ['pending','syncing','failed','conflict','blocked'].includes(item.status)
+          && ((item.entity === 'spread' && item.local_id === spreadId) || (item.entity === 'photo' && photoIds.has(item.photo_id))))
+        .map(item => ({...item, status:'done', last_error:'superseded by local spread delete'}));
+      await window.vNextAtomic('spreads', spreadId, current => {
+        const now = nowISO();
+        return {row:{...current, deleted_at:current.deleted_at || now, favorite:false, updated_at:now},
+          item:{entity:'spread', local_id:spreadId, status:'pending', retry_count:0, payload:{op:'delete'}},
+          retired};
+      });
+    };
   });
   result = await page.evaluate(async () => {
     await openDB();
@@ -265,8 +289,10 @@ try {
     await put('sync_queue', {entity:'photo', photo_id:'phX', status:'pending', retry_count:0});
     return true;
   });
-  const tooLargeHandler = route =>
-    route.fulfill({status:413, contentType:'application/json', body:'{"error":"too_large"}'});
+  const tooLargeHandler = route => {
+    apiState.photoAttempts++;
+    return route.fulfill({status:413, contentType:'application/json', body:'{"error":"too_large"}'});
+  };
   await page.route(origin + '/api/spreads/srv-spA/photos', tooLargeHandler); // later registration wins
   result = await page.evaluate(async () => {
     await window.__syncUntil(async () => {
@@ -281,6 +307,19 @@ try {
   assert.equal(result.status, 'blocked', '413 blocks instead of infinite retry');
   assert.equal(result.reason, 'too_large');
   assert.equal(result.blob, true, 'original blob stays local');
+  // Review D: a manual sync retries the blocked op exactly once per pass, then parks again.
+  // If the classification were wrong, this would spin the upload in a tight loop.
+  apiState.photoAttempts = 0;
+  let oneShotDelta = 0;
+  for (let i = 0; i < 3 && oneShotDelta < 1; i++) {
+    const before = apiState.photoAttempts;
+    await page.evaluate(() => fullSync(true));
+    oneShotDelta = apiState.photoAttempts - before;
+    if (oneShotDelta < 1) await page.waitForTimeout(250);
+  }
+  assert.equal(oneShotDelta, 1, 'one manual sync = exactly one retry attempt, then blocked again');
+  result = await page.evaluate(async () => ({status:(await getAll('sync_queue')).find(q => q.photo_id === 'phX').status}));
+  assert.equal(result.status, 'blocked', '413 again parks the op instead of looping');
   await page.unroute(origin + '/api/spreads/srv-spA/photos', tooLargeHandler);
 
   // ---------- F4: without auth no upload attempt happens ----------
@@ -295,6 +334,10 @@ try {
   });
   assert.equal(result.before, result.after, 'queue untouched without auth');
   assert.notEqual(result.photo, 'synced');
+  await page.evaluate(async () => {
+    for (const q of await getAll('sync_queue')) if (q.photo_id === 'phX') await del('sync_queue', q.id);
+    await del('photos', 'phX');
+  });
 
   // ---------- F5: export never contains credentials ----------
   result = await page.evaluate(async () => {
@@ -307,7 +350,8 @@ try {
   });
   const exportedSettings = result.settings[0] || {};
   assert.ok(!('auth_token' in exportedSettings), 'auth_token is stripped from exported settings');
-  assert.ok(!Object.keys(exportedSettings).some(key => /token|secret/i.test(key)), 'no token/secret fields at all');
+  assert.ok(!Object.keys(exportedSettings).some(key => /token|secret|session/i.test(key)),
+    'no token/secret/session-shaped fields at all');
   assert.equal(result.hasQueue, true, 'queue still exported for diagnostics');
 
   // ---------- F6: safe import ----------
@@ -377,7 +421,7 @@ try {
   assert.ok(result.numLiteral, 'number renders as literal escaped text');
   assert.ok(!result.cardHtml.includes('<img src=x onerror'), 'no raw HTML from number/status in card markup');
 
-  // ---------- F7: conservative photo retention ----------
+  // ---------- F7: photo retention is strictly OPT-IN (never on plain upgrade) ----------
   result = await page.evaluate(async () => {
     await put('spreads', {id:'spR', server_id:'srv-spR', notebook_id:'nb1', number:9, title:'ret',
       status:'Актуально', deleted_at:null, current_photo_id:'phCur', revision:1});
@@ -392,22 +436,149 @@ try {
       await put('blobs', {id:id+'_thumb', blob:new Blob(['thumb-'+id])});
     }
     await put('sync_queue', {entity:'photo', photo_id:'phBusy', status:'pending', retry_count:0});
-    settings.keep_old_photos_policy = 'last1';
-    await saveSettings();
-    const first = await window.v340PruneOldPhotos({force:true});
+    // instrument every prune invocation (own calls + possible background hook)
+    window.__pruneCalls = [];
+    const origPrune = window.v340PruneOldPhotos;
+    window.v340PruneOldPhotos = async (...a) => {
+      const r = await origPrune(...a);
+      window.__pruneCalls.push({force:!!(a[0]||{}).force, r});
+      return r;
+    };
     const has = async id => !!(await get('blobs', id));
-    const afterLast1 = {cur:await has('phCur_orig'), v3:await has('phV3_orig'), v2:await has('phV2_orig'), busy:await has('phBusy_orig')};
+    const snap = async () => ({cur:await has('phCur_orig'), v3:await has('phV3_orig'), v2:await has('phV2_orig'),
+      busy:await has('phBusy_orig'), thumb:await has('phV2_thumb')});
+
+    // 1) plain upgrade: existing user, old dead default 'none', opt-in marker never set
+    delete settings.photo_retention_configured;
     settings.keep_old_photos_policy = 'none';
     await saveSettings();
-    const second = await window.v340PruneOldPhotos({force:true});
-    const afterNone = {cur:await has('phCur_orig'), v3:await has('phV3_orig'), v2:await has('phV2_orig'), busy:await has('phBusy_orig'), v2thumb:await has('phV2_thumb')};
-    return {first, second, afterLast1, afterNone};
+    const upgrade = await window.v340PruneOldPhotos({force:true});
+    const afterUpgrade = await snap();
+    // 2) existing user + successful sync: the post-sync hook must also delete nothing
+    await window.__syncUntil(async () => true, 2000); // real sync incl. the retention hook
+    const afterSync = await snap();
+
+    // 3) explicit choice via the real settings select (the UI wiring sets the opt-in marker)
+    // The product-side post-sync hook may legitimately beat the measurement below; count
+    // pruning via the instrumented total, not the single call's return value.
+    const last1Span = [window.__pruneCalls.length];
+    await renderSettings();
+    const selPolicyEl = document.querySelector('#selPolicy');
+    selPolicyEl.value = 'last1';
+    selPolicyEl.dispatchEvent(new Event('change'));
+    await new Promise(r => setTimeout(r, 120));
+    const markerAfterSelect = !!settings.photo_retention_configured && settings.keep_old_photos_policy === 'last1';
+    // deterministic: the settings-select race with the post-sync hook is excluded by
+    // pre-setting the daily throttle timestamp right before each forced run
+    const pruneDeterministic = async policy => {
+      settings.keep_old_photos_policy = policy;
+      settings.last_photo_retention_at = nowISO(); // hook sees "already ran today" and skips
+      await saveSettings();
+      return window.v340PruneOldPhotos({force:true});
+    };
+    const last1 = await pruneDeterministic('last1');
+    last1Span.push(window.__pruneCalls.length);
+    const afterLast1 = await snap();
+    // 4) explicit Last 3 afterwards: everything now fits the keep limit
+    const last3More = await pruneDeterministic('last3');
+    const afterLast3 = await snap();
+    // 5) explicit None: old synced originals go; current/pending/blocked/failed never; thumbs stay
+    const busyItem = (await getAll('sync_queue')).find(q => q.photo_id === 'phBusy');
+    busyItem.status = 'blocked'; await put('sync_queue', busyItem);
+    const noneRun = await pruneDeterministic('none');
+    const afterNone = await snap();
+    busyItem.status = 'failed'; await put('sync_queue', busyItem);
+    const noneAgain = await pruneDeterministic('none');
+    const afterFail = await snap();
+    // 6) explicit All never deletes anything, even after opt-in
+    const allRun = await pruneDeterministic('all');
+    const afterAll = await snap();
+    // test fixture cleanup so later drain-style waits stay photo-free
+    await del('sync_queue', busyItem.id);
+    await del('photos', 'phBusy');
+    return {upgrade, afterUpgrade, afterSync, markerAfterSelect,
+      last1, afterLast1, last1Span, last3More, afterLast3, noneRun, afterNone, noneAgain, afterFail, allRun, afterAll, pruneLog:window.__pruneCalls};
   });
-  assert.deepEqual(result.afterLast1, {cur:true, v3:true, v2:false, busy:true},
-    'last1 keeps current + newest old version + pending photo');
-  assert.deepEqual(result.afterNone, {cur:true, v3:false, v2:false, busy:true, v2thumb:true},
-    'none prunes all old synced originals but never current/pending; thumbnails kept');
-  assert.ok(result.first.pruned === 1 && result.second.pruned === 1, 'prune counts are exact');
+  assert.equal(result.upgrade.pruned, 0, 'upgrade with the old default prunes nothing');
+  assert.equal(result.upgrade.notOptedIn, true, 'prune reports opt-in required');
+  assert.deepEqual(result.afterUpgrade, {cur:true, v3:true, v2:true, busy:true, thumb:true},
+    'existing local blobs untouched on upgrade');
+  assert.deepEqual(result.afterSync, {cur:true, v3:true, v2:true, busy:true, thumb:true},
+    'existing local blobs untouched after a successful sync');
+  assert.equal(result.markerAfterSelect, true, 'settings select sets the explicit opt-in marker');
+  const prunedSum = span => result.pruneLog.slice(span[0], span[1]).reduce((n, c) => n + (c.r.pruned || 0), 0);
+  assert.equal(prunedSum(result.last1Span), 1,
+    'explicit Last 1 prunes exactly the overflow, exactly once (counter includes the sync hook if it fired)');
+  assert.deepEqual(result.afterLast1, {cur:true, v3:true, v2:false, busy:true, thumb:true},
+    'Last 1 keeps current + newest old version + pending photo');
+  assert.equal(result.last3More.pruned, 0, 'explicit Last 3 no-ops once the limit fits');
+  assert.deepEqual(result.afterLast3, result.afterLast1);
+  assert.equal(result.noneRun.pruned, 1, 'explicit None prunes the remaining old synced original');
+  assert.deepEqual(result.afterNone, {cur:true, v3:false, v2:false, busy:true, thumb:true},
+    'None prunes all old synced originals; blocked-upload photo kept');
+  assert.equal(result.noneAgain.pruned, 0, 'failed upload photo is never pruned');
+  assert.deepEqual(result.afterFail, result.afterNone);
+  assert.equal(result.allRun.pruned, 0, 'explicit All never deletes');
+  assert.deepEqual(result.afterAll, result.afterNone);
+
+  // ---------- new client + OLD (v3.5.9) worker that does not know /restore ----------
+  apiState.spreads['srv-spY'] = {id:'srv-spY', notebook_id:'srv-nb1', number:10, title:'victim Y', revision:1,
+    deleted_at:null, updated_at:'2026-09-20T00:00:00.000Z', created_at:'2026-09-01T00:00:00.000Z', current_photo_id:null};
+  apiState.oldWorker = true;
+  result = await page.evaluate(async () => {
+    await put('spreads', {id:'spY', server_id:'srv-spY', notebook_id:'nb1', number:10, title:'victim Y',
+      status:'Актуально', favorite:false, current_photo_id:null, created_at:'2026-09-20T00:00:00.000Z',
+      updated_at:'2026-09-20T00:00:00.000Z', deleted_at:null, revision:1});
+    await window.__testDeleteSpread('spY');
+    await window.__syncUntil(async () => (await getAll('sync_queue')).every(q => q.status === 'done'));
+    return {local:(await get('spreads','spY')).deleted_at};
+  });
+  assert.ok(result.local && apiState.spreads['srv-spY'].deleted_at, 'delete syncs fine on the old worker');
+  result = await page.evaluate(async () => {
+    await window.vNextSync.restoreFromTrash('spread', 'spY');
+    // let the op hit the old worker: it must NOT become 'done'
+    await window.__syncUntil(async () => {
+      const op = (await getAll('sync_queue')).filter(q => q.local_id === 'spY' && q.payload?.op === 'restore').at(-1);
+      return op && op.status !== 'pending' && op.status !== 'syncing';
+    }, 4000);
+    const op = (await getAll('sync_queue')).filter(q => q.local_id === 'spY' && q.payload?.op === 'restore').at(-1);
+    return {status:op.status, reason:op.blocked_reason || null, local:(await get('spreads','spY')).deleted_at};
+  });
+  assert.equal(result.status, 'blocked', 'unsupported /restore parks the op instead of faking success');
+  assert.equal(result.reason, 'unsupported_endpoint', 'blocked op explains that the worker is outdated');
+  assert.equal(result.local, null, 'locally restored record is kept while the op waits');
+  assert.ok(apiState.spreads['srv-spY'].deleted_at, 'server still holds the tombstone (nothing was faked)');
+  // pull protection: one more sync round while the op is parked — tombstone must not win
+  result = await page.evaluate(async () => {
+    await window.__syncUntil(async () => true, 1600);
+    return (await get('spreads','spY')).deleted_at;
+  });
+  assert.equal(result, null, 'blocked restore still shields the record from the server tombstone');
+  // Review C: independent changes keep syncing while the restore op is parked
+  result = await page.evaluate(async () => {
+    const spA = await get('spreads','spA');
+    await put('spreads', {...spA, title:'independent edit', updated_at:nowISO()});
+    await put('sync_queue', {entity:'spread', local_id:'spA', status:'pending', retry_count:0, payload:{}});
+    const drained = await window.__syncUntil(async () =>
+      (await getAll('sync_queue')).every(q => q.local_id !== 'spA' || q.entity === 'photo' || q.status === 'done'));
+    const ops = (await getAll('sync_queue')).filter(q => q.local_id === 'spA')
+      .map(q => ({entity:q.entity, status:q.status, err:q.last_error || null}));
+    return {drained, ops, restore:(await getAll('sync_queue')).filter(q => q.local_id === 'spY' && q.payload?.op === 'restore').at(-1).status};
+  });
+  if (!result.drained) console.error('SIBLING DEBUG', JSON.stringify(result), JSON.stringify(apiState.log.slice(-12)));
+  assert.equal(result.restore, 'blocked', 'parked restore undisturbed while siblings sync');
+  assert.ok(apiState.log.some(line => line === 'PATCH /api/spreads/srv-spA'), 'sibling change reached the server');
+  assert.equal(apiState.spreads['srv-spA'].title, 'independent edit');
+  // after the worker rollout (deployment order is worker-first) the parked op completes
+  apiState.oldWorker = false;
+  result = await page.evaluate(async () => {
+    await window.__syncUntil(async () => (await getAll('sync_queue')).every(q => q.status === 'done'));
+    return {op:(await getAll('sync_queue')).filter(q => q.local_id === 'spY' && q.payload?.op === 'restore').at(-1).status,
+      local:(await get('spreads','spY')).deleted_at};
+  });
+  assert.equal(result.op, 'done', 'restore op completes once the worker supports it');
+  assert.equal(result.local, null);
+  assert.equal(apiState.spreads['srv-spY'].deleted_at, null, 'server tombstone cleared after the rollout');
 
   assert.deepEqual(errors, [], 'no page errors during audit-fix scenarios');
   console.log('audit-fixes: PASS (F1 trash restore chains incl. offline/lost-response/reload, F3 notebook outbox, F10 blocked retry, F4 auth-gated upload, F5 sanitized export, F6 safe import, F2 escaping, F7 retention)');

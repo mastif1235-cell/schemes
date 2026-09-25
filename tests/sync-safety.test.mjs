@@ -1159,6 +1159,31 @@ async function testRestoreOpPushesRestoreEndpoint() {
   assert.equal(runtime.db.spreads.get('sp-local').revision, 4, 'local revision follows restored server row');
 }
 
+async function testRestoreOpWaitsForWorkerRollout() {
+  // Old (pre-3.6.0) worker answers 404 'no_such_route' for /restore: that must never count as
+  // a successful restore — the op parks (blocked/unsupported) and keeps shielding the record,
+  // then completes once the worker supports the endpoint (deployment is worker-first).
+  const runtime = createRuntime({
+    notebooks:[{id:'nb-local', server_id:'nb-server'}],
+    spreads:[{id:'sp-local', server_id:'sp-server', notebook_id:'nb-local', deleted_at:null, revision:3, number:1, title:'A'}],
+    sync_queue:[{id:44, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0, payload:{op:'restore'}}]
+  });
+  runtime.setApi(async () => { throw Object.assign(new Error('no_such_route'), {status:404}); });
+  await runtime.context.pushEntityQueue(false);
+  const parked = runtime.db.sync_queue.get(44);
+  assert.equal(parked.status, 'blocked', 'no_such_route does not mark the restore as done');
+  assert.equal(parked.blocked_reason, 'unsupported_endpoint');
+  // pull with the server tombstone while parked: record must survive
+  await runtime.context.applyChangeBatch({spreads:[{id:'sp-server', notebook_id:'nb-server', number:1, title:'A',
+    deleted_at:'2026-09-24T12:00:00.000Z', revision:3, updated_at:'2026-09-24T12:00:00.000Z', created_at:'2026-09-01T00:00:00.000Z'}]});
+  assert.equal(runtime.db.spreads.get('sp-local').deleted_at, null, 'parked restore shields the record');
+  // worker rollout done: a manual sync completes the restore
+  runtime.setApi(async () => ({spread:{id:'sp-server', revision:5}}));
+  await runtime.context.pushEntityQueue(true);
+  assert.equal(runtime.db.sync_queue.get(44).status, 'done', 'restore completes after the rollout');
+  assert.equal(runtime.db.spreads.get('sp-local').revision, 5);
+}
+
 async function testPullCannotResurrectWhileRestorePending() {
   // THE F1 chain regression: server tombstone must not re-delete a spread with a pending restore.
   const runtime = createRuntime({
@@ -1267,6 +1292,7 @@ async function testPhotosWaitForSignInWithoutNetwork() {
 
 await testRestoreFromTrashRetiresPendingDelete();
 await testRestoreOpPushesRestoreEndpoint();
+await testRestoreOpWaitsForWorkerRollout();
 await testPullCannotResurrectWhileRestorePending();
 await testNotebookDeleteIsPersistentOutbox();
 await testPermanentErrorsBlockedNotRetried();

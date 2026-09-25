@@ -671,6 +671,14 @@ assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
 {
   // F1/F3: restore endpoints
   const fx = createFixture();
+  // A: a third party with NO membership must not restore foreign notebooks/spreads
+  fx.sqlite.prepare('INSERT INTO users VALUES (?,?,?)').run('u3', 'Чужой', new Date().toISOString());
+  fx.sqlite.prepare('INSERT INTO sessions(id,user_id,token_hash,device_name,created_at,expires_at) VALUES(?,?,?,?,?,?)')
+    .run('session-3', 'u3', tokenHash('token-3'), 'pc', new Date().toISOString(), '2099-01-01T00:00:00.000Z');
+  assert.equal((await api(fx.env, 'POST', '/api/spreads/s1/restore', 'token-3')).status, 403,
+    'non-member cannot restore a spread');
+  assert.equal((await api(fx.env, 'POST', '/api/notebooks/n1/restore', 'token-3')).status, 403,
+    'non-member cannot restore a notebook');
   // delete twice (idempotent), then restore
   for (let i = 0; i < 2; i++) assert.equal((await api(fx.env, 'DELETE', '/api/spreads/s1', 'token-2')).status, 200);
   const tombstoned = fx.sqlite.prepare('SELECT deleted_at FROM spreads WHERE id=?').get('s1');
@@ -705,6 +713,12 @@ assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
   assert.equal(nbRestored.data.restored, true);
   assert.equal(fx.sqlite.prepare('SELECT deleted_at FROM notebooks WHERE id=?').get('n1').deleted_at, null);
   assert.equal((await api(fx.env, 'POST', '/api/notebooks/n1/restore', 'token-1')).data.restored, false);
+  const nbRestoreActivity = fx.sqlite.prepare("SELECT COUNT(*) AS c FROM activity_events WHERE action='notebook.restored'").get().c;
+  assert.equal(nbRestoreActivity, 1, 'notebook restore retry does not duplicate activity');
+  const nbRestoreHistory = fx.sqlite.prepare("SELECT COUNT(*) AS c FROM history WHERE action='notebook_restored'").get().c;
+  assert.equal(nbRestoreHistory, 1, 'notebook restore retry does not duplicate history');
+  const spRestoreHistory = fx.sqlite.prepare("SELECT COUNT(*) AS c FROM history WHERE action='spread_restored'").get().c;
+  assert.ok(spRestoreHistory >= 1, 'spread restore recorded in history exactly per actual restore');
   // after notebook restore the spread can be restored again
   assert.equal((await api(fx.env, 'POST', '/api/spreads/s1/restore', 'token-1')).status, 200);
   // photos/notes of the spread were never touched (children preserved through delete+restore)
@@ -747,8 +761,16 @@ assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
   assert.ok(new Date(renewed) > new Date(Date.now() + 170 * 24 * 3600 * 1000), 'active session near expiry is renewed');
   const untouched = fx.sqlite.prepare('SELECT expires_at FROM sessions WHERE id=?').get('session-2').expires_at;
   assert.equal(untouched, far, 'session with plenty of time left is not rewritten');
-  fx.sqlite.prepare('UPDATE sessions SET expires_at=? WHERE id=?').run(new Date(Date.now() - 1000).toISOString(), 'session-2');
+  const pastExp = new Date(Date.now() - 1000).toISOString();
+  fx.sqlite.prepare('UPDATE sessions SET expires_at=? WHERE id=?').run(pastExp, 'session-2');
   assert.equal((await api(fx.env, 'GET', '/api/me', 'token-2')).status, 401, 'expired session stays expired');
+  assert.equal(fx.sqlite.prepare('SELECT expires_at FROM sessions WHERE id=?').get('session-2').expires_at, pastExp,
+    'expired session is never rewritten/renewed');
+  const revokedBefore = fx.sqlite.prepare('SELECT expires_at FROM sessions WHERE id=?').get('session-1').expires_at;
+  fx.sqlite.prepare('UPDATE sessions SET revoked_at=? WHERE id=?').run(new Date().toISOString(), 'session-1');
+  assert.equal((await api(fx.env, 'GET', '/api/me', 'token-1')).status, 401, 'revoked session is rejected');
+  assert.equal(fx.sqlite.prepare('SELECT expires_at FROM sessions WHERE id=?').get('session-1').expires_at, revokedBefore,
+    'revoked session is never renewed');
 }
 {
   // F8: large preview must not crash the photo upload

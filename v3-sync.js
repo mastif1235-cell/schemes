@@ -611,7 +611,11 @@
       if (!nb.server_id) return queueResult('sent'); // never reached the server
       try { await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}/restore`, {method:'POST'}); }
       catch (error) {
+        // 'no_such_route' = the deployed worker predates the /restore endpoint (the rollout is
+        // worker-first). That is NOT a successful restore: park the op, keep the record local.
         if (!error || error.status !== 404) throw error;
+        if (String(error.message || '') === 'no_such_route')
+          throw Object.assign(new Error('worker_missing_restore_endpoint'), {status:404, unsupported:true});
       }
       return queueResult('sent');
     }
@@ -662,7 +666,11 @@
           if (latest) await put('spreads', {...latest, revision:data.spread.revision, deleted_at:null});
         }
       } catch (error) {
-        if (error && error.status === 404) return queueResult('sent', 'spread is gone on the server');
+        if (error && error.status === 404) {
+          if (String(error.message || '') === 'no_such_route')
+            throw Object.assign(new Error('worker_missing_restore_endpoint'), {status:404, unsupported:true});
+          return queueResult('sent', 'spread is gone on the server'); // entity truly absent
+        }
         throw error;
       }
       return queueResult('sent');
@@ -803,6 +811,14 @@
             local.conflict = item.server_copy || true;
             await put(item.entity === 'notebook' ? 'notebooks' : 'spreads', local);
           }
+        } else if (error && error.unsupported) {
+          // Deployment window: the worker does not know this endpoint (e.g. /restore).
+          // Blocked protects the local record from pull and keeps other entities flowing;
+          // the manual sync button (fullSync(true)) retries it after the worker rollout.
+          markBlocked(item, error, 'unsupported_endpoint');
+          item.last_error = 'Нужна более новая серверная версия (worker); операция ожидает обновления';
+          await put('sync_queue', item);
+          console.warn('Deferred sync item blocked (worker endpoint unsupported)', item.entity, item.local_id);
         } else if (['permanent','too_large','auth'].includes(classifyPushError(error))) {
           // 4xx the server will keep rejecting: stop automatic retries, keep payload local.
           markBlocked(item, error, classifyPushError(error));
