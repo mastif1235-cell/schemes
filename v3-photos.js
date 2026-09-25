@@ -73,6 +73,15 @@
   window.v354LegacyTelegramLinkFromStorageObject = legacyTelegramLinkFromStorageObject;
 
   function getTelegramPhotoLink(photo) {
+    // Dual storage: prefer the auxiliary PREVIEW message (sendPhoto — nice inline gallery);
+    // the canonical sendDocument link stays the fallback for legacy/document-only photos.
+    const previewLink = typeof photo?.telegram_preview_link === 'string' ? photo.telegram_preview_link.trim() : '';
+    if (previewLink) {
+      try {
+        const parsedPreview = new URL(previewLink, location.href);
+        if (parsedPreview.protocol === 'https:' && parsedPreview.hostname === 't.me') return parsedPreview.href;
+      } catch (error) { console.warn('Invalid Telegram photo preview link', error); }
+    }
     const link = typeof photo?.telegram_link === 'string' ? photo.telegram_link.trim() : '';
     if (link) {
       try {

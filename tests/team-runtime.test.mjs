@@ -938,24 +938,49 @@ try {
   assert.ok(telegramView.none.caption.includes('Telegram'), 'metadata-less photo explains itself instead of silence');
   assert.equal(telegramView.none.title, 'Нет открываемой копии в Telegram', 'disabled button carries an explanation');
 
-  // ---- v3.6.3 (4/4): device-local send-as-photo opt-in toggle in settings ----
+  // ---- v3.6.3d: dual storage — the button opens the PREVIEW message; dual row keeps document ids ----
+  const dualRows = await page.evaluate(async () => {
+    const encode = (chat, message) => btoa(chat + ':' + message);
+    await put('photos', {id:'ph-dual', spread_id:'s2', version:2, is_current:true, upload_status:'synced',
+      telegram_message_id:'600', telegram_file_id:'doc-file', telegram_link:'https://t.me/c/555777/600',
+      telegram_preview_link:'https://t.me/c/555777/910', preview_message_id:'910', preview_file_id:'view-file',
+      preview_pending:false, telegram_method:'document+photo',
+      storage_object_id:encode('-100555777','600')});
+    const dualLink = window.v350GetTelegramPhotoLink(await get('photos','ph-dual'));
+    const pendingLink = window.v350GetTelegramPhotoLink({upload_status:'synced',
+      telegram_link:'https://t.me/c/555777/600', telegram_preview_link:null, preview_pending:true, preview_message_id:null});
+    return {dualLink, pendingLink};
+  });
+  assert.equal(dualRows.dualLink, 'https://t.me/c/555777/910',
+    'dual-storage photo opens the preview (sendPhoto) message');
+  assert.equal(dualRows.pendingLink, 'https://t.me/c/555777/600',
+    'pending preview falls back to the canonical document message');
+
+  // ---- v3.6.3 (4/4): device-local preview toggle in settings (dual mode is the default) ----
   const toggle = await page.evaluate(async () => {
-    settings.telegram_send_as_photo = false; await saveSettings();
+    delete settings.telegram_photo_preview; await saveSettings();
     document.querySelector('.bottomnav [data-nav="settings"]')?.click();
     await new Promise(resolve => setTimeout(resolve, 400));
     const sw = document.querySelector('#swTelegramPhoto');
-    const initiallyOff = sw && !sw.classList.contains('on');
+    const initiallyOn = sw && sw.classList.contains('on');
+    const label = sw ? sw.closest('.settings-row')?.textContent.replace(/\s+/g,' ').trim() : null;
     sw?.click();
     await new Promise(resolve => setTimeout(resolve, 150));
-    const stored = (await get('settings','app')).telegram_send_as_photo;
-    const on = sw?.classList.contains('on');
+    const stored = (await get('settings','app')).telegram_photo_preview;
+    const off = sw && !sw.classList.contains('on');
+    sw?.click();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const restored = (await get('settings','app')).telegram_photo_preview;
     route = {screen:'notebooks'}; await render();
-    return {exists:!!sw, initiallyOff, stored, on};
+    return {exists:!!sw, initiallyOn, stored, off, restored, label};
   });
   assert.equal(toggle.exists, true, 'settings expose the Telegram photo toggle');
-  assert.equal(toggle.initiallyOff, true, 'toggle defaults to the lossless document mode');
-  assert.equal(toggle.stored, true, 'toggle persists the opt-in locally');
-  assert.equal(toggle.on, true, 'toggle reflects the enabled state');
+  assert.equal(toggle.initiallyOn, true, 'dual mode (document + preview) is the default');
+  assert.equal(toggle.stored, false, 'toggle can disable the preview for new uploads');
+  assert.equal(toggle.off, true, 'toggle reflects the disabled state');
+  assert.equal(toggle.restored, true, 'state persists across re-toggles');
+  assert.ok(/Создавать превью фото в Telegram/.test(toggle.label), 'toggle labelled as preview creation');
+  assert.ok(/без сжатия/.test(toggle.label), 'label promises the lossless document original regardless');
 
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');

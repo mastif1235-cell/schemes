@@ -77,24 +77,39 @@ assert.match(workerSource, /decodeStorageObjectId\(row\.storage_object_id\)/,
   'backend derives the Telegram link for legacy rows from storage_object_id');
 assert.match(workerSource, /telegram_link: messageId && messageChatId \? telegramLink\(messageChatId, messageId\)/,
   'backend computes Telegram links from the correct chat and message id');
-
-// sendPhoto is opt-in, guarded, and always falls back to lossless sendDocument.
+// Dual storage contract: sendDocument = canonical original (always, first), sendPhoto = the
+// auxiliary preview (opt-in, guarded, after the document, never a restore source).
 assert.match(workerSource, /async function telegramSendPhoto\(env, blob, filename\)/, 'worker implements sendPhoto');
 assert.match(workerSource, /\/sendPhoto`, \{ method: 'POST', body: fd \}\)/, 'sendPhoto posts to the sendPhoto endpoint');
-assert.match(workerSource, /form\.get\('send_as'\) \|\| ''\) === 'photo'/, 'sendPhoto is client opt-in only');
-assert.match(workerSource, /image\\\/\(jpeg\|png\|webp\)\$\/\.test/, 'sendPhoto is limited to photo mime types');
-assert.match(workerSource, /Number\(file\.size\) <= 10 \* 1024 \* 1024/, 'sendPhoto respects the 10 MB photo limit');
-assert.match(workerSource, /falling back to sendDocument/, 'sendPhoto failure falls back to sendDocument');
-assert.match(workerSource, /telegram_method: telegramMethod/, 'upload response records the actual Telegram method');
-assert.match(workerSource, /if \(!tgResult\) tgResult = await telegramSendDocument/,
-  'document upload always succeeds when sendPhoto is not used');
-assert.match(workerSource, /photos: publicPhotos\(photos\.results, env\)/,
-  'snapshot returns mapped public photos with computed links');
-assert.match(workerSource, /changes\[tables\[i\]\.name\] = tables\[i\]\.name === 'photos' \? publicPhotos\(rows, env\) : rows/,
-  'sync returns mapped public photos with computed links');
-assert.match(workerSource, /return json\(\{ photo: publicPhoto\(photo, env\) \}\)/,
-  'photo GET returns mapped public photo metadata');
-assert.match(workerSource, /uploadedPhoto = publicPhoto/,
-  'fresh upload response is built from mapped public photo metadata');
+assert.match(workerSource, /async function sendTelegramPreview\(env, blob, spreadId, version\)/,
+  'preview sending is isolated in a soft-fail helper');
+assert.match(workerSource, /form\.get\('photo_preview'\) \|\| ''\) === '1'/,
+  'preview creation is an explicit client request');
+assert.match(workerSource, /\^image\\\/\(jpeg\|png\|webp\)\$\/\.test/, 'preview is limited to photo mime types');
+assert.match(workerSource, /Number\(file\.size\) <= 10 \* 1024 \* 1024/, 'preview respects the 10 MB photo limit');
+assert.match(workerSource, /const tgResult = await telegramSendDocument/,
+  'the canonical original always goes through sendDocument');
+assert.match(workerSource, /docExtras\.message_id, docExtras\.file_id,/,
+  'photos row persists the DOCUMENT identifiers (source of truth)');
+assert.match(workerSource, /telegram_preview_link: mapped\.telegram_preview_link/,
+  'preview link is exposed alongside the document link');
+assert.match(workerSource, /\{ pending: true, phase: 'sending' \}/, 'preview has a pending/in-flight state');
+assert.match(workerSource, /AND result_json=\?/, 'preview claim is a compare-and-swap on the idempotency ledger');
+assert.match(workerSource, /dualLedgerJson/, 'dual state lives in the uploads ledger (no D1 migration)');
+assert.match(workerSource, /'document\+photo' : 'document'/, 'upload response records the actual Telegram mode');
+assert.match(workerSource, /SELECT \* FROM photos WHERE client_upload_id=\?/,
+  'retry/crash-resume converges on the existing photo row');
+assert.match(workerSource, /await photosWithPreview\(env, photos\.results\)/,
+  'snapshot returns photos with merged preview references');
+assert.match(workerSource, /await photosWithPreview\(env, rows\)/,
+  'sync returns photos with merged preview references');
+assert.match(workerSource, /return json\(\{ photo: await photoWithPreview\(env, photo\) \}\)/,
+  'photo GET returns mapped public photo + preview metadata');
+assert.ok(workerSource.indexOf('telegramSendDocument(env, file') <
+  workerSource.indexOf('await sendTelegramPreview(env, file'), 'document is sent BEFORE the preview in the upload flow');
+assert.match(workerSource, /const doc = tgResult\.document;/,
+  'the canonical file_id comes from the sendDocument document only');
+assert.doesNotMatch(workerSource, /INSERT INTO photos[\s\S]{0,700}previewExtras/,
+  'the photos INSERT never uses preview identifiers');
 
 console.log('photo-telegram-link: PASS');

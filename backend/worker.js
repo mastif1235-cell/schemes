@@ -229,6 +229,103 @@ function publicPhotos(rows, env) {
   return (rows || []).map(row => publicPhoto(row, env));
 }
 
+// ---------------------------------------------------------------- dual Telegram storage
+// New uploads may create TWO Telegram messages: sendDocument (canonical original — restore,
+// second device, /file, retention safety) and sendPhoto (auxiliary preview for the Telegram
+// gallery/button; Telegram re-encodes it, so it must never be used as the original).
+// photos.* always carries the DOCUMENT identifiers. Preview identifiers need durable storage,
+// but photos has no JSON column and we must not run a D1 migration, so the dual state lives in
+// the EXISTING idempotency ledger (uploads.result_json, keyed by client_upload_id):
+//   { response: <cached response|null>, extras: { doc: {...}, preview: {…}|{pending:true}|null } }
+// That table already guarantees one logical record per upload and is the natural source to
+// resume the preview without ever resending the document.
+function dualLedgerFromRow(uploadRow) {
+  if (!uploadRow?.result_json) return null;
+  try {
+    const parsed = JSON.parse(uploadRow.result_json);
+    if (parsed && typeof parsed === 'object' && 'extras' in parsed) return parsed;
+  } catch { /* legacy plain-response rows: ignore */ }
+  return null; // rows written by older clients keep the legacy shape (response only)
+}
+
+function mergePreviewIntoPhoto(mapped, extras) {
+  if (!mapped) return mapped;
+  const preview = extras?.preview;
+  if (preview && preview.message_id && preview.chat_id) {
+    mapped.preview_message_id = preview.message_id;
+    mapped.preview_file_id = preview.file_id || null;
+    mapped.telegram_preview_link = telegramLink(preview.chat_id, preview.message_id);
+    mapped.preview_pending = false;
+  } else if (preview && preview.pending) {
+    mapped.preview_message_id = null;
+    mapped.preview_file_id = null;
+    mapped.telegram_preview_link = null;
+    mapped.preview_pending = true;
+  } else {
+    mapped.preview_message_id = mapped.preview_message_id ?? null;
+    mapped.preview_file_id = null;
+    mapped.telegram_preview_link = null;
+    mapped.preview_pending = false;
+  }
+  return mapped;
+}
+
+async function photoWithPreview(env, row) {
+  const mapped = publicPhoto(row, env);
+  if (!mapped || !row?.client_upload_id) return mapped;
+  const ledgerRow = await env.DB.prepare('SELECT result_json FROM uploads WHERE client_upload_id=?')
+    .bind(row.client_upload_id).first();
+  return mergePreviewIntoPhoto(mapped, dualLedgerFromRow(ledgerRow)?.extras);
+}
+
+async function photosWithPreview(env, rows) {
+  const list = rows || [];
+  if (!list.length) return [];
+  const ids = [...new Set(list.map(row => row.client_upload_id).filter(Boolean))];
+  if (!ids.length) return publicPhotos(list, env);
+  const placeholders = ids.map(() => '?').join(',');
+  const ledgerRows = await env.DB.prepare(
+    `SELECT client_upload_id, result_json FROM uploads WHERE client_upload_id IN (${placeholders})`
+  ).bind(...ids).all();
+  const extrasById = new Map((ledgerRows.results || [])
+    .map(row => [row.client_upload_id, dualLedgerFromRow(row)?.extras]));
+  return list.map(row => mergePreviewIntoPhoto(publicPhoto(row, env), extrasById.get(row.client_upload_id)));
+}
+
+function dualLedgerJson(extras, response) {
+  return JSON.stringify({ response: response ?? null, extras });
+}
+
+// Persist ledger progress. `expectedJson` makes the write a compare-and-swap so two requests
+// racing for the same client_upload_id cannot both own the preview send.
+async function writeDualLedger(env, clientUploadId, photoId, extras, response, expectedJson) {
+  const nextJson = dualLedgerJson(extras, response);
+  const result = expectedJson === undefined
+    ? await env.DB.prepare('UPDATE uploads SET photo_id=?, result_json=? WHERE client_upload_id=?')
+        .bind(photoId ?? null, nextJson, clientUploadId).run()
+    : await env.DB.prepare('UPDATE uploads SET photo_id=?, result_json=? WHERE client_upload_id=? AND result_json=?')
+        .bind(photoId ?? null, nextJson, clientUploadId, expectedJson).run();
+  return { json: nextJson, changed: Number(result?.meta?.changes || 0) > 0 };
+}
+
+const workerSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Poll the ledger until the document identifiers appear (owner mid-flight) and, optionally,
+// until the photos row exists (owner finished). Returns {ledgerRow, parsed, photoRow}.
+async function waitForDualLedger(env, clientUploadId, { docAttempts = 12, photoAttempts = 8, delayMs = 200 } = {}) {
+  let ledgerRow = null, parsed = null, photoRow = null;
+  for (let i = 0; i < docAttempts && !parsed?.extras?.doc; i++) {
+    ledgerRow = await env.DB.prepare('SELECT * FROM uploads WHERE client_upload_id=?').bind(clientUploadId).first();
+    parsed = dualLedgerFromRow(ledgerRow);
+    if (!parsed?.extras?.doc) await workerSleep(delayMs);
+  }
+  for (let i = 0; i < photoAttempts && parsed?.extras?.doc && !photoRow; i++) {
+    photoRow = await env.DB.prepare('SELECT * FROM photos WHERE client_upload_id=?').bind(clientUploadId).first();
+    if (!photoRow) await workerSleep(delayMs);
+  }
+  return { ledgerRow, parsed, photoRow };
+}
+
 function publicCover(row) {
   if (!row) return null;
   return {
@@ -384,8 +481,9 @@ async function telegramSendDocument(env, blob, filename) {
 }
 
 // sendPhoto renders an inline gallery in Telegram, but Telegram re-encodes the image (largest
-// PhotoSize ~2560px) — the returned file is NOT the uploaded original. Used only when the client
-// explicitly opts in via send_as=photo; the default stays lossless sendDocument.
+// PhotoSize ~2560px) — the returned file is NOT the uploaded original. Used ONLY for the
+// auxiliary preview message in the dual-storage upload flow; the canonical original is always
+// sendDocument.
 async function telegramSendPhoto(env, blob, filename) {
   const fd = new FormData();
   fd.append('chat_id', env.CHAT_ID);
@@ -410,6 +508,26 @@ function largestPhotoSize(sizes) {
     const bestArea = best ? Number(best.width || 0) * Number(best.height || 0) : -1;
     return area > bestArea ? size : best;
   }, null);
+}
+
+// Creates the auxiliary preview message via sendPhoto. NEVER a restore source: Telegram returns
+// its re-encoded copy. Failure is soft — the caller records {pending:true} while the canonical
+// sendDocument original counts the photo as successfully stored.
+async function sendTelegramPreview(env, blob, spreadId, version) {
+  try {
+    const result = await telegramSendPhoto(env, blob, `spread_${spreadId}_v${version}`);
+    const size = largestPhotoSize(result.photo);
+    if (!size || !size.file_id) throw new HttpError(502, 'telegram_error', 'sendPhoto returned no photo sizes');
+    return { message_id: result.message_id, chat_id: env.CHAT_ID, file_id: size.file_id,
+      file_unique_id: size.file_unique_id || null, file_size: size.file_size || null };
+  } catch (previewError) {
+    console.warn('dual: sendPhoto preview failed for spread', spreadId, '(original stays safe):',
+      previewError instanceof Error ? previewError.message : previewError);
+    const reason = previewError instanceof HttpError
+      ? (previewError.detail || previewError.code)
+      : (previewError?.message || previewError);
+    return { pending: true, error: String(reason).slice(0, 200) };
+  }
 }
 function telegramLink(chatId, messageId) {
   const normalizedMessageId = Number(messageId);
@@ -724,7 +842,7 @@ on('GET', '/api/notebooks/:id/snapshot', async (request, env, p) => {
     FROM spread_notes sn WHERE notebook_id=?`).bind(p.id).all();
   const cursorRow = await env.DB.prepare('SELECT MAX(seq) as m FROM change_seq').first();
   return json({
-    notebook, spreads: spreads.results, photos: publicPhotos(photos.results, env), tags: tags.results,
+    notebook, spreads: spreads.results, photos: await photosWithPreview(env, photos.results), tags: tags.results,
     spread_tags: spreadTags.results, favorites: favorites.results, members: members.results, spread_notes: notes.results,
     cover: (await hasCoverSchema(env)) ? publicCover(await selectCover(env, p.id)) : null,
     cursor: cursorRow.m || 0,
@@ -1473,12 +1591,86 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   const clientUploadId = form.get('client_upload_id');
   if (!file || !clientUploadId) return err(400, 'file_and_client_upload_id_required');
 
+  // Dual storage: every new upload writes the canonical ORIGINAL via sendDocument first
+  // (source of truth for restore / second device / :id/file / retention). When the client asks
+  // (photo_preview=1, legacy send_as=photo alias) an auxiliary PREVIEW via sendPhoto is added —
+  // Telegram gallery only, never a restore source. Preview identifiers live in the uploads
+  // idempotency ledger (no D1 migration): result_json = {response, extras:{doc, preview|{pending}|null}},
+  // so retries and crash-resume can finish the preview WITHOUT re-sending the document.
+  const wantPreview = String(form.get('photo_preview') || '') === '1' || String(form.get('send_as') || '') === 'photo';
+  const previewEligible = /^image\/(jpeg|png|webp)$/.test(String(file.type || ''))
+    && Number(file.size) > 0 && Number(file.size) <= 10 * 1024 * 1024;
+
   const existingUpload = await env.DB.prepare('SELECT * FROM uploads WHERE client_upload_id=?').bind(clientUploadId).first();
-  if (existingUpload) {
+  let ledger = dualLedgerFromRow(existingUpload);
+  let adoptedDocExtras = null; // document identifiers taken from the ledger instead of a fresh sendDocument
+  let follower = false;        // another request owns the ledger row for this client_upload_id
+  const readLedger = async () => dualLedgerFromRow(
+    await env.DB.prepare('SELECT * FROM uploads WHERE client_upload_id=?').bind(clientUploadId).first());
+  const buildResult = (photoRow, extras, revision) => {
+    const mapped = mergePreviewIntoPhoto(publicPhoto(photoRow, env), extras);
+    return {
+      photo_id: mapped.id, storage_object_id: mapped.storage_object_id,
+      message_id: mapped.telegram_message_id, file_id: mapped.telegram_file_id,
+      file_unique_id: mapped.telegram_file_unique_id, mime_type: mapped.mime_type,
+      file_size: mapped.file_size, telegram_link: mapped.telegram_link,
+      telegram_preview_link: mapped.telegram_preview_link,
+      preview_message_id: mapped.preview_message_id, preview_file_id: mapped.preview_file_id,
+      preview_pending: mapped.preview_pending,
+      telegram_method: extras?.preview?.message_id ? 'document+photo' : 'document',
+      version: mapped.version, seq: mapped.seq, spread_revision: revision,
+      photo: mapped,
+    };
+  };
+  if (existingUpload && ledger) {
+    // Dual-era ledger row: converge with an in-flight owner, then replay the finished result or
+    // resume a missing preview. The DOCUMENT is never re-sent from here.
+    if (!ledger.extras?.doc) {
+      const waited = await waitForDualLedger(env, clientUploadId, { photoAttempts: 0 });
+      if (waited.parsed?.extras?.doc) ledger = waited.parsed;
+    }
+    const photoRow = await env.DB.prepare('SELECT * FROM photos WHERE client_upload_id=?').bind(clientUploadId).first();
+    if (photoRow) {
+      // A lost response retries the whole request: document stays untouched; only a pending
+      // preview is (re)attempted exactly once via the CAS claim on the ledger (idempotency A/B).
+      if (wantPreview && previewEligible && !ledger.extras?.preview?.message_id) {
+        // CAS against the RAW stored string (re-serialization would not byte-match, e.g. once a
+        // cached response was written into the ledger).
+        const claim = await writeDualLedger(env, clientUploadId, existingUpload.photo_id,
+          { ...ledger.extras, preview: { pending: true, phase: 'sending' } }, null, existingUpload.result_json);
+        if (claim.changed) {
+          const previewExtras2 = await sendTelegramPreview(env, file, p.id, photoRow.version);
+          await writeDualLedger(env, clientUploadId, existingUpload.photo_id,
+            { ...ledger.extras, preview: previewExtras2 }, null, claim.json);
+          ledger = { ...ledger, extras: { ...ledger.extras, preview: previewExtras2 } };
+        } else {
+          ledger = (await readLedger()) || ledger;
+        }
+      }
+      const spreadFresh = await env.DB.prepare('SELECT revision FROM spreads WHERE id=?').bind(p.id).first();
+      const result = buildResult(photoRow, ledger.extras, spreadFresh.revision);
+      await writeDualLedger(env, clientUploadId, existingUpload.photo_id ?? photoRow.id, ledger.extras, result);
+      return json(result);
+    }
+    // Photos row missing: the owner crashed after the document send (crash-resume) or is still
+    // in flight. Wait briefly; if the row never appears, adopt the document and resume below.
+    const waited = await waitForDualLedger(env, clientUploadId);
+    if (waited.photoRow) {
+      const latest = (await readLedger()) || waited.parsed;
+      const spreadFresh = await env.DB.prepare('SELECT revision FROM spreads WHERE id=?').bind(p.id).first();
+      return json(buildResult(waited.photoRow, latest?.extras ?? ledger.extras, spreadFresh.revision));
+    }
+    if (waited.parsed?.extras?.doc) {
+      ledger = waited.parsed;
+      adoptedDocExtras = waited.parsed.extras.doc;
+      follower = true;
+    }
+    // Empty/legacy ledger without document identifiers: fall through to a fresh upload.
+  } else if (existingUpload) {
     const cached = JSON.parse(existingUpload.result_json);
     if (!cached.telegram_link && existingUpload.photo_id) {
       const row = await env.DB.prepare('SELECT * FROM photos WHERE id=?').bind(existingUpload.photo_id).first();
-      const mapped = publicPhoto(row, env);
+      const mapped = await photoWithPreview(env, row);
       if (mapped) {
         cached.telegram_link = mapped.telegram_link;
         cached.photo = mapped;
@@ -1490,33 +1682,106 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   const maxVersionRow = await env.DB.prepare('SELECT MAX(version) as v FROM photos WHERE spread_id=?').bind(p.id).first();
   const version = (maxVersionRow.v || 0) + 1;
 
-  // Opt-in sendPhoto: only for image uploads the client explicitly marks (send_as=photo) and
-  // only within Telegram's sendPhoto envelope (≤10 MB, jpeg/png/webp). Any sendPhoto failure —
-  // dimensions, ratio, mime, size — falls back to lossless sendDocument so the photo is never
-  // lost. client_upload_id idempotency is untouched: the uploads row is written only after a
-  // successful Telegram send, so a lost response retries into the cached result without a second
-  // Telegram message.
-  const wantPhoto = String(form.get('send_as') || '') === 'photo';
-  const photoEligible = wantPhoto && /^image\/(jpeg|png|webp)$/.test(String(file.type || ''))
-    && Number(file.size) > 0 && Number(file.size) <= 10 * 1024 * 1024;
-  let tgResult = null, telegramMethod = 'document', photoSize = null;
-  if (photoEligible) {
-    try {
-      const candidate = await telegramSendPhoto(env, file, `spread_${p.id}_v${version}`);
-      photoSize = largestPhotoSize(candidate.photo);
-      if (!photoSize || !photoSize.file_id) {
-        throw new HttpError(502, 'telegram_error', 'sendPhoto returned no photo sizes');
+  // The canonical original ALWAYS goes through sendDocument — never through sendPhoto, which
+  // would only return Telegram's re-encoded copy. If sendDocument fails the request fails: the
+  // photo is not remote-safe and nothing is recorded as uploaded.
+  let docExtras = adoptedDocExtras;
+  let ledgerJson = ledger ? dualLedgerJson(ledger.extras, null) : null;
+  if (!docExtras) {
+    const tgResult = await telegramSendDocument(env, file, `spread_${p.id}_v${version}`);
+    const doc = tgResult.document;
+    docExtras = { message_id: tgResult.message_id, chat_id: env.CHAT_ID, file_id: doc.file_id,
+      file_unique_id: doc.file_unique_id || null, mime_type: doc.mime_type || file.type,
+      file_size: doc.file_size || null };
+    if (!ledger) {
+      // Persist the original identifiers BEFORE any preview work: a crash after this point can
+      // resume from the ledger instead of sending the document a second time.
+      const initialExtras = { doc: docExtras, preview: null };
+      try {
+        await env.DB.prepare('INSERT INTO uploads (client_upload_id, photo_id, result_json, created_at) VALUES (?,?,?,?)')
+          .bind(clientUploadId, null, dualLedgerJson(initialExtras, null), nowISO()).run();
+        ledger = { extras: initialExtras, response: null };
+        ledgerJson = dualLedgerJson(initialExtras, null);
+      } catch (ledgerError) {
+        // A parallel request with the same client_upload_id owns the ledger: adopt its document
+        // and converge on its photos row instead of recording a duplicate (parallel D).
+        const waited = await waitForDualLedger(env, clientUploadId);
+        if (waited.photoRow) {
+          const latest = (await readLedger()) || waited.parsed;
+          const spreadFresh = await env.DB.prepare('SELECT revision FROM spreads WHERE id=?').bind(p.id).first();
+          return json(buildResult(waited.photoRow, latest?.extras ?? initialExtras, spreadFresh.revision));
+        }
+        if (waited.parsed?.extras?.doc) {
+          console.warn('dual: duplicate document for', clientUploadId, '— adopting the ledger original instead');
+          ledger = waited.parsed;
+          ledgerJson = dualLedgerJson(ledger.extras, null);
+          docExtras = waited.parsed.extras.doc;
+          follower = true;
+        }
       }
-      tgResult = candidate; telegramMethod = 'photo';
-    } catch (sendPhotoError) {
-      console.warn('sendPhoto failed; falling back to sendDocument for', clientUploadId,
-        sendPhotoError instanceof Error ? sendPhotoError.message : sendPhotoError);
-      tgResult = null; telegramMethod = 'document'; photoSize = null;
+    } else {
+      ledger = { ...ledger, extras: { ...ledger.extras, doc: docExtras } };
+      const upd = await writeDualLedger(env, clientUploadId, existingUpload?.photo_id ?? null, ledger.extras, null, ledgerJson);
+      if (upd.changed) {
+        ledgerJson = upd.json;
+      } else {
+        // Someone else filled the ledger meanwhile: adopt their document rather than record a
+        // duplicate original (our extra document stays unreferenced in Telegram).
+        const fresh = await readLedger();
+        if (fresh?.extras?.doc) {
+          console.warn('dual: concurrent document for', clientUploadId, '— adopting the ledger original');
+          ledger = fresh;
+          ledgerJson = dualLedgerJson(fresh.extras, null);
+          docExtras = fresh.extras.doc;
+          follower = true;
+        }
+      }
     }
   }
-  if (!tgResult) tgResult = await telegramSendDocument(env, file, `spread_${p.id}_v${version}`);
-  const doc = telegramMethod === 'photo' ? photoSize : tgResult.document;
-  const storageObjectId = encodeStorageObjectId(env.CHAT_ID, tgResult.message_id);
+
+  // Auxiliary preview (Telegram gallery/button only). Exactly one request owns the preview send
+  // via a compare-and-swap claim on the ledger; a sendPhoto failure never affects the original —
+  // the photo stays synced and the preview is marked pending for a retry of the preview ONLY.
+  let previewExtras = ledger?.extras?.preview ?? null;
+  // A pending marker here means either someone else owns the in-flight claim (never re-claim it
+  // — that would double the preview message) or a failed attempt awaiting the next whole-upload
+  // retry, which is handled by the existingUpload branch above after a photos row exists.
+  if (wantPreview && previewEligible && !previewExtras?.message_id && !previewExtras?.pending) {
+    const claim = ledger
+      ? await writeDualLedger(env, clientUploadId, existingUpload?.photo_id ?? null,
+          { doc: docExtras, preview: { pending: true, phase: 'sending' } }, null, ledgerJson)
+      : { changed: false };
+    if (claim.changed) {
+      previewExtras = await sendTelegramPreview(env, file, p.id, version);
+      const next = await writeDualLedger(env, clientUploadId, null,
+        { doc: docExtras, preview: previewExtras }, null, claim.json);
+      if (next.changed) { ledgerJson = next.json; }
+      ledger = { ...(ledger || {}), extras: { doc: docExtras, preview: previewExtras } };
+    } else if (ledger) {
+      // Another request claimed or finished the preview: take the ledger's view.
+      const fresh = await readLedger();
+      if (fresh) {
+        ledger = fresh;
+        previewExtras = fresh.extras?.preview ?? previewExtras;
+        ledgerJson = dualLedgerJson(fresh.extras, null);
+      }
+    }
+  }
+
+  // A follower never inserts the photos row itself. Converge on the owner's row; if the owner
+  // died between the document send and the insert, complete the row with the ADOPTED document
+  // (crash-resume) instead of sending a second one.
+  if (follower) {
+    const waited = await waitForDualLedger(env, clientUploadId, { docAttempts: 0 });
+    if (waited.photoRow) {
+      const latest = (await readLedger()) || waited.parsed;
+      const spreadFresh2 = await env.DB.prepare('SELECT revision FROM spreads WHERE id=?').bind(p.id).first();
+      return json(buildResult(waited.photoRow, latest?.extras ?? { doc: docExtras, preview: previewExtras }, spreadFresh2.revision));
+    }
+    follower = false;
+  }
+
+  const storageObjectId = encodeStorageObjectId(docExtras.chat_id || env.CHAT_ID, docExtras.message_id);
 
   const photoId = uuid();
   const seq = await nextSeq(env);
@@ -1528,8 +1793,9 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
       `INSERT INTO photos (id, spread_id, version, is_current, provider, storage_object_id, telegram_message_id,
         telegram_file_id, telegram_file_unique_id, mime_type, file_size, created_by, created_at, seq, client_upload_id)
        VALUES (?,?,?,1,'telegram',?,?,?,?,?,?,?,?,?,?)`
-    ).bind(photoId, p.id, version, storageObjectId, tgResult.message_id, doc.file_id, doc.file_unique_id,
-      doc.mime_type || file.type, doc.file_size || null, u.userId, now, seq, clientUploadId),
+    ).bind(photoId, p.id, version, storageObjectId, docExtras.message_id, docExtras.file_id,
+      docExtras.file_unique_id, docExtras.mime_type || file.type, docExtras.file_size || null,
+      u.userId, now, seq, clientUploadId),
     env.DB.prepare('UPDATE spreads SET current_photo_id=?, updated_at=?, updated_by=?, revision=revision+1, seq=? WHERE id=?')
       .bind(photoId, now, u.userId, seq, p.id),
     activityStatement(env, { notebookId: spread.notebook_id, spreadId: p.id, entity: 'photo', entityId: photoId,
@@ -1547,18 +1813,15 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   await env.DB.batch(statements);
 
   const spreadFresh = await env.DB.prepare('SELECT revision FROM spreads WHERE id=?').bind(p.id).first();
-  const uploadedPhoto = publicPhoto(await env.DB.prepare('SELECT * FROM photos WHERE id=?').bind(photoId).first(), env);
-  const result = {
-    photo_id: uploadedPhoto.id, storage_object_id: uploadedPhoto.storage_object_id,
-    message_id: uploadedPhoto.telegram_message_id, file_id: uploadedPhoto.telegram_file_id,
-    file_unique_id: uploadedPhoto.telegram_file_unique_id, mime_type: uploadedPhoto.mime_type,
-    file_size: uploadedPhoto.file_size, telegram_link: uploadedPhoto.telegram_link,
-    telegram_method: telegramMethod,
-    version: uploadedPhoto.version, seq: uploadedPhoto.seq, spread_revision: spreadFresh.revision,
-    photo: uploadedPhoto,
-  };
-  await env.DB.prepare('INSERT INTO uploads (client_upload_id, photo_id, result_json, created_at) VALUES (?,?,?,?)')
-    .bind(clientUploadId, photoId, JSON.stringify(result), now).run();
+  const photoRowFresh = await env.DB.prepare('SELECT * FROM photos WHERE id=?').bind(photoId).first();
+  const finalExtras = { doc: docExtras, preview: previewExtras };
+  const result = buildResult(photoRowFresh, finalExtras, spreadFresh.revision);
+  if (ledger) {
+    await writeDualLedger(env, clientUploadId, photoId, finalExtras, result);
+  } else {
+    await env.DB.prepare('INSERT INTO uploads (client_upload_id, photo_id, result_json, created_at) VALUES (?,?,?,?)')
+      .bind(clientUploadId, photoId, dualLedgerJson(finalExtras, result), now).run();
+  }
   await logHistory(env, { notebook_id: spread.notebook_id, entity: 'spread', entity_id: p.id, user_id: u.userId, action: 'photo_added' });
   return json(result);
 });
@@ -1569,7 +1832,7 @@ on('GET', '/api/photos/:id', async (request, env, p) => {
   if (!photo) return err(404, 'not_found');
   const spread = await env.DB.prepare('SELECT notebook_id FROM spreads WHERE id=?').bind(photo.spread_id).first();
   await requireMembership(env, u.userId, spread.notebook_id);
-  return json({ photo: publicPhoto(photo, env) });
+  return json({ photo: await photoWithPreview(env, photo) });
 });
 
 on('GET', '/api/photos/:id/preview', async (request, env, p) => {
@@ -1756,7 +2019,7 @@ on('GET', '/api/sync', async (request, env) => {
   const pages = await env.DB.batch(tables.map(t => syncStatement(env, t.sql, t.params, since, limit)));
   for (let i=0; i<tables.length; i++) {
     const rows = pages[i].results;
-    changes[tables[i].name] = tables[i].name === 'photos' ? publicPhotos(rows, env) : rows;
+    changes[tables[i].name] = tables[i].name === 'photos' ? await photosWithPreview(env, rows) : rows;
     if (rows.length >= limit) fullTables.push(tables[i].name);
     for (const row of rows) if (row.seq > maxSeqSeen) maxSeqSeen = row.seq;
   }

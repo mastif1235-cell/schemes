@@ -480,25 +480,26 @@
     toast('Порядок подтверждён сервером');
     if (route.screen === 'spreads' && route.notebookId === notebookId) render();
   });
-  // Device-local opt-in: send new uploads inline to Telegram via sendPhoto. Default stays the
-  // lossless sendDocument — Telegram re-encodes sendPhoto images, so this must be a choice.
-  // The settings screen is rendered inside a closure we cannot wrap, so the toggle is injected
-  // when the user navigates to Settings (event-driven, no observers/intervals).
+  // Dual Telegram storage toggle (device-local). Default ON: the original always goes through
+  // lossless sendDocument, and an auxiliary sendPhoto preview message is added next to it;
+  // OFF: only the document. The settings screen is rendered inside a closure we cannot wrap,
+  // so the toggle is injected when the user navigates to Settings (event-driven, no observers).
   function injectTelegramPhotoToggle() {
     const host = document.getElementById('screen');
     if (!host || host.querySelector('#swTelegramPhoto') || !host.querySelector('#swTheme')) return;
     const block = document.createElement('div');
     block.innerHTML = `<div class="section-title">Telegram</div>
-      <div class="settings-row"><span>Новые фото показывать в Telegram сразу<br><small>Вкл — в чате видна фотография (Telegram слегка сожмёт её). Выкл — файл без изменений.</small></span>
-      <button class="switch ${settings.telegram_send_as_photo ? 'on' : ''}" id="swTelegramPhoto" aria-label="Новые фото как фото Telegram"></button></div>`;
+      <div class="settings-row"><span>Создавать превью фото в Telegram<br><small>Вкл — рядом с файлом появляется фотография-превью (кнопка «Telegram» открывает её). Оригинал в любом случае хранится файлом без сжатия.</small></span>
+      <button class="switch ${settings.telegram_photo_preview !== false ? 'on' : ''}" id="swTelegramPhoto" aria-label="Превью фото в Telegram"></button></div>`;
     host.appendChild(block);
     block.querySelector('#swTelegramPhoto').onclick = async event => {
-      settings.telegram_send_as_photo = !settings.telegram_send_as_photo;
-      event.currentTarget.classList.toggle('on', !!settings.telegram_send_as_photo);
+      const enabled = settings.telegram_photo_preview === false; // default ON
+      settings.telegram_photo_preview = enabled;
+      event.currentTarget.classList.toggle('on', enabled);
       await saveSettings();
-      toast(settings.telegram_send_as_photo
-        ? 'Новые фото будут открываться в Telegram как фото'
-        : 'Новые фото будут отправляться файлом без сжатия');
+      toast(enabled
+        ? 'Для новых фото в Telegram будет добавляться превью-фотография'
+        : 'Новые фото будут отправляться только файлом без сжатия');
     };
   }
   window.v363InjectTelegramPhotoToggle = injectTelegramPhotoToggle;
