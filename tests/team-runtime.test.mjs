@@ -613,48 +613,62 @@ try {
 
   // E: read state survives reload, and F: a NEW deleted event becomes unread again
   await page.reload();
-  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined');
-  const deletedReload = await page.evaluate(async () => {
-    const originalApi = api;
-    fullSync = async () => {};
-    let cursors = {notebooks:{'remote-nbX':900,'remote-nb':900}, spreads:{'srv-sp-gone':900,'remote-s1':900,'remote-s2':900}};
-    let unread = {notebooks:{},spreads:{},total:0};
-    api = async (path, options) => {
-      if (path === '/api/activity/read-cursors') return {cursors:structuredClone(cursors)};
-      if (path === '/api/activity/unread') return {unread:structuredClone(unread)};
-      if (path.includes('/activity?')) return {events:[],legacy_events:[]};
-      return originalApi(path, options);
+  // Boot-readiness: vNextSync/db being defined is NOT enough right after reload — loadSettings is
+  // async, and without auth openGlobalHistory routes to the local fallback overlay instead of the
+  // server one. Wait for the auth token so all four following assertions observe the true app
+  // state (this was also the hidden mode of the pre-existing E/F flake).
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined'
+    && typeof settings !== 'undefined' && !!settings.auth_token, null, {timeout:15000});
+  await page.evaluate(async () => {
+    window.__tApi = api;
+    window.__tState = {
+      cursors:{notebooks:{'remote-nbX':900,'remote-nb':900}, spreads:{'srv-sp-gone':900,'remote-s1':900,'remote-s2':900}},
+      unread:{notebooks:{},spreads:{},total:0}
     };
-    await window.v340ApplyUnread(unread);
+    fullSync = async () => {};
+    api = async (path, options) => {
+      if (path === '/api/activity/read-cursors') return {cursors:structuredClone(window.__tState.cursors)};
+      if (path === '/api/activity/unread') return {unread:structuredClone(window.__tState.unread)};
+      if (path.includes('/activity?')) return {events:[],legacy_events:[]};
+      return window.__tApi(path, options);
+    };
+    await window.v340ApplyUnread(window.__tState.unread);
     await window.v340OpenGlobalHistory();
-    const persisted = {
-      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
-      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
+  });
+  // 1) the SERVER history overlay exists (auth/overlays settled) — not the local fallback;
+  // 2) the badge reflects the zero-unread state after the applyUnread/refreshBadge round-trip.
+  await page.waitForFunction(() => !!document.querySelector('[data-server-history]'), null, {timeout:15000});
+  await page.waitForFunction(() => !document.querySelector('#v340HistoryButton .v340-history-badge'), null, {timeout:15000});
+  const persisted = await page.evaluate(() => ({
+    dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+    badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null}));
+  // F: a later event on the deleted notebook becomes unread again and pins on top (I)
+  await page.evaluate(async () => {
     document.querySelector('[data-history-close]')?.click();
-    // F: a later event on the deleted notebook becomes unread again and pins on top (I)
     const scope = window.vNextSync.scope();
     await put('activity_events', {scope, cache_id:scope+'|ev-nb-del-2', id:'ev-nb-del-2', seq:836,
       notebook_id:'remote-nbX', spread_id:null, action:'notebook.deleted', notebook_title:'Общий',
       actor_display_name:'Участник', created_at:'2026-09-24T13:00:00Z'});
-    cursors.notebooks['remote-nbX'] = 835;
-    unread = {notebooks:{'remote-nbX':{count:1,max_seq:836}},spreads:{},total:1};
-    await window.v340ApplyUnread(unread);
+    window.__tState.cursors.notebooks['remote-nbX'] = 835;
+    window.__tState.unread = {notebooks:{'remote-nbX':{count:1,max_seq:836}},spreads:{},total:1};
+    await window.v340ApplyUnread(window.__tState.unread);
     await window.v340OpenGlobalHistory();
-    const first = await (async () => {
-      for (let i = 0; i < 40; i++) {
-        const row = document.querySelector('[data-server-history] .v340-history-row');
-        if (row) return row;
-        await new Promise(r => setTimeout(r, 50));
-      }
-      return document.querySelector('[data-server-history] .v340-history-row');
-    })();
-    const fresh = {id:first?.dataset.eventId,
-      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
-      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
-    document.querySelector('[data-history-close]')?.click();
-    api = originalApi;
-    return {persisted, fresh};
   });
+  await page.waitForFunction(() =>
+    document.querySelector('[data-server-history] .v340-history-row')?.dataset.eventId === 'ev-nb-del-2',
+    null, {timeout:15000});
+  await page.waitForFunction(() =>
+    document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent === '1', null, {timeout:15000});
+  const fresh = await page.evaluate(() => ({
+    id:document.querySelector('[data-server-history] .v340-history-row')?.dataset.eventId,
+    dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+    badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null}));
+  await page.evaluate(() => {
+    document.querySelector('[data-history-close]')?.click();
+    api = window.__tApi;
+    delete window.__tState;
+  });
+  const deletedReload = {persisted, fresh};
   assert.equal(deletedReload.persisted.dots, 0, 'E: read state survives reload');
   assert.equal(deletedReload.persisted.badge, null, 'E: badge stays clear after reload');
   assert.deepEqual(deletedReload.fresh, {id:'ev-nb-del-2', dots:1, badge:'1'},
