@@ -604,6 +604,8 @@ try {
   assert.equal(deletedHistory.before.spRow.open, false, 'no Open button for a deleted spread');
   assert.equal(deletedHistory.before.nbRow.open, false, 'no Open button without a living spread');
   assert.equal(deletedHistory.before.nbRow.mark, true, 'mark-whole-notebook stays clickable for the deleted notebook');
+  assert.equal(deletedHistory.before.spRow.mark, true,
+    'deleted-spread event offers read-whole-notebook fallback (otherwise a dead-end badge)');
   assert.equal(deletedHistory.fetchedDeleted, true, 'journal of the deleted notebook is fetched into the cache');
   // D: mark all clears badge and dots
   assert.equal(deletedHistory.after.badge, null, 'mark all clears the badge');
@@ -663,6 +665,154 @@ try {
     return {deleted:!!row.deleted_at, route:JSON.parse(JSON.stringify(route || null))};
   });
   assert.equal(lists.deleted, true, 'deleted notebook stays deleted locally (no resurrection)');
+
+  // ---- Production UX case (v3.6.2): 3 note.deleted + 1 spread.deleted by Петя on a spread that
+  // no longer exists — per-notebook read button and badge-driven journal view must clear it ----
+  const readUx = await page.evaluate(async () => {
+    const originalApi = api; const seenPuts = [];
+    fullSync = async () => {};
+    const scope = window.vNextSync.scope();
+    settings.team_capabilities = {scope, flags:{activity:true, activity_seen:true, activity_spread_seen:true, team_notes:true}};
+    // Hermetic scenario: drop every cached server event of this scope so no earlier scenario leaks in.
+    for (const stale of await getAll('activity_events')) {
+      if (stale.scope === scope) await del('activity_events', stale.cache_id);
+    }
+    await put('notebooks', {id:'nb2', server_id:'remote-nb2', title:'Черновик', sort_order:1, revision:1, updated_at:'2026-09-25T10:00:00.000Z'});
+    const mk = (id, seq, action, spreadId) => ({scope, cache_id:scope+'|'+id, id, seq,
+      notebook_id:'remote-nb2', notebook_title:'Черновик', spread_id:spreadId || 'srv-sp-1', spread_number:1,
+      actor:{id:'u2', display_name:'Петя'}, actor_display_name:'Петя', action,
+      created_at:'2026-09-25T18:30:'+String(seq-900).padStart(2,'0')+'Z'});
+    await put('activity_events', mk('pd-901',901,'note.deleted'));
+    await put('activity_events', mk('pd-902',902,'note.deleted'));
+    await put('activity_events', mk('pd-903',903,'note.deleted'));
+    await put('activity_events', mk('pd-904',904,'spread.deleted'));
+    let cursors = {notebooks:{'remote-nb2':0}, spreads:{}};
+    let unread = {notebooks:{'remote-nb2':{count:4,max_seq:904}}, spreads:{'srv-sp-1':{count:4,max_seq:904}}, total:4};
+    let journalEvents = () => [];
+    let failJournal = false;
+    api = async (path, options) => {
+      if (path === '/api/activity/read-cursors') return {cursors:structuredClone(cursors)};
+      if (path === '/api/activity/unread') return {unread:structuredClone(unread)};
+      if (path.includes('/activity/seen') && options?.method === 'PUT') {
+        seenPuts.push({path, body:options.json});
+        if (options.json?.all_spreads === true) {
+          const seq = Number(options.json.seq) || 9999;
+          cursors = {notebooks:{'remote-nb2':seq},
+            spreads:{'srv-sp-1':Math.max(Number(cursors.spreads['srv-sp-1'])||0, seq),
+                     'srv-sp-2':Math.max(Number(cursors.spreads['srv-sp-2'])||0, seq)}};
+          unread = {notebooks:{}, spreads:{}, total:0};
+        }
+        return {unread:structuredClone(unread)};
+      }
+      if (path.startsWith('/api/notebooks/remote-nb2/activity')) {
+        if (failJournal) { const error = new Error('HTTP 500'); error.status = 500; throw error; }
+        return {events:journalEvents(), legacy_events:[], has_more:false, next_before_seq:null};
+      }
+      return originalApi(path, options);
+    };
+    const rowsOf = () => [...document.querySelectorAll('[data-server-history] .v340-history-row')];
+    const waitRow = async () => {
+      for (let i = 0; i < 40; i++) {
+        if (rowsOf().length) return;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    };
+    await window.v340ApplyUnread(unread);
+    await window.v340OpenGlobalHistory();
+    await waitRow();
+    const before = {
+      ids:rowsOf().map(row => row.dataset.eventId),
+      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null,
+      noOpen:rowsOf().every(row => !row.querySelector('[data-open]')),
+      allMark:rowsOf().every(row => !!row.querySelector('[data-mark-notebook]')),
+      texts:rowsOf().map(row => row.textContent).join('|')
+    };
+    // Click the button on the OLDEST row on purpose: the cursor must use the newest DISPLAYED seq
+    // of the notebook (904), never the row's own seq.
+    rowsOf().find(row => row.dataset.eventId === 'pd-901')?.querySelector('[data-mark-notebook]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const afterMark = {
+      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null
+    };
+    document.querySelector('[data-history-close]')?.click();
+    // A fifth, newer event from Петя: badge 1 and only that event carries the dot.
+    await put('activity_events', mk('pd-905',905,'note.created','srv-sp-2'));
+    unread = {notebooks:{'remote-nb2':{count:1,max_seq:905}}, spreads:{'srv-sp-2':{count:1,max_seq:905}}, total:1};
+    await window.v340ApplyUnread(unread);
+    await window.v340OpenGlobalHistory();
+    await waitRow();
+    const fifth = {
+      ids:rowsOf().map(row => row.dataset.eventId),
+      unreadIds:[...document.querySelectorAll('[data-server-history] .v340-history-unread')].map(row => row.dataset.eventId),
+      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null
+    };
+    document.querySelector('[data-history-close]')?.click();
+    // Notebook card badge opens the notebook team history; the successfully loaded journal marks
+    // exactly what it displayed (seq 905) without navigating into the spreads screen.
+    route = {screen:'notebooks'}; await render();
+    journalEvents = () => [{id:'pd-905', notebook_id:'remote-nb2', spread_id:'srv-sp-2', spread_number:2,
+      actor:{id:'u2', display_name:'Петя'}, action:'note.created', created_at:'2026-09-25T18:31:00Z', seq:905}];
+    const badgeEl = document.querySelector('.notebook-card[data-notebook-id="nb2"] .v340-unread-badge');
+    const hasBadge = !!badgeEl;
+    badgeEl?.click();
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const teamSheet = document.querySelector('[data-team-history]');
+    const badgeFlow = {
+      hasBadge,
+      routeScreen:route.screen,
+      sheetOpen:!!teamSheet,
+      sawPetya:!!(teamSheet && teamSheet.textContent.includes('Петя')),
+      cardBadgeAfter:document.querySelector('.notebook-card[data-notebook-id="nb2"] .v340-unread-badge')?.textContent || null,
+      globalBadge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null
+    };
+    document.querySelectorAll('.sheet-backdrop').forEach(node => node.remove());
+    // Failed journal fetch: seen is never written and the badge stays alive.
+    const seenBeforeFail = seenPuts.length;
+    unread = {notebooks:{'remote-nb2':{count:1,max_seq:905}}, spreads:{'srv-sp-2':{count:1,max_seq:905}}, total:1};
+    await window.v340ApplyUnread(unread);
+    failJournal = true;
+    document.querySelector('.notebook-card[data-notebook-id="nb2"] .v340-unread-badge')?.click();
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const failFlow = {
+      seenCallsDuringFail:seenPuts.length - seenBeforeFail,
+      badgeKept:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null,
+      stateText:document.querySelector('[data-team-state]')?.textContent || ''
+    };
+    document.querySelectorAll('.sheet-backdrop').forEach(node => node.remove());
+    failJournal = false;
+    api = originalApi;
+    return {before, afterMark, fifth, badgeFlow, failFlow, seenPuts};
+  });
+  assert.deepEqual(readUx.before.ids, ['pd-904','pd-903','pd-902','pd-901'],
+    'all four deletion events are visible, unread-first, newest first');
+  assert.equal(readUx.before.dots, 4, 'four unread dots (badge ↔ visible cards consistency kept)');
+  assert.equal(readUx.before.badge, '4', 'global badge counts the four events');
+  assert.equal(readUx.before.noOpen, true, 'deleted spread: no Open button anywhere');
+  assert.equal(readUx.before.allMark, true, 'deleted spread: read-whole-notebook button on every event');
+  assert.ok(readUx.before.texts.includes('Петя'), 'actor is Петя');
+  assert.ok(readUx.before.texts.includes('Удалён разворот'), 'spread.deleted label present');
+  assert.deepEqual(readUx.afterMark, {dots:0, badge:null},
+    'read-whole-notebook clears badge and dots without touching other notebooks');
+  assert.deepEqual(readUx.seenPuts[0], {path:'/api/notebooks/remote-nb2/activity/seen', body:{all_spreads:true, seq:904}},
+    'read uses the newest DISPLAYED seq even when the oldest row is clicked');
+  assert.deepEqual(readUx.fifth.unreadIds, ['pd-905'], 'fifth event: only the new event is unread');
+  assert.equal(readUx.fifth.ids[0], 'pd-905', 'fifth event pinned on top');
+  assert.equal(readUx.fifth.dots, 1, 'exactly one dot returns');
+  assert.equal(readUx.fifth.badge, '1', 'badge 1 returns');
+  assert.equal(readUx.badgeFlow.hasBadge, true, 'notebook card badge is rendered');
+  assert.equal(readUx.badgeFlow.routeScreen, 'notebooks', 'badge tap does not navigate into the spreads screen');
+  assert.equal(readUx.badgeFlow.sheetOpen, true, 'badge tap opens the notebook team history');
+  assert.equal(readUx.badgeFlow.sawPetya, true, 'the journal actually renders the unseen event');
+  assert.equal(readUx.badgeFlow.globalBadge, null, 'journal view cleared exactly what it displayed');
+  assert.equal(readUx.badgeFlow.cardBadgeAfter, null, 'notebook badge cleared after the journal view');
+  assert.deepEqual(readUx.seenPuts[1], {path:'/api/notebooks/remote-nb2/activity/seen', body:{all_spreads:true, seq:905}},
+    'journal view marks with its own loaded seq (bounded, not server MAX)');
+  assert.equal(readUx.failFlow.seenCallsDuringFail, 0, 'failed fetch never advances read cursors');
+  assert.equal(readUx.failFlow.badgeKept, '1', 'badge survives a failed journal fetch');
+  assert.ok(readUx.failFlow.stateText.includes('Не удалось'), 'failure is shown to the user');
 
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');
