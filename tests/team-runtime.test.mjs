@@ -814,6 +814,149 @@ try {
   assert.equal(readUx.failFlow.badgeKept, '1', 'badge survives a failed journal fetch');
   assert.ok(readUx.failFlow.stateText.includes('Не удалось'), 'failure is shown to the user');
 
+  // ---- v3.6.3 (1/4): fullscreen photo has a persistent one-tap collapse button (+ Esc) ----
+  const collapse = await page.evaluate(async () => {
+    document.querySelectorAll('.v340-viewer,.v342-photo-fullscreen').forEach(node => node.remove());
+    await window.v340OpenSpread(await get('spreads','s1'));
+    await new Promise(resolve => setTimeout(resolve, 200));
+    document.querySelector('.v340-viewer')?.querySelector('[data-image]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const full = document.querySelector('.v342-photo-fullscreen');
+    const button = full?.querySelector('[data-full-collapse]');
+    const style = button ? getComputedStyle(button) : null;
+    const rect = button ? button.getBoundingClientRect() : null;
+    const before = {
+      exists:!!button, label:button?.getAttribute('aria-label') || null,
+      num:full?.querySelector('.viewer-top .num')?.textContent || '',
+      big:!!(rect && rect.width >= 44 && rect.height >= 44),
+      positioned:style?.position === 'absolute', bottomRight:!!(rect && rect.right > 300 && rect.bottom > 700),
+      opaque:!!(style && style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')
+    };
+    const photoBefore = (await get('spreads','s1')).current_photo_id;
+    button?.click();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const afterTap = {
+      closed:!document.querySelector('.v342-photo-fullscreen'),
+      viewerBack:!!document.querySelector('.v340-viewer'),
+      num:document.querySelector('.v340-viewer .num')?.textContent || '',
+      photoKept:(await get('spreads','s1')).current_photo_id === photoBefore && photoBefore != null
+    };
+    // Esc on desktop does the same
+    document.querySelector('.v340-viewer')?.querySelector('[data-image]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const reopened = !!document.querySelector('.v342-photo-fullscreen');
+    document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}));
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const afterEsc = {closed:!document.querySelector('.v342-photo-fullscreen'), viewerBack:!!document.querySelector('.v340-viewer')};
+    document.querySelector('.v340-viewer')?.remove();
+    return {before, afterTap, reopened, afterEsc};
+  });
+  assert.equal(collapse.before.exists, true, 'fullscreen has a dedicated collapse button');
+  assert.equal(collapse.before.label, 'Свернуть фото', 'collapse button is labelled');
+  assert.equal(collapse.before.big, true, 'collapse button is a comfortable tap target');
+  assert.equal(collapse.before.positioned, true, 'collapse button floats over the photo');
+  assert.equal(collapse.before.bottomRight, true, 'collapse button sits bottom-right on the mobile viewport');
+  assert.equal(collapse.before.opaque, true, 'collapse button stays visible on any photo');
+  assert.ok(collapse.before.num.includes('№1'), 'fullscreen shows the opened spread');
+  assert.deepEqual(collapse.afterTap.closed, true, 'one tap closes the fullscreen');
+  assert.deepEqual(collapse.afterTap.viewerBack, true, 'the spread viewer stays open after collapse');
+  assert.ok(collapse.afterTap.num.includes('№1'), 'collapse returns to the same spread');
+  assert.equal(collapse.afterTap.photoKept, true, 'collapse keeps the selected photo');
+  assert.equal(collapse.reopened, true, 'fullscreen reopens for the Esc check');
+  assert.deepEqual(collapse.afterEsc, {closed:true, viewerBack:true}, 'Esc collapses the fullscreen to the same spread');
+
+  // ---- v3.6.3 (2/4): dark notes composer on the dark viewer; light theme sheets untouched ----
+  const themeUx = await page.evaluate(async () => {
+    settings.theme = 'dark'; document.body.dataset.theme = 'dark'; await saveSettings();
+    await window.v340OpenSpread(await get('spreads','s1'));
+    await new Promise(resolve => setTimeout(resolve, 200));
+    document.querySelector('.vnext-note-composer [data-note-compose]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const textarea = document.querySelector('.vnext-note-composer textarea');
+    const style = textarea ? getComputedStyle(textarea) : null;
+    const darkUi = {
+      exists:!!textarea, bg:style?.backgroundColor, color:style?.color,
+      border:style?.borderTopColor, placeholder:getComputedStyle(textarea, '::placeholder').color,
+      focusOutline:(() => { textarea?.focus(); return getComputedStyle(textarea).outlineColor; })()
+    };
+    settings.theme = 'light'; document.body.dataset.theme = 'light'; await saveSettings();
+    const lightComposerBg = getComputedStyle(textarea).backgroundColor;
+    document.querySelector('.v340-viewer [data-action="close"]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    // light theme sheets keep their light surface with themed fields
+    const {el, close} = openSheet('<div class="field"><label>t</label><textarea></textarea></div>');
+    const sheetBg = getComputedStyle(el).backgroundColor;
+    const fieldBg = getComputedStyle(el.querySelector('textarea')).backgroundColor;
+    close();
+    return {darkUi, lightComposerBg, sheetBg, fieldBg};
+  });
+  assert.equal(themeUx.darkUi.exists, true, 'notes composer exists');
+  assert.equal(themeUx.darkUi.bg, 'rgba(255, 255, 255, 0.063)', 'composer textarea is dark-on-dark, not white');
+  assert.equal(themeUx.darkUi.color, 'rgb(237, 230, 211)', 'composer text is light and readable');
+  assert.equal(themeUx.darkUi.placeholder, 'rgb(180, 172, 147)', 'composer placeholder has usable contrast');
+  assert.equal(themeUx.darkUi.focusOutline, 'rgb(224, 164, 89)', 'composer focus state is visible');
+  assert.equal(themeUx.lightComposerBg, 'rgba(255, 255, 255, 0.063)',
+    'the viewer is dark in light theme too, so the composer stays dark there (no white box)');
+  assert.equal(themeUx.sheetBg, 'rgb(237, 230, 211)', 'light theme sheet keeps its light paper surface');
+  assert.equal(themeUx.fieldBg, 'rgb(246, 241, 228)', 'light theme field keeps its light card background');
+
+  // ---- v3.6.3 (3/4): Telegram button across photo generations; missing metadata explains itself ----
+  const telegramView = await page.evaluate(async () => {
+    const encode = (chat, message) => btoa(chat + ':' + message);
+    const s2 = await get('spreads','s2');
+    await put('photos', {id:'ph-legacy', spread_id:'s2', version:1, is_current:true,
+      telegram_message_id:null, telegram_link:null, storage_object_id:encode('-100555777','321'), upload_status:'synced'});
+    await put('spreads', {...s2, current_photo_id:'ph-legacy'});
+    const s3 = await get('spreads','s3');
+    await put('photos', {id:'ph-none', spread_id:'s3', version:1, is_current:true, upload_status:'synced'});
+    await put('spreads', {...s3, current_photo_id:'ph-none'});
+    const open = async id => {
+      await window.v340OpenSpread(await get('spreads', id));
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const button = document.querySelector('[data-action="telegram"]');
+      const state = {
+        disabled:!!button?.disabled, title:button?.getAttribute('title') || null,
+        caption:[...document.querySelectorAll('.v340-viewer-state')].map(node => node.textContent).join(' ')
+      };
+      document.querySelector('.v340-viewer [data-action="close"]')?.click();
+      await new Promise(resolve => setTimeout(resolve, 80));
+      return state;
+    };
+    const legacy = await open('s2');
+    const none = await open('s3');
+    return {
+      legacy, none,
+      legacyLink:window.v350GetTelegramPhotoLink(await get('photos','ph-legacy')),
+      noneLink:window.v350GetTelegramPhotoLink(await get('photos','ph-none'))
+    };
+  });
+  assert.equal(telegramView.legacyLink, 'https://t.me/c/555777/321',
+    'A/G: legacy photo without telegram_message_id opens via storage_object_id fallback');
+  assert.equal(telegramView.legacy.disabled, false, 'legacy photo Telegram button is enabled again');
+  assert.equal(telegramView.noneLink, null, 'photo without any Telegram metadata has no link');
+  assert.equal(telegramView.none.disabled, true, 'metadata-less photo keeps the button disabled');
+  assert.ok(telegramView.none.caption.includes('Telegram'), 'metadata-less photo explains itself instead of silence');
+  assert.equal(telegramView.none.title, 'Нет открываемой копии в Telegram', 'disabled button carries an explanation');
+
+  // ---- v3.6.3 (4/4): device-local send-as-photo opt-in toggle in settings ----
+  const toggle = await page.evaluate(async () => {
+    settings.telegram_send_as_photo = false; await saveSettings();
+    document.querySelector('.bottomnav [data-nav="settings"]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const sw = document.querySelector('#swTelegramPhoto');
+    const initiallyOff = sw && !sw.classList.contains('on');
+    sw?.click();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const stored = (await get('settings','app')).telegram_send_as_photo;
+    const on = sw?.classList.contains('on');
+    route = {screen:'notebooks'}; await render();
+    return {exists:!!sw, initiallyOff, stored, on};
+  });
+  assert.equal(toggle.exists, true, 'settings expose the Telegram photo toggle');
+  assert.equal(toggle.initiallyOff, true, 'toggle defaults to the lossless document mode');
+  assert.equal(toggle.stored, true, 'toggle persists the opt-in locally');
+  assert.equal(toggle.on, true, 'toggle reflects the enabled state');
+
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }

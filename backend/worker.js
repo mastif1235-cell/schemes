@@ -213,10 +213,16 @@ function publicActivity(row) {
 
 function publicPhoto(row, env) {
   if (!row) return null;
-  const messageId = row.telegram_message_id ?? row.message_id ?? null;
+  // Legacy rows may lack telegram_message_id but still carry storage_object_id, which
+  // deterministically encodes "<chatId>:<messageId>" (see encodeStorageObjectId). Deriving the
+  // link from it is read-only and fixes "old photo opens nothing" without touching data.
+  const decoded = row.storage_object_id ? decodeStorageObjectId(row.storage_object_id) : null;
+  const directMessageId = row.telegram_message_id ?? row.message_id ?? null;
+  const messageId = directMessageId ?? (decoded ? decoded.messageId : null);
+  const messageChatId = directMessageId ? env.CHAT_ID : (decoded ? decoded.chatId : env.CHAT_ID);
   return {
     ...row,
-    telegram_link: messageId && env.CHAT_ID ? telegramLink(env.CHAT_ID, messageId) : (row.telegram_link ?? null),
+    telegram_link: messageId && messageChatId ? telegramLink(messageChatId, messageId) : (row.telegram_link ?? null),
   };
 }
 function publicPhotos(rows, env) {
@@ -375,6 +381,35 @@ async function telegramSendDocument(env, blob, filename) {
     throw new HttpError(502, 'telegram_error', data.description);
   }
   return data.result;
+}
+
+// sendPhoto renders an inline gallery in Telegram, but Telegram re-encodes the image (largest
+// PhotoSize ~2560px) — the returned file is NOT the uploaded original. Used only when the client
+// explicitly opts in via send_as=photo; the default stays lossless sendDocument.
+async function telegramSendPhoto(env, blob, filename) {
+  const fd = new FormData();
+  fd.append('chat_id', env.CHAT_ID);
+  fd.append('photo', blob, filename);
+  const resp = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, { method: 'POST', body: fd });
+  const data = await resp.json();
+  if (!data.ok) {
+    console.error('TELEGRAM SENDPHOTO ERROR:', {
+      httpStatus: resp.status,
+      errorCode: data.error_code,
+      description: data.description
+    });
+    throw new HttpError(502, 'telegram_error', data.description);
+  }
+  return data.result;
+}
+
+function largestPhotoSize(sizes) {
+  const list = Array.isArray(sizes) ? sizes : [];
+  return list.reduce((best, size) => {
+    const area = Number(size?.width || 0) * Number(size?.height || 0);
+    const bestArea = best ? Number(best.width || 0) * Number(best.height || 0) : -1;
+    return area > bestArea ? size : best;
+  }, null);
 }
 function telegramLink(chatId, messageId) {
   const normalizedMessageId = Number(messageId);
@@ -1455,8 +1490,32 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
   const maxVersionRow = await env.DB.prepare('SELECT MAX(version) as v FROM photos WHERE spread_id=?').bind(p.id).first();
   const version = (maxVersionRow.v || 0) + 1;
 
-  const tgResult = await telegramSendDocument(env, file, `spread_${p.id}_v${version}`);
-  const doc = tgResult.document;
+  // Opt-in sendPhoto: only for image uploads the client explicitly marks (send_as=photo) and
+  // only within Telegram's sendPhoto envelope (≤10 MB, jpeg/png/webp). Any sendPhoto failure —
+  // dimensions, ratio, mime, size — falls back to lossless sendDocument so the photo is never
+  // lost. client_upload_id idempotency is untouched: the uploads row is written only after a
+  // successful Telegram send, so a lost response retries into the cached result without a second
+  // Telegram message.
+  const wantPhoto = String(form.get('send_as') || '') === 'photo';
+  const photoEligible = wantPhoto && /^image\/(jpeg|png|webp)$/.test(String(file.type || ''))
+    && Number(file.size) > 0 && Number(file.size) <= 10 * 1024 * 1024;
+  let tgResult = null, telegramMethod = 'document', photoSize = null;
+  if (photoEligible) {
+    try {
+      const candidate = await telegramSendPhoto(env, file, `spread_${p.id}_v${version}`);
+      photoSize = largestPhotoSize(candidate.photo);
+      if (!photoSize || !photoSize.file_id) {
+        throw new HttpError(502, 'telegram_error', 'sendPhoto returned no photo sizes');
+      }
+      tgResult = candidate; telegramMethod = 'photo';
+    } catch (sendPhotoError) {
+      console.warn('sendPhoto failed; falling back to sendDocument for', clientUploadId,
+        sendPhotoError instanceof Error ? sendPhotoError.message : sendPhotoError);
+      tgResult = null; telegramMethod = 'document'; photoSize = null;
+    }
+  }
+  if (!tgResult) tgResult = await telegramSendDocument(env, file, `spread_${p.id}_v${version}`);
+  const doc = telegramMethod === 'photo' ? photoSize : tgResult.document;
   const storageObjectId = encodeStorageObjectId(env.CHAT_ID, tgResult.message_id);
 
   const photoId = uuid();
@@ -1470,7 +1529,7 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
         telegram_file_id, telegram_file_unique_id, mime_type, file_size, created_by, created_at, seq, client_upload_id)
        VALUES (?,?,?,1,'telegram',?,?,?,?,?,?,?,?,?,?)`
     ).bind(photoId, p.id, version, storageObjectId, tgResult.message_id, doc.file_id, doc.file_unique_id,
-      doc.mime_type || file.type, doc.file_size, u.userId, now, seq, clientUploadId),
+      doc.mime_type || file.type, doc.file_size || null, u.userId, now, seq, clientUploadId),
     env.DB.prepare('UPDATE spreads SET current_photo_id=?, updated_at=?, updated_by=?, revision=revision+1, seq=? WHERE id=?')
       .bind(photoId, now, u.userId, seq, p.id),
     activityStatement(env, { notebookId: spread.notebook_id, spreadId: p.id, entity: 'photo', entityId: photoId,
@@ -1494,6 +1553,7 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
     message_id: uploadedPhoto.telegram_message_id, file_id: uploadedPhoto.telegram_file_id,
     file_unique_id: uploadedPhoto.telegram_file_unique_id, mime_type: uploadedPhoto.mime_type,
     file_size: uploadedPhoto.file_size, telegram_link: uploadedPhoto.telegram_link,
+    telegram_method: telegramMethod,
     version: uploadedPhoto.version, seq: uploadedPhoto.seq, spread_revision: spreadFresh.revision,
     photo: uploadedPhoto,
   };

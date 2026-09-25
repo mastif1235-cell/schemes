@@ -129,7 +129,12 @@ function createEnv() {
       revision:1, seq:2, deleted_at:null}],
     photos:[{id:'p-old', spread_id:'s1', version:1, is_current:1, provider:'telegram', storage_object_id:'storage-old',
       telegram_message_id:'321', telegram_file_id:'file-old', telegram_file_unique_id:'unique-old', mime_type:'image/jpeg',
-      file_size:1234, created_by:'u1', created_at:now(), seq:3, client_upload_id:'old-upload'}],
+      file_size:1234, created_by:'u1', created_at:now(), seq:3, client_upload_id:'old-upload'},
+    // Legacy row: no telegram_message_id at all — only storage_object_id with the encoded pair.
+    {id:'p-legacy', spread_id:'s1', version:2, is_current:0, provider:'telegram',
+      storage_object_id:Buffer.from('-100555777:300', 'utf8').toString('base64'),
+      telegram_message_id:null, telegram_file_id:'file-legacy', telegram_file_unique_id:'unique-legacy',
+      mime_type:'image/jpeg', file_size:2222, created_by:'u1', created_at:now(), seq:4, client_upload_id:'legacy-upload'}],
     uploads:[],
   };
   return {DB:new FakeD1(db), CHAT_ID:'-100555777', BOT_TOKEN:'test-token', __db:db};
@@ -154,6 +159,20 @@ assert.equal(sync.status, 200);
 assert.equal(sync.data.changes.photos.find(row => row.id === 'p-old').telegram_link, 'https://t.me/c/555777/321',
   'sync computes Telegram links for photo changes');
 assert.ok(!Object.hasOwn(env.__db.photos[0], 'telegram_link'), 'test fixture mimics D1 photos without a stored telegram_link column');
+assert.equal(snapshot.data.photos.find(row => row.id === 'p-legacy').telegram_link, 'https://t.me/c/555777/300',
+  'legacy row without telegram_message_id gets its link derived from storage_object_id');
+assert.equal(sync.data.changes.photos.find(row => row.id === 'p-legacy').telegram_link, 'https://t.me/c/555777/300',
+  'sync delivers the derived legacy link to every device');
+{
+  // garbage storage_object_id must not crash publicPhoto nor invent links
+  env.__db.photos.push({id:'p-broken', spread_id:'s1', version:3, is_current:0, storage_object_id:'storage-old',
+    telegram_message_id:null, telegram_file_id:'x', telegram_file_unique_id:'x', mime_type:'image/jpeg',
+    file_size:1, created_by:'u1', created_at:now(), seq:5, client_upload_id:'broken-upload'});
+  const brokenSnap = await api(env, 'GET', '/api/notebooks/n1/snapshot');
+  assert.equal(brokenSnap.status, 200, 'broken storage_object_id row stays readable');
+  assert.equal(brokenSnap.data.photos.find(row => row.id === 'p-broken').telegram_link, null,
+    'broken storage_object_id never invents a link');
+}
 
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async url => {
@@ -174,4 +193,95 @@ try {
   assert.ok(stored && !Object.hasOwn(stored, 'telegram_link'), 'computed link is not stored as a D1 photo column');
 } finally { globalThis.fetch = nativeFetch; }
 
+// ---- sendPhoto opt-in: E success, F lost-response retry, G fallback, mime guard ----
+{
+  const calls = [];
+  globalThis.fetch = async url => {
+    calls.push(String(url));
+    if (String(url).includes('/sendPhoto')) {
+      return Response.json({ok:true, result:{message_id:501, photo:[
+        {file_id:'photo-small', file_unique_id:'u-small', width:90, height:67, file_size:100},
+        {file_id:'photo-big', file_unique_id:'u-big', width:1280, height:960, file_size:5000}]}});
+    }
+    return Response.json({ok:true, result:{message_id:444, document:{file_id:'fresh-file', file_unique_id:'fresh-unique',
+      file_size:4, mime_type:'image/jpeg'}}});
+  };
+  try {
+    const form = new FormData();
+    form.append('file', new Blob(['jpeg-bytes'], {type:'image/jpeg'}), 'scan.jpg');
+    form.append('client_upload_id', 'photo-upload-1');
+    form.append('send_as', 'photo');
+    const uploaded = await api(env, 'POST', '/api/spreads/s1/photos', form);
+    assert.equal(uploaded.status, 200);
+    assert.equal(uploaded.data.telegram_method, 'photo', 'sendPhoto success is recorded as photo');
+    assert.equal(uploaded.data.message_id, 501);
+    assert.equal(uploaded.data.file_id, 'photo-big', 'the largest PhotoSize becomes the stored file');
+    assert.equal(uploaded.data.telegram_link, 'https://t.me/c/555777/501', 'sendPhoto link is a normal message link');
+    const stored = env.__db.photos.find(row => row.id === uploaded.data.photo_id);
+    assert.equal(stored.telegram_file_id, 'photo-big', 'stored file_id belongs to the largest size');
+    assert.equal(stored.mime_type, 'image/jpeg', 'mime falls back to the uploaded file type');
+    assert.equal(calls.filter(url => url.includes('/sendPhoto')).length, 1, 'exactly one sendPhoto call');
+    // F: lost response + retry with the same client_upload_id must NOT re-send to Telegram
+    const retry = await api(env, 'POST', '/api/spreads/s1/photos', form);
+    assert.equal(retry.status, 200);
+    assert.equal(retry.data.telegram_method, 'photo', 'retry replays the cached photo result');
+    assert.equal(retry.data.photo_id, uploaded.data.photo_id, 'retry returns the same photo row');
+    assert.equal(calls.filter(url => url.includes('/sendPhoto')).length, 1,
+      'lost response + retry does not create a second Telegram message');
+    // parallel duplicate with the same upload id also replays the cache
+    const second = await api(env, 'POST', '/api/spreads/s1/photos', form);
+    assert.equal(second.data.photo_id, uploaded.data.photo_id, 'parallel duplicate replays one logical upload');
+    assert.equal(calls.filter(url => url.includes('/sendPhoto')).length, 1);
+  } finally { globalThis.fetch = nativeFetch; }
+}
+{
+  // G: sendPhoto rejected by Telegram (dimensions/mime inside) → lossless document wins, photo not lost.
+  const calls = [];
+  globalThis.fetch = async url => {
+    calls.push(String(url));
+    if (String(url).includes('/sendPhoto')) {
+      return Response.json({ok:false, error_code:400, description:'PHOTO_INVALID_DIMENSIONS'}, {status:400});
+    }
+    return Response.json({ok:true, result:{message_id:445, document:{file_id:'fallback-file',
+      file_unique_id:'fallback-unique', file_size:9, mime_type:'image/webp'}}});
+  };
+  try {
+    const form = new FormData();
+    form.append('file', new Blob(['webp-bytes'], {type:'image/webp'}), 'scan.webp');
+    form.append('client_upload_id', 'photo-upload-2');
+    form.append('send_as', 'photo');
+    const uploaded = await api(env, 'POST', '/api/spreads/s1/photos', form);
+    assert.equal(uploaded.status, 200, 'fallback keeps the upload alive');
+    assert.equal(uploaded.data.telegram_method, 'document', 'fallback records the actual method');
+    assert.equal(uploaded.data.message_id, 445);
+    assert.equal(uploaded.data.file_id, 'fallback-file');
+    assert.equal(uploaded.data.telegram_link, 'https://t.me/c/555777/445', 'document fallback link opens the message');
+    assert.equal(calls.filter(url => url.includes('/sendPhoto')).length, 1, 'sendPhoto attempted once');
+    assert.ok(calls.some(url => url.includes('/sendDocument')), 'sendDocument used as fallback');
+  } finally { globalThis.fetch = nativeFetch; }
+}
+{
+  // mime guard: send_as=photo with a non-photo type goes straight to sendDocument
+  const calls = [];
+  globalThis.fetch = async url => {
+    calls.push(String(url));
+    return Response.json({ok:true, result:{message_id:446, document:{file_id:'gif-file',
+      file_unique_id:'gif-unique', file_size:3, mime_type:'image/gif'}}});
+  };
+  try {
+    const form = new FormData();
+    form.append('file', new Blob(['gif'], {type:'image/gif'}), 'anim.gif');
+    form.append('client_upload_id', 'photo-upload-3');
+    form.append('send_as', 'photo');
+    const uploaded = await api(env, 'POST', '/api/spreads/s1/photos', form);
+    assert.equal(uploaded.data.telegram_method, 'document', 'gif skips sendPhoto (pre-check)');
+    assert.equal(calls.filter(url => url.includes('/sendPhoto')).length, 0, 'no sendPhoto attempt for gif');
+  } finally { globalThis.fetch = nativeFetch; }
+}
+// H: every generation stays visible after sync — the second phone receives working data.
+const afterAll = await api(env, 'GET', '/api/sync?since=0');
+for (const id of ['p-old', 'p-legacy']) {
+  assert.ok(afterAll.data.changes.photos.find(row => row.id === id).telegram_link?.startsWith('https://t.me/c/555777/'),
+    `photo ${id} keeps a usable link after all changes`);
+}
 console.log('backend-photo-link: PASS');

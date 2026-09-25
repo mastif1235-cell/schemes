@@ -859,6 +859,9 @@
     fd.append('file', blobRec.blob, `spread_${photo.spread_id}_v${photo.version}`);
     fd.append('client_upload_id', photo.id);
     if (thumbRec) fd.append('preview', thumbRec.blob, 'thumb.webp');
+    // Device-local opt-in: show new uploads inline in Telegram. Telegram re-encodes sendPhoto,
+    // so sending remains lossless (sendDocument) unless the user explicitly enabled this.
+    if (settings.telegram_send_as_photo) fd.append('send_as', 'photo');
     if (!isAuthed()) throw Object.assign(new Error('auth_required'), {status:401});
     const path = `/api/spreads/${spread.server_id}/photos`;
     const headers = {};
@@ -907,6 +910,7 @@
           telegram_file_id:data.file_id,
           telegram_file_unique_id:data.file_unique_id,
           telegram_link:data.telegram_link || null,
+          telegram_method:data.telegram_method || 'document',
           server_id:data.photo_id || current.server_id,
           scope:requestScope, upload_status:'synced'}} : {});
         if (data.spread_revision) {
