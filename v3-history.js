@@ -196,9 +196,18 @@
     const host = el.querySelector('[data-server-history]');
     const notebooks = (await getAll('notebooks')).filter(row => !row.deleted_at && !row.hidden_no_access);
     const byServer = new Map(notebooks.filter(row => row.server_id).map(row => [row.server_id, row]));
+    // Events of locally deleted/hidden notebooks must stay visible when the SERVER still counts
+    // them as this user's unread (e.g. notebook.deleted / spread.deleted of a trashed notebook).
+    // The server only lists notebook ids the user is authorized to read in unread/cursor maps,
+    // so using them as the visibility key cannot widen access; the server re-checks anyway.
+    const authorizedExtras = () => new Set([
+      ...Object.keys(settings.unread_by_notebook || {}),
+      ...Object.keys(readCursors?.notebooks || {})
+    ]);
     async function draw() {
+      const extras = authorizedExtras();
       const events = (await getAll('activity_events'))
-        .filter(row => row.scope === scope && !row.legacy && byServer.has(row.notebook_id))
+        .filter(row => row.scope === scope && !row.legacy && (byServer.has(row.notebook_id) || extras.has(row.notebook_id)))
         .sort((a, b) => Number(isUnread(b)) - Number(isUnread(a))
           || (Number(b.seq) || 0) - (Number(a.seq) || 0) || eventTime(b) - eventTime(a)
           || String(b.id || '').localeCompare(String(a.id || '')));
@@ -208,16 +217,23 @@
       for (const row of events.slice(0, 200)) {
         const notebook = byServer.get(row.notebook_id) || null;
         const spread = spreads.find(item => item.server_id === row.spread_id);
+        // Deleted notebook: show server-preserved title if known, else a neutral label —
+        // never resurrect the object itself into the main lists.
+        const notebookLabel = notebook?.title || row.notebook_title || 'Удалённый блокнот';
+        const spreadLabel = row.spread_number != null || spread
+          ? ' · №' + esc(row.spread_number ?? spread?.number ?? '')
+          : (row.spread_id ? ' · Удалённый разворот' : '');
+        const markNotebookId = !row.spread_id && (notebook?.server_id || (extras.has(row.notebook_id) ? row.notebook_id : null));
         const item = document.createElement('article');
         const unread = !!isUnread(row);
         item.className = 'v340-history-row' + (unread ? ' v340-history-unread' : '');
         item.dataset.eventId = row.id;
         item.innerHTML = `<div>${unread ? '<span class="v340-history-unread-dot" aria-label="Непрочитано">●</span>' : ''}<strong>${esc(row.actor?.display_name || row.actor_display_name || 'Участник')}</strong>
           <small> · ${esc(new Date(eventTime(row)).toLocaleString('ru-RU'))}</small>
-          <div>${esc(notebook?.title || row.notebook_title || '')}${row.spread_number || spread ? ' · №' + esc(row.spread_number ?? spread?.number ?? '') : ''}</div>
+          <div>${esc(notebookLabel)}${spreadLabel}</div>
           <div>${esc(actionLabel(row.action))}${spread && spread.deleted_at ? ' · Разворот удалён' : ''}</div></div>
           ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open>Открыть</button>'
-            : (!row.spread_id && notebook?.server_id ? '<button class="btn-secondary" data-mark-notebook>Прочитать весь блокнот</button>' : '')}`;
+            : (markNotebookId ? '<button class="btn-secondary" data-mark-notebook>Прочитать весь блокнот</button>' : '')}`;
         item.querySelector('[data-open]')?.addEventListener('click', async () => {
           close();
           await window.v340OpenSpread(spread, {returnToHistory:true});
@@ -225,7 +241,7 @@
         item.querySelector('[data-mark-notebook]')?.addEventListener('click', async event => {
           event.target.disabled = true;
           try {
-            if (await markNotebookSeen(notebook.server_id, true)) {
+            if (await markNotebookSeen(markNotebookId, true)) {
               try { await refreshReadCursors(); } catch (error) { console.warn('History read cursors refresh failed', error); }
             } else toast('Не удалось отметить блокнот прочитанным. Повторите.');
             await draw();
@@ -251,6 +267,12 @@
     await draw();
     for (const notebook of notebooks) {
       try { await refreshNotebookActivity(notebook); } catch (error) { console.warn('History refresh failed', error); }
+    }
+    // Deleted/hidden notebooks with server-reported unread: fetch their journal too, otherwise
+    // the cached store can never contain the very events the badge counts.
+    for (const serverId of authorizedExtras()) {
+      if (byServer.has(serverId)) continue;
+      try { await refreshNotebookActivity({server_id:serverId}); } catch (error) { console.warn('History refresh failed for a deleted notebook', error); }
     }
     await draw();
   }

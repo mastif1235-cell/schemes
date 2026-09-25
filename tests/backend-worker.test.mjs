@@ -780,6 +780,54 @@ assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
     'revoked session is never renewed');
 }
 {
+  // History/Unread (production case seq 835/819): events of a DELETED notebook stay readable and
+  // countable for remaining members — so the client may show them instead of hiding the badge.
+  const fx = createFixture();
+  const before = (await api(fx.env, 'GET', '/api/activity/unread', 'token-2')).data.unread;
+  assert.equal((await api(fx.env, 'DELETE', '/api/spreads/s1', 'token-2')).status, 200);
+  assert.equal((await api(fx.env, 'DELETE', '/api/notebooks/n1', 'token-1')).status, 200);
+  const memberUnread = (await api(fx.env, 'GET', '/api/activity/unread', 'token-2')).data.unread;
+  assert.ok((memberUnread.notebooks.n1?.count || 0) > (before.notebooks.n1?.count || 0),
+    'deleted notebook events stay in the member unread counter');
+  assert.ok(memberUnread.total >= 2, 'two deletion events are counted');
+  const journal = await api(fx.env, 'GET', '/api/notebooks/n1/activity', 'token-2');
+  assert.equal(journal.status, 200, 'deleted notebook journal stays readable for a member');
+  assert.ok(journal.data.events.some(event => event.action === 'notebook.deleted'),
+    'notebook.deleted is present in the journal');
+  assert.ok(journal.data.events.some(event => event.action === 'spread.deleted'),
+    'spread.deleted is present in the journal');
+  const seen = await api(fx.env, 'PUT', '/api/notebooks/n1/activity/seen', 'token-2', {all_spreads:true});
+  assert.equal(seen.status, 200, 'read cursor can be set on a deleted notebook (membership intact)');
+  assert.equal((await api(fx.env, 'GET', '/api/activity/unread', 'token-2')).data.unread.total, 0,
+    'read-all clears deleted notebook unread without touching D1 by hand');
+}
+{
+  // H: a revoked member must not see events of the deleted notebook, anywhere.
+  const fx = createFixture();
+  assert.equal((await api(fx.env, 'DELETE', '/api/notebooks/n1', 'token-1')).status, 200);
+  fx.sqlite.prepare('UPDATE notebook_members SET revoked_at=? WHERE notebook_id=? AND user_id=?')
+    .run(new Date().toISOString(), 'n1', 'u2');
+  assert.equal((await api(fx.env, 'GET', '/api/notebooks/n1/activity', 'token-2')).status, 403,
+    'revoked member cannot read the deleted notebook journal');
+  const unread = (await api(fx.env, 'GET', '/api/activity/unread', 'token-2')).data.unread;
+  assert.equal(unread.notebooks.n1, undefined, 'revoked member has no unread from the deleted notebook');
+  const cursors = (await api(fx.env, 'GET', '/api/activity/read-cursors', 'token-2')).data.cursors;
+  assert.ok(!('n1' in (cursors.notebooks || {})), 'revoked member gets no read cursor for the deleted notebook');
+}
+{
+  // Owner fallback nuance: an owner WITHOUT a membership row is not pestered about the notebook
+  // they deleted themselves (deleted_at is NULL filter on the fallback UNION term).
+  const fx = createFixture();
+  fx.sqlite.prepare('DELETE FROM notebook_members WHERE notebook_id=? AND user_id=?').run('n1', 'u1');
+  assert.equal((await api(fx.env, 'DELETE', '/api/notebooks/n1', 'token-1')).status, 200);
+  const ownerUnread = (await api(fx.env, 'GET', '/api/activity/unread', 'token-1')).data.unread;
+  assert.ok(!('n1' in (ownerUnread.notebooks || {})),
+    'owner-without-membership is not counted for their own deleted notebook');
+  // ...while a still-member notebook-mate IS counted (documented, intentional asymmetry)
+  const memberUnread = (await api(fx.env, 'GET', '/api/activity/unread', 'token-2')).data.unread;
+  assert.ok((memberUnread.notebooks.n1?.count || 0) >= 1, 'remaining member is counted');
+}
+{
   // A renewal write failure is part of the request, never detached fire-and-forget work.
   const fx = createFixture();
   const soon = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();

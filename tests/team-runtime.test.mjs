@@ -536,6 +536,134 @@ try {
   assert.equal(historyReload.persisted.badge,null);
   assert.deepEqual(historyReload.fresh,{id:'new-21',dots:1,badge:'1'},'one later event is unread and first');
   assert.deepEqual(historyReload.notebook,{badge:null,dots:0},'read whole notebook refreshes global badge');
+
+  // ---- Production case: unread events of a DELETED notebook (seq 835 / 819) must be visible ----
+  const deletedHistory = await page.evaluate(async () => {
+    const originalApi = api; const calls = [];
+    fullSync = async () => {}; // no background interference for this deterministic snapshot
+    const scope = window.vNextSync.scope();
+    await put('notebooks', {id:'nbX', server_id:'remote-nbX', title:'Удалённый старый блокнот',
+      deleted_at:'2026-09-24T20:00:00.000Z', updated_at:'2026-09-24T20:00:00.000Z', revision:3});
+    const base = {scope, notebook_id:'remote-nbX', actor_display_name:'Участник', created_at:'2026-09-24T12:00:00Z'};
+    // mirrors production seq 835 (notebook.deleted) and seq 819 (spread.deleted)
+    await put('activity_events', {...base, cache_id:scope+'|ev-nb-del', id:'ev-nb-del', seq:835,
+      spread_id:null, action:'notebook.deleted', notebook_title:'Общий'});
+    await put('activity_events', {...base, cache_id:scope+'|ev-sp-del', id:'ev-sp-del', seq:819,
+      spread_id:'srv-sp-gone', action:'spread.deleted'}); // no spread row and no spread_number
+    await put('activity_events', {scope, cache_id:scope+'|act-830', id:'act-830', seq:830,
+      notebook_id:'remote-nb', spread_id:'remote-s1', action:'spread.updated',
+      actor_display_name:'Участник', created_at:'2026-09-24T12:30:00Z'});
+    let cursors = {notebooks:{'remote-nbX':795,'remote-nb':900}, spreads:{'srv-sp-gone':818,'remote-s1':829,'remote-s2':900}};
+    let unread = {notebooks:{'remote-nbX':{count:2,max_seq:835},'remote-nb':{count:1,max_seq:830}},spreads:{},total:3};
+    api = async (path, options) => {
+      calls.push(path);
+      if (path === '/api/activity/read-cursors') return {cursors:structuredClone(cursors)};
+      if (path === '/api/activity/unread') return {unread:structuredClone(unread)};
+      if (path.includes('/activity/seen') && options?.method === 'PUT') {
+        cursors = {notebooks:{'remote-nbX':900,'remote-nb':900}, spreads:{'srv-sp-gone':900,'remote-s1':900,'remote-s2':900}};
+        unread = {notebooks:{},spreads:{},total:0};
+        return {unread:structuredClone(unread)};
+      }
+      if (path.includes('/activity?')) return {events:[],legacy_events:[]};
+      return originalApi(path, options);
+    };
+    await window.v340ApplyUnread(unread);
+    await window.v340OpenGlobalHistory();
+    const rowById = id => document.querySelector(`[data-server-history] .v340-history-row[data-event-id="${id}"]`);
+    const state = () => ({
+      ids:[...document.querySelectorAll('[data-server-history] .v340-history-row')].map(item => item.dataset.eventId).slice(0, 5),
+      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null,
+      nbRow:(() => { const row = rowById('ev-nb-del'); return row ? {text:row.textContent, open:!!row.querySelector('[data-open]'), mark:!!row.querySelector('[data-mark-notebook]')} : null; })(),
+      spRow:(() => { const row = rowById('ev-sp-del'); return row ? {text:row.textContent, open:!!row.querySelector('[data-open]'), mark:!!row.querySelector('[data-mark-notebook]')} : null; })()
+    });
+    const before = state();
+    // mark all read must clear the deleted-notebook unread too (cursor endpoints exist for it)
+    const markButton = document.querySelector('[data-mark-all]');
+    await markButton.onclick({target:markButton});
+    const after = state();
+    // the deleted-notebook journal must be requested too
+    const fetchedDeleted = calls.some(path => path.startsWith('/api/notebooks/remote-nbX/activity'));
+    document.querySelector('[data-history-close]')?.click();
+    api = originalApi;
+    return {before, after, fetchedDeleted};
+  });
+  // A/B/C: deleted notebook + deleted spread unread events are visible and counted
+  assert.equal(deletedHistory.before.badge, '3', 'badge counts deleted notebook events (2) + active event (1)');
+  assert.ok(deletedHistory.before.ids.includes('ev-nb-del'), 'deleted notebook event is visible in History');
+  assert.ok(deletedHistory.before.ids.includes('ev-sp-del'), 'deleted spread event is visible in History');
+  assert.equal(deletedHistory.before.dots, 3, 'unread dots present on all unread events');
+  // I: unread-first + newest-first across active and deleted entities
+  assert.deepEqual(deletedHistory.before.ids.slice(0, 3), ['ev-nb-del', 'act-830', 'ev-sp-del'],
+    'unread first, all three unread rows sorted by seq desc');
+  // labels: server-preserved notebook title wins; neutral fallbacks are used otherwise
+  assert.ok(deletedHistory.before.nbRow.text.includes('Общий'), 'server notebook title is shown');
+  assert.ok(deletedHistory.before.spRow.text.includes('Удалённый блокнот'), 'neutral notebook fallback is shown');
+  assert.ok(deletedHistory.before.spRow.text.includes('Удалённый разворот'), 'neutral spread fallback is shown');
+  // G: no Open navigation for deleted/missing entities; mark-whole-notebook stays available
+  assert.equal(deletedHistory.before.spRow.open, false, 'no Open button for a deleted spread');
+  assert.equal(deletedHistory.before.nbRow.open, false, 'no Open button without a living spread');
+  assert.equal(deletedHistory.before.nbRow.mark, true, 'mark-whole-notebook stays clickable for the deleted notebook');
+  assert.equal(deletedHistory.fetchedDeleted, true, 'journal of the deleted notebook is fetched into the cache');
+  // D: mark all clears badge and dots
+  assert.equal(deletedHistory.after.badge, null, 'mark all clears the badge');
+  assert.equal(deletedHistory.after.dots, 0, 'mark all clears unread dots');
+
+  // E: read state survives reload, and F: a NEW deleted event becomes unread again
+  await page.reload();
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined');
+  const deletedReload = await page.evaluate(async () => {
+    const originalApi = api;
+    fullSync = async () => {};
+    let cursors = {notebooks:{'remote-nbX':900,'remote-nb':900}, spreads:{'srv-sp-gone':900,'remote-s1':900,'remote-s2':900}};
+    let unread = {notebooks:{},spreads:{},total:0};
+    api = async (path, options) => {
+      if (path === '/api/activity/read-cursors') return {cursors:structuredClone(cursors)};
+      if (path === '/api/activity/unread') return {unread:structuredClone(unread)};
+      if (path.includes('/activity?')) return {events:[],legacy_events:[]};
+      return originalApi(path, options);
+    };
+    await window.v340ApplyUnread(unread);
+    await window.v340OpenGlobalHistory();
+    const persisted = {
+      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
+    document.querySelector('[data-history-close]')?.click();
+    // F: a later event on the deleted notebook becomes unread again and pins on top (I)
+    const scope = window.vNextSync.scope();
+    await put('activity_events', {scope, cache_id:scope+'|ev-nb-del-2', id:'ev-nb-del-2', seq:836,
+      notebook_id:'remote-nbX', spread_id:null, action:'notebook.deleted', notebook_title:'Общий',
+      actor_display_name:'Участник', created_at:'2026-09-24T13:00:00Z'});
+    cursors.notebooks['remote-nbX'] = 835;
+    unread = {notebooks:{'remote-nbX':{count:1,max_seq:836}},spreads:{},total:1};
+    await window.v340ApplyUnread(unread);
+    await window.v340OpenGlobalHistory();
+    const first = await (async () => {
+      for (let i = 0; i < 40; i++) {
+        const row = document.querySelector('[data-server-history] .v340-history-row');
+        if (row) return row;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      return document.querySelector('[data-server-history] .v340-history-row');
+    })();
+    const fresh = {id:first?.dataset.eventId,
+      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
+    document.querySelector('[data-history-close]')?.click();
+    api = originalApi;
+    return {persisted, fresh};
+  });
+  assert.equal(deletedReload.persisted.dots, 0, 'E: read state survives reload');
+  assert.equal(deletedReload.persisted.badge, null, 'E: badge stays clear after reload');
+  assert.deepEqual(deletedReload.fresh, {id:'ev-nb-del-2', dots:1, badge:'1'},
+    'F: a new event on the deleted notebook is unread again and first');
+  // requirement 4: the deleted notebook never reappears in the main lists
+  const lists = await page.evaluate(async () => {
+    const row = await get('notebooks', 'nbX');
+    return {deleted:!!row.deleted_at, route:JSON.parse(JSON.stringify(route || null))};
+  });
+  assert.equal(lists.deleted, true, 'deleted notebook stays deleted locally (no resurrection)');
+
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');
 } finally { await browser?.close();await new Promise(resolve=>server.close(resolve)); }
