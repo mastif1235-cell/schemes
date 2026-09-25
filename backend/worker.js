@@ -71,12 +71,17 @@ async function authenticate(request, env) {
      WHERE s.token_hash = ?`
   ).bind(hash).first();
   if (!row || row.revoked_at || new Date(row.expires_at) < new Date()) return null;
-  env.DB.prepare('UPDATE sessions SET last_used_at=? WHERE id=?').bind(nowISO(), row.session_id).run().catch(() => {});
-  // Sliding renewal: an actively used session never reaches the 180-day wall.
-  if (new Date(row.expires_at) < new Date(Date.now() + 1000 * 60 * 60 * 24 * 90)) {
-    env.DB.prepare('UPDATE sessions SET expires_at=? WHERE id=? AND revoked_at IS NULL')
-      .bind(new Date(Date.now() + 1000 * 60 * 60 * 24 * 180).toISOString(), row.session_id).run().catch(() => {});
-  }
+  // Await the write before returning an authenticated response. The conditional UPDATE also
+  // refuses a session revoked or expired after the SELECT above.
+  const now = nowISO();
+  const nearExpiry = new Date(row.expires_at) < new Date(Date.now() + 1000 * 60 * 60 * 24 * 90);
+  const write = nearExpiry
+    ? env.DB.prepare('UPDATE sessions SET last_used_at=?, expires_at=? WHERE id=? AND revoked_at IS NULL AND expires_at>?')
+      .bind(now, new Date(Date.now() + 1000 * 60 * 60 * 24 * 180).toISOString(), row.session_id, now)
+    : env.DB.prepare('UPDATE sessions SET last_used_at=? WHERE id=? AND revoked_at IS NULL AND expires_at>?')
+      .bind(now, row.session_id, now);
+  const result = await write.run(); // a DB failure must fail the request, not silently skip renewal
+  if (!result.meta.changes) return null;
   return { userId: row.user_id, sessionId: row.session_id, displayName: row.display_name };
 }
 async function requireAuth(request, env) {

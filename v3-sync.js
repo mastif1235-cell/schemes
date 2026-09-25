@@ -10,6 +10,7 @@
   const enabled = name => settings.team_capabilities?.scope === scope() && settings.team_capabilities.flags?.[name] === true;
   const assertScope = expected => { if (expected !== scope()) throw new Error('Аккаунт изменился; повторите синхронизацию'); };
   const recoveringNotebooks = new Set();
+  const inFlightEntityItems = new Set();
   let refreshRequested = false;
   function requestRemoteRefresh() {
     if (!isOnline() || !isAuthed()) return;
@@ -589,67 +590,87 @@
     return has(await getAll('sync_queue'));
   }
 
+  // Apply only server-confirmed identity/revision inside one IndexedDB transaction.
+  // A local edit, delete or restore may have changed every other field during the request.
+  async function confirmServerRow(store, original, server, requestScope) {
+    assertScope(requestScope);
+    if (!server || server.id !== (original.server_id || server.id) || !Number.isInteger(server.revision))
+      throw new Error('Некорректное подтверждение сервера');
+    await window.vNextAtomic(store, original.id, current => {
+      if (!current) return {};
+      if (current.server_id && current.server_id !== server.id)
+        throw new Error('Серверная привязка изменилась во время синхронизации');
+      return {row:{...current, server_id:server.id, revision:server.revision, scope:requestScope}};
+    });
+  }
+
+  function restoreConfirmation(data, entity, serverId) {
+    const row = data?.[entity];
+    if (!row || row.id !== serverId || row.deleted_at != null ||
+        !Number.isInteger(row.revision) || typeof data.restored !== 'boolean')
+      throw new Error('Сервер не подтвердил восстановление объекта');
+    return row;
+  }
+
+  function restoreError(error) {
+    if (error?.status !== 404) return error;
+    if (String(error.message || '') === 'no_such_route')
+      return Object.assign(new Error('worker_missing_restore_endpoint'), {status:404, unsupported:true});
+    return Object.assign(new Error('Объект отсутствует на сервере, требуется восстановление/разрешение конфликта'),
+      {status:404, entityMissing:true});
+  }
+
   pushNotebook = async function (item) {
+    const requestScope = scope();
     const nb = await get('notebooks', item.local_id);
     if (!nb) return queueResult('discarded', 'local notebook no longer exists');
     if (item.payload && item.payload.op === 'delete') {
       // Persistent outbox delete: replaces the old fire-and-forget call that silently
       // reverted when the request failed offline.
-      const deletedAt = nb.deleted_at || nowISO();
       if (!nb.server_id) {
-        await put('notebooks', {...nb, deleted_at:deletedAt});
         return queueResult('sent');
       }
       try { await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}`, {method:'DELETE'}); }
       catch (error) {
         if (!error || error.status !== 404) throw error;
       }
-      await put('notebooks', {...nb, deleted_at:deletedAt});
       return queueResult('sent');
     }
     if (item.payload && item.payload.op === 'restore') {
       if (!nb.server_id) return queueResult('sent'); // never reached the server
-      try { await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}/restore`, {method:'POST'}); }
-      catch (error) {
-        // 'no_such_route' = the deployed worker predates the /restore endpoint (the rollout is
-        // worker-first). That is NOT a successful restore: park the op, keep the record local.
-        if (!error || error.status !== 404) throw error;
-        if (String(error.message || '') === 'no_such_route')
-          throw Object.assign(new Error('worker_missing_restore_endpoint'), {status:404, unsupported:true});
-      }
+      let data;
+      try { data = await api(`/api/notebooks/${encodeURIComponent(nb.server_id)}/restore`, {method:'POST'}); }
+      catch (error) { throw restoreError(error); }
+      await confirmServerRow('notebooks', nb, restoreConfirmation(data, 'notebook', nb.server_id), requestScope);
       return queueResult('sent');
     }
     if (!nb.server_id) {
       const data = await api('/api/notebooks', {method:'POST', json:{title:nb.title, description:nb.description, client_ref:nb.id}});
-      nb.server_id = data.notebook.id;
-      nb.revision = data.notebook.revision;
+      await confirmServerRow('notebooks', nb, data.notebook, requestScope);
     } else {
       const data = await api(`/api/notebooks/${nb.server_id}`, {method:'PATCH', json:{
         title:nb.title, description:nb.description, archived:nb.archived, revision:nb.revision
       }});
-      nb.revision = data.notebook.revision;
+      await confirmServerRow('notebooks', nb, data.notebook, requestScope);
     }
-    await put('notebooks', nb);
     return queueResult('sent');
   };
 
   pushSpread = async function (item) {
+    const requestScope = scope();
     const sp = await get('spreads', item.local_id);
     if (!sp) return queueResult('discarded', 'local spread no longer exists');
     if (item.payload && item.payload.op === 'delete') {
       // A local delete must reach the server; otherwise the next snapshot restores the spread.
       // Local-only spreads (no server id) are already deleted as far as the server is concerned.
-      const deletedAt = sp.deleted_at || nowISO();
       const nb = await get('notebooks', sp.notebook_id);
       if (!sp.server_id || !nb || !nb.server_id) {
-        await put('spreads', {...sp, deleted_at:deletedAt});
         return queueResult('sent');
       }
       try { await api(`/api/spreads/${sp.server_id}`, {method:'DELETE'}); }
       catch (error) {
         if (!error || error.status !== 404) throw error;
       }
-      await put('spreads', {...sp, deleted_at:deletedAt});
       return queueResult('sent');
     }
     if (item.payload && item.payload.op === 'restore') {
@@ -661,17 +682,9 @@
       if (!nbRestore || !nbRestore.server_id) return queueResult('deferred', 'notebook has no server id');
       try {
         const data = await api(`/api/spreads/${encodeURIComponent(sp.server_id)}/restore`, {method:'POST'});
-        if (data && data.spread) {
-          const latest = await get('spreads', sp.id);
-          if (latest) await put('spreads', {...latest, revision:data.spread.revision, deleted_at:null});
-        }
+        await confirmServerRow('spreads', sp, restoreConfirmation(data, 'spread', sp.server_id), requestScope);
       } catch (error) {
-        if (error && error.status === 404) {
-          if (String(error.message || '') === 'no_such_route')
-            throw Object.assign(new Error('worker_missing_restore_endpoint'), {status:404, unsupported:true});
-          return queueResult('sent', 'spread is gone on the server'); // entity truly absent
-        }
-        throw error;
+        throw restoreError(error);
       }
       return queueResult('sent');
     }
@@ -682,17 +695,14 @@
         number:sp.number, title:sp.title, note_short:sp.note_short, note_full:sp.note_full,
         status:sp.status, client_ref:sp.id
       }});
-      sp.server_id = data.spread.id;
-      sp.revision = data.spread.revision;
+      await confirmServerRow('spreads', sp, data.spread, requestScope);
     } else {
       const data = await api(`/api/spreads/${sp.server_id}`, {method:'PATCH', json:{
         number:sp.number, title:sp.title, note_short:sp.note_short, note_full:sp.note_full,
         status:sp.status, revision:sp.revision
       }});
-      sp.revision = data.spread.revision;
-      sp.conflict = null;
+      await confirmServerRow('spreads', sp, data.spread, requestScope);
     }
-    await put('spreads', sp);
     return queueResult('sent');
   };
 
@@ -707,7 +717,8 @@
     if (!tagRow.server_id) {
       const data = await api(`/api/notebooks/${nb.server_id}/tags`, {method:'POST', json:{name:tagRow.name}});
       tagRow.server_id = data.tag.id;
-      await put('tags', tagRow);
+      await window.vNextAtomic('tags', tagRow.id, current =>
+        current ? {row:{...current, server_id:data.tag.id}} : {});
     }
     if (item.op === 'add') await api(`/api/spreads/${sp.server_id}/tags`, {method:'POST', json:{tag_id:tagRow.server_id}});
     else await api(`/api/spreads/${sp.server_id}/tags/${tagRow.server_id}`, {method:'DELETE'});
@@ -762,6 +773,8 @@
       item.entity && item.entity !== 'photo' && retryDue(item, !!forceRetry)
     );
     for (const item of queue) {
+      // A concurrent edit must get its own outbox row while this snapshot is on the wire.
+      inFlightEntityItems.add(item.id);
       try {
         let result = queueResult('discarded', 'unsupported queue entity');
         if (item.entity === 'notebook') result = await pushNotebook(item);
@@ -811,6 +824,9 @@
             local.conflict = item.server_copy || true;
             await put(item.entity === 'notebook' ? 'notebooks' : 'spreads', local);
           }
+        } else if (error && error.entityMissing) {
+          markBlocked(item, error, 'entity_missing');
+          await put('sync_queue', item);
         } else if (error && error.unsupported) {
           // Deployment window: the worker does not know this endpoint (e.g. /restore).
           // Blocked protects the local record from pull and keeps other entities flowing;
@@ -829,6 +845,8 @@
           await put('sync_queue', item);
           console.warn('Deferred sync item failed', item.entity, item.local_id, error);
         }
+      } finally {
+        inFlightEntityItems.delete(item.id);
       }
     }
   };
@@ -856,6 +874,7 @@
 
   pushPhotoQueue = async function (forceRetry, options = {}) {
     if (!isAuthed()) return; // photos wait for sign-in locally; there is no unauthenticated upload
+    const requestScope = scope();
     const onlyItemIds = options.onlyItemIds ? new Set(options.onlyItemIds.map(String)) : null;
     const queue = (await getAll('sync_queue')).filter(item =>
       item.entity === 'photo' && retryDue(item, !!forceRetry)
@@ -877,20 +896,19 @@
       }
       const photoBeforeAttempt = {...photo};
       const itemBeforeAttempt = {...item};
-      photo.upload_status = 'uploading';
-      await put('photos', photo);
+      await window.vNextAtomic('photos', photo.id, current => current ?
+        {row:{...current, upload_status:'uploading'}} : {});
       try {
         const data = await sendPhotoUpload(photo, spread);
-        photo.storage_object_id = data.storage_object_id;
-        photo.telegram_message_id = data.message_id;
-        photo.telegram_file_id = data.file_id;
-        photo.telegram_file_unique_id = data.file_unique_id;
-        photo.telegram_link = data.telegram_link || null;
-        photo.server_id = data.photo_id || photo.server_id;
-        photo.upload_status = 'synced';
-        const latestPhoto = await get('photos', photo.id);
-        if (latestPhoto) photo.is_current = latestPhoto.is_current;
-        await put('photos', photo);
+        assertScope(requestScope);
+        await window.vNextAtomic('photos', photo.id, current => current ? {row:{...current,
+          storage_object_id:data.storage_object_id,
+          telegram_message_id:data.message_id,
+          telegram_file_id:data.file_id,
+          telegram_file_unique_id:data.file_unique_id,
+          telegram_link:data.telegram_link || null,
+          server_id:data.photo_id || current.server_id,
+          scope:requestScope, upload_status:'synced'}} : {});
         if (data.spread_revision) {
           const latestSpread = await get('spreads', spread.id);
           if (latestSpread) await put('spreads', {...latestSpread, revision:Math.max(latestSpread.revision || 0, data.spread_revision)});
@@ -900,11 +918,12 @@
         if (!options.preserveOriginals && !settings.keep_originals_offline) await del('blobs', photo.id + '_orig');
       } catch (error) {
         if (options.restoreOnFailure) {
-          await put('photos', photoBeforeAttempt);
+          await window.vNextAtomic('photos', photo.id, current => current ?
+            {row:{...current, upload_status:photoBeforeAttempt.upload_status}} : {});
           await put('sync_queue', itemBeforeAttempt);
         } else {
-          photo.upload_status = 'upload_failed';
-          await put('photos', photo);
+          await window.vNextAtomic('photos', photo.id, current => current ?
+            {row:{...current, upload_status:'upload_failed'}} : {});
           if (['permanent','too_large','auth'].includes(classifyPushError(error))) {
             markBlocked(item, error, classifyPushError(error)); // e.g. oversize file: no endless retry
           } else {
@@ -952,7 +971,7 @@
       } else if (await queueHasUnsynced(queue, 'notebook', local.id)) {
         continue;
       }
-      Object.assign(local, {server_id:srvNb.id, title:srvNb.title, description:srvNb.description,
+      Object.assign(local, {server_id:srvNb.id, scope:scope(), title:srvNb.title, description:srvNb.description,
         archived:!!srvNb.archived, revision:srvNb.revision, updated_at:srvNb.updated_at, deleted_at:srvNb.deleted_at});
       await put('notebooks', local);
     }
@@ -974,7 +993,7 @@
       } else if (await queueHasUnsynced(queue, 'spread', local.id)) {
         continue;
       }
-      Object.assign(local, {server_id:srvSp.id, number:srvSp.number, title:srvSp.title,
+      Object.assign(local, {server_id:srvSp.id, scope:scope(), number:srvSp.number, title:srvSp.title,
         note_short:srvSp.note_short, note_full:srvSp.note_full, status:srvSp.status,
         revision:srvSp.revision, updated_at:srvSp.updated_at, deleted_at:srvSp.deleted_at,
         searchableText:normalize([srvSp.number, srvSp.title, srvSp.note_short, srvSp.note_full].join(' '))});
@@ -1011,7 +1030,7 @@
       const localSp = spreadsFresh.find(sp => sp.server_id === srvPh.spread_id);
       if (!localSp) continue;
       let localPh = photosAll.find(photo => photo.server_id === srvPh.id);
-      if (!localPh) localPh = {id:uid(), created_at:srvPh.created_at};
+      if (!localPh) localPh = {id:uid(), created_at:srvPh.created_at, scope:scope()};
       const photoPending = queue.some(item => item.entity === 'photo' && item.photo_id === localPh.id && UNSYNCED.has(item.status));
       if (photoPending) continue;
       mapServerPhoto(localPh, srvPh, localSp.id);
@@ -1066,6 +1085,7 @@
       Object.assign(localNb, {title:data.notebook.title, description:data.notebook.description,
         archived:!!data.notebook.archived, revision:data.notebook.revision});
     }
+    localNb.scope = scope();
     localNb.hidden_no_access = false;
     await put('notebooks', localNb);
     if (data.cover && !(await queueHasUnsynced(queue, 'notebook_cover', localNb.id))) {
@@ -1078,7 +1098,7 @@
       let localSp = localSpreads.find(sp => sp.server_id === srvSp.id);
       if (!localSp) localSp = {id:uid(), notebook_id:localNb.id, created_at:srvSp.created_at, deleted_at:null};
       if (!(await queueHasUnsynced(queue, 'spread', localSp.id))) {
-        Object.assign(localSp, {server_id:srvSp.id, notebook_id:localNb.id, number:srvSp.number,
+        Object.assign(localSp, {server_id:srvSp.id, scope:scope(), notebook_id:localNb.id, number:srvSp.number,
           title:srvSp.title, note_short:srvSp.note_short, note_full:srvSp.note_full,
           status:srvSp.status, revision:srvSp.revision, updated_at:srvSp.updated_at,
           deleted_at:srvSp.deleted_at,
@@ -1110,7 +1130,7 @@
       const localSpId = spreadIdMap[srvPh.spread_id];
       if (!localSpId) continue;
       let localPh = localPhotos.find(photo => photo.server_id === srvPh.id);
-      if (!localPh) localPh = {id:uid(), created_at:srvPh.created_at};
+      if (!localPh) localPh = {id:uid(), created_at:srvPh.created_at, scope:scope()};
       const photoPending = queue.some(item => item.entity === 'photo' && item.photo_id === localPh.id && UNSYNCED.has(item.status));
       if (photoPending) continue;
       mapServerPhoto(localPh, srvPh, localSpId);
@@ -2662,7 +2682,8 @@
     const queue = await getAll('sync_queue');
     const same = queue.filter(item => item.entity === 'notebook' && item.local_id === localId
       && (!item.scope || item.scope === scope()) && UNSYNCED.has(item.status));
-    const reusable = same.find(item => item.status === 'pending' || item.status === 'failed');
+    const reusable = same.find(item => !inFlightEntityItems.has(item.id) &&
+      (item.status === 'pending' || item.status === 'failed'));
     if (reusable) {
       await put('sync_queue', {...reusable, ...extra, scope:scope(), status:'pending', retry_count:0,
         last_error:null, next_attempt_at:null});

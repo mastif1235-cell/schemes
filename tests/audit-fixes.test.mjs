@@ -373,13 +373,16 @@ try {
       const payload = {
         notebooks:[{id:'nb1', server_id:'srv-nb1', title:'Старое имя', updated_at:'2026-09-10T00:00:00.000Z'}],
         spreads:[{...fresh, title:'Устаревшая копия', updated_at:'2026-09-01T00:00:00.000Z'}],
-        photos:[], tags:[{id:'tag-imp1', name:'импорт'}],
+        photos:[{id:'photo-existing',server_id:'old-photo',upload_status:'local_pending',is_current:false,
+          telegram_message_id:null,telegram_link:null}], tags:[{id:'tag-imp1', name:'импорт'}],
         spread_tags:[{id:999, spread_id:'spA', tag_id:'tag-imp1'}, {id:998, spread_id:'spA', tag_id:'tag-imp1'}],
         history:[{id:55, spread_id:'spA', action:'X', timestamp:'2026-09-01T00:00:00.000Z'},
                  {id:56, spread_id:'spA', action:'X', timestamp:'2026-09-01T00:00:00.000Z'}],
         sync_queue:[{id:777, entity:'spread', local_id:'spA', status:'pending', retry_count:0, payload:{op:'delete'}}],
         settings:[{key:'app', auth_token:'STOLEN'}]
       };
+      await put('photos',{id:'photo-existing',server_id:'new-photo',upload_status:'synced',is_current:true,
+        telegram_message_id:123,telegram_link:'https://t.me/example/123'});
       await importBackup(new File([JSON.stringify(payload)], 'ok.json', {type:'application/json'}));
       await window.__pendingImport();
       const okToast = messages.at(-1);
@@ -392,7 +395,8 @@ try {
         histCount:hist.length,
         spreadTitle:(await get('spreads','spA')).title,
         nbTitle:(await get('notebooks','nb1')).title,
-        settingsToken:(await get('settings','app')).auth_token};
+        settingsToken:(await get('settings','app')).auth_token,
+        photo:(await get('photos','photo-existing'))};
     } finally { window.toast = oldToast; window.confirmAction = oldConfirm; }
   });
   assert.match(result.badToast, /повреждён|JSON/i, 'corrupted file shows an error toast');
@@ -403,6 +407,11 @@ try {
   assert.equal(result.spreadTitle, 'Новая правка', 'fresher local row wins over older backup copy');
   assert.equal(result.nbTitle, 'NB', 'fresher local notebook row wins over older backup copy');
   assert.equal(result.settingsToken, 't', 'credentials are never restored from a file');
+  assert.deepEqual({server_id:result.photo.server_id,upload_status:result.photo.upload_status,
+    is_current:result.photo.is_current,telegram_message_id:result.photo.telegram_message_id,
+    telegram_link:result.photo.telegram_link},
+    {server_id:'new-photo',upload_status:'synced',is_current:true,telegram_message_id:123,
+      telegram_link:'https://t.me/example/123'}, 'old photo backup cannot overwrite current server metadata');
 
   // ---------- F2: escaping of server-controlled values in list rendering ----------
   result = await page.evaluate(async () => {
@@ -423,10 +432,12 @@ try {
 
   // ---------- F7: photo retention is strictly OPT-IN (never on plain upgrade) ----------
   result = await page.evaluate(async () => {
+    const currentScope = settings.backend_url.replace(/\/$/, '') + '|' + settings.user_id;
+    await put('notebooks', {...await get('notebooks','nb1'),scope:currentScope});
     await put('spreads', {id:'spR', server_id:'srv-spR', notebook_id:'nb1', number:9, title:'ret',
-      status:'Актуально', deleted_at:null, current_photo_id:'phCur', revision:1});
+      status:'Актуально', deleted_at:null, current_photo_id:'phCur', revision:1,scope:currentScope});
     const mk = (id, version, current, status, server_id) => ({id, spread_id:'spR', version, is_current:current,
-      upload_status:status, server_id, created_at:'2026-09-01T00:00:00.000Z'});
+      upload_status:status, server_id, scope:currentScope,created_at:'2026-09-01T00:00:00.000Z'});
     await put('photos', mk('phCur', 4, true, 'synced', 'srv-phCur'));
     await put('photos', mk('phV3', 3, false, 'synced', 'srv-phV3'));
     await put('photos', mk('phV2', 2, false, 'synced', 'srv-phV2'));
@@ -450,6 +461,7 @@ try {
 
     // 1) plain upgrade: existing user, old dead default 'none', opt-in marker never set
     delete settings.photo_retention_configured;
+    delete settings.photo_retention_scopes;
     settings.keep_old_photos_policy = 'none';
     await saveSettings();
     const upgrade = await window.v340PruneOldPhotos({force:true});
@@ -467,12 +479,13 @@ try {
     selPolicyEl.value = 'last1';
     selPolicyEl.dispatchEvent(new Event('change'));
     await new Promise(r => setTimeout(r, 120));
-    const markerAfterSelect = !!settings.photo_retention_configured && settings.keep_old_photos_policy === 'last1';
+    const markerAfterSelect = !!settings.photo_retention_configured &&
+      settings.photo_retention_scopes?.[currentScope]?.policy === 'last1';
     // deterministic: the settings-select race with the post-sync hook is excluded by
     // pre-setting the daily throttle timestamp right before each forced run
     const pruneDeterministic = async policy => {
       settings.keep_old_photos_policy = policy;
-      settings.last_photo_retention_at = nowISO(); // hook sees "already ran today" and skips
+      settings.photo_retention_scopes[currentScope] = {policy,last_at:nowISO()}; // hook skips today
       await saveSettings();
       return window.v340PruneOldPhotos({force:true});
     };
@@ -520,6 +533,43 @@ try {
   assert.deepEqual(result.afterFail, result.afterNone);
   assert.equal(result.allRun.pruned, 0, 'explicit All never deletes');
   assert.deepEqual(result.afterAll, result.afterNone);
+
+  // Policy and proof of server ownership must both match the active account/backend.
+  result = await page.evaluate(async () => {
+    const aScope = settings.backend_url.replace(/\/$/, '') + '|' + settings.user_id;
+    const bBackend = 'https://other-backend.example';
+    const bScope = bBackend + '|user-b';
+    for (const [suffix,scope] of [['A',aScope],['B',bScope]]) {
+      await put('notebooks',{id:'nbScope'+suffix,server_id:'srv-nb-'+suffix,scope});
+      await put('spreads',{id:'spScope'+suffix,notebook_id:'nbScope'+suffix,
+        server_id:'srv-sp-'+suffix,scope,deleted_at:null,current_photo_id:'cur'+suffix});
+      for (const [id,version,current] of [['cur'+suffix,3,true],['old2'+suffix,2,false],['old1'+suffix,1,false]]) {
+        await put('photos',{id,spread_id:'spScope'+suffix,scope,version,is_current:current,
+          server_id:'srv-'+id,upload_status:'synced'});
+        await put('blobs',{id:id+'_orig',blob:new Blob([id])});
+      }
+    }
+    // A legacy row has no proven scope and must remain untouched too.
+    await put('photos',{id:'unknownA',spread_id:'spScopeA',version:0,is_current:false,
+      server_id:'srv-unknown',upload_status:'synced'});
+    await put('blobs',{id:'unknownA_orig',blob:new Blob(['unknown'])});
+    settings.photo_retention_scopes[aScope] = {policy:'last1'};
+    const originalBackend = settings.backend_url, originalUser = settings.user_id;
+    settings.backend_url = bBackend; settings.user_id = 'user-b';
+    const bResult = await window.v340PruneOldPhotos({force:true});
+    const bBefore = !!(await get('blobs','old1B_orig'));
+    settings.backend_url = originalBackend; settings.user_id = originalUser;
+    const aResult = await window.v340PruneOldPhotos({force:true});
+    return {bResult,bBefore,aResult,
+      aOld:!!(await get('blobs','old1A_orig')),bOld:!!(await get('blobs','old1B_orig')),
+      unknown:!!(await get('blobs','unknownA_orig'))};
+  });
+  assert.equal(result.bResult.notOptedIn,true,'A policy does not activate for B/backend B');
+  assert.equal(result.bBefore,true);
+  assert.equal(result.aResult.pruned,1,'returning to A applies A policy only to proven A rows');
+  assert.equal(result.aOld,false);
+  assert.equal(result.bOld,true,'B original survives A pruning');
+  assert.equal(result.unknown,true,'unscoped legacy original is preserved');
 
   // ---------- new client + OLD (v3.5.9) worker that does not know /restore ----------
   apiState.spreads['srv-spY'] = {id:'srv-spY', notebook_id:'srv-nb1', number:10, title:'victim Y', revision:1,

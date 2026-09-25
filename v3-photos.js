@@ -14,22 +14,29 @@
     // setting was introduced dead in v3.x) must never start deleting existing local blobs on
     // upgrade. Pruning is allowed only after the user explicitly picks a policy in Settings,
     // which sets photo_retention_configured=true (local marker — no D1 migration needed).
-    if (!settings.photo_retention_configured) return {pruned:0, notOptedIn:true};
+    const currentScope = (settings.backend_url || '').replace(/\/$/, '') + '|' + (settings.user_id || '');
+    const scopedPolicy = settings.auth_token && settings.user_id && settings.photo_retention_scopes?.[currentScope];
+    if (!scopedPolicy) return {pruned:0, notOptedIn:true};
     const POLICY_KEEP = {none:0, last1:1, last3:3, all:Infinity};
-    const keep = POLICY_KEEP[settings.keep_old_photos_policy];
+    const keep = POLICY_KEEP[scopedPolicy.policy];
     if (!Number.isFinite(keep)) return {pruned:0}; // 'all' (and any unknown policy) never deletes
     if (!isAuthed()) return {pruned:0};
     if (!options.force) {
-      const lastRun = Date.parse(settings.last_photo_retention_at || '');
+      const lastRun = Date.parse(scopedPolicy.last_at || '');
       if (Number.isFinite(lastRun) && Date.now() - lastRun < 24 * 3600 * 1000) return {pruned:0, throttled:true};
     }
     let pruned = 0;
     const queue = await getAll('sync_queue');
     const spreads = await getAll('spreads');
+    const notebooks = new Map((await getAll('notebooks')).map(row => [row.id, row]));
     for (const spread of spreads) {
-      if (!spread || spread.deleted_at) continue;
+      // Legacy rows with no proven account/backend scope are preserved. Only server-confirmed
+      // rows in this authenticated scope can have their originals pruned.
+      if (!spread || spread.deleted_at || spread.scope !== currentScope ||
+          notebooks.get(spread.notebook_id)?.scope !== currentScope) continue;
       const versions = (await getAllByIndex('photos', 'spread_id', spread.id))
-        .filter(photo => photo && !photo.is_current)
+        .filter(photo => photo && photo.scope === currentScope && !photo.is_current &&
+          photo.id !== spread.current_photo_id)
         .sort((a, b) => (Number(b.version) || 0) - (Number(a.version) || 0));
       let kept = 0;
       for (const photo of versions) {
@@ -43,7 +50,7 @@
         } catch (error) { console.warn('Old photo version blob could not be pruned', photo.id, error); }
       }
     }
-    settings.last_photo_retention_at = nowISO();
+    settings.photo_retention_scopes[currentScope] = {...scopedPolicy, last_at:nowISO()};
     try { await saveSettings(); } catch (error) { console.warn('Retention timestamp could not be saved', error); }
     return {pruned};
   };

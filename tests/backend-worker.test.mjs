@@ -773,6 +773,21 @@ assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
     'revoked session is never renewed');
 }
 {
+  // A renewal write failure is part of the request, never detached fire-and-forget work.
+  const fx = createFixture();
+  const soon = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+  fx.sqlite.prepare('UPDATE sessions SET expires_at=? WHERE id=?').run(soon, 'session-1');
+  const originalPrepare = fx.env.DB.prepare.bind(fx.env.DB);
+  fx.env.DB.prepare = sql => {
+    const prepared = originalPrepare(sql);
+    if (!sql.startsWith('UPDATE sessions SET last_used_at=')) return prepared;
+    return {bind:() => ({run:async () => { throw new Error('D1 renewal unavailable'); }})};
+  };
+  const response = await api(fx.env, 'GET', '/api/me', 'token-1');
+  assert.notEqual(response.status,200,'failed renewal cannot return an authenticated success');
+  assert.equal(fx.sqlite.prepare('SELECT expires_at FROM sessions WHERE id=?').get('session-1').expires_at,soon);
+}
+{
   // F8: large preview must not crash the photo upload
   const fx = createFixture();
   const nativeFetch = globalThis.fetch;

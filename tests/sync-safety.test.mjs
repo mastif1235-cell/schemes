@@ -1151,7 +1151,7 @@ async function testRestoreOpPushesRestoreEndpoint() {
     sync_queue:[{id:42, entity:'spread', local_id:'sp-local', status:'pending', retry_count:0, payload:{op:'restore'}}]
   });
   const calls = [];
-  runtime.setApi(async (path, options) => { calls.push([path, options?.method]); return {spread:{id:'sp-server', revision:4}}; });
+  runtime.setApi(async (path, options) => { calls.push([path, options?.method]); return {spread:{id:'sp-server', revision:4, deleted_at:null}, restored:true}; });
   await runtime.context.pushEntityQueue(false);
   assert.equal(calls.length, 1, 'restore op issues exactly one request');
   assert.ok(calls[0][0].includes('/restore') && calls[0][1] === 'POST', 'restore uses POST /restore');
@@ -1178,7 +1178,7 @@ async function testRestoreOpWaitsForWorkerRollout() {
     deleted_at:'2026-09-24T12:00:00.000Z', revision:3, updated_at:'2026-09-24T12:00:00.000Z', created_at:'2026-09-01T00:00:00.000Z'}]});
   assert.equal(runtime.db.spreads.get('sp-local').deleted_at, null, 'parked restore shields the record');
   // worker rollout done: a manual sync completes the restore
-  runtime.setApi(async () => ({spread:{id:'sp-server', revision:5}}));
+  runtime.setApi(async () => ({spread:{id:'sp-server', revision:5, deleted_at:null}, restored:true}));
   await runtime.context.pushEntityQueue(true);
   assert.equal(runtime.db.sync_queue.get(44).status, 'done', 'restore completes after the rollout');
   assert.equal(runtime.db.spreads.get('sp-local').revision, 5);
@@ -1222,7 +1222,7 @@ async function testNotebookDeleteIsPersistentOutbox() {
   assert.equal(runtime.db.notebooks.get('nb-local').deleted_at, null);
   const restoreOps = [...runtime.db.sync_queue.values()].filter(item => item.payload?.op === 'restore' && item.status === 'pending');
   assert.equal(restoreOps.length, 1);
-  runtime.setApi(async (path, options) => { calls.push([path, options?.method]); return {notebook:{id:'nb-server', revision:3}}; });
+  runtime.setApi(async (path, options) => { calls.push([path, options?.method]); return {notebook:{id:'nb-server', revision:3, deleted_at:null}, restored:true}; });
   await runtime.context.pushEntityQueue(false);
   assert.ok(calls.at(-1)[0].endsWith('/restore'), 'notebook restore hits /restore');
 }
@@ -1290,6 +1290,91 @@ async function testPhotosWaitForSignInWithoutNetwork() {
   assert.equal(runtime.db.photos.get('ph-2').upload_status, 'local_pending', 'badge stays "ожидает"');
 }
 
+async function testConcurrentPushKeepsNewEdits() {
+  for (const entity of ['notebook','spread']) {
+    const store = entity === 'notebook' ? 'notebooks' : 'spreads';
+    const id = entity === 'notebook' ? 'nb' : 'sp';
+    const serverId = 'server-' + id;
+    const row = {id, server_id:serverId, title:'A', revision:1, deleted_at:null,
+      ...(entity === 'spread' ? {notebook_id:'parent', number:1} : {})};
+    const runtime = createRuntime({notebooks:entity === 'spread' ? [{id:'parent',server_id:'server-parent'}] : [row],
+      spreads:entity === 'spread' ? [row] : [],
+      sync_queue:[{id:1,entity,local_id:id,status:'pending',retry_count:0}]});
+    let release, started;
+    const entered = new Promise(resolve => { started = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const requests = [];
+    runtime.setApi(async (path, options) => {
+      requests.push(options.json.title);
+      if (requests.length === 1) { started(); await gate; }
+      return {[entity]:{id:serverId,revision:requests.length+1}};
+    });
+    const first = runtime.context.pushEntityQueue(false);
+    await entered;
+    await runtime.context.put(store, {...runtime.db[store].get(id),title:'B'});
+    await runtime.context.queueEntityChange(entity,id);
+    release();
+    await first;
+    assert.equal(runtime.db[store].get(id).title,'B',`${entity}: in-flight reply must not overwrite B`);
+    assert.equal([...runtime.db.sync_queue.values()].filter(item => item.status === 'pending').length,1,
+      `${entity}: B has its own pending operation`);
+    await runtime.context.pushEntityQueue(false);
+    assert.deepEqual(requests,['A','B'],`${entity}: B reaches the server after A`);
+    assert.equal(runtime.db[store].get(id).title,'B');
+  }
+}
+
+async function testDeleteReplyCannotUndoLocalRestore() {
+  for (const entity of ['notebook','spread']) {
+    const store = entity === 'notebook' ? 'notebooks' : 'spreads';
+    const id = entity === 'notebook' ? 'nb' : 'sp';
+    const row = {id,server_id:'server-'+id,deleted_at:'2026-09-25T00:00:00.000Z',revision:1,
+      ...(entity === 'spread' ? {notebook_id:'parent'} : {})};
+    const runtime = createRuntime({notebooks:entity === 'spread' ? [{id:'parent',server_id:'server-parent'}] : [row],
+      spreads:entity === 'spread' ? [row] : [],
+      sync_queue:[{id:1,entity,local_id:id,status:'pending',retry_count:0,payload:{op:'delete'}}]});
+    let release, started;
+    const entered = new Promise(resolve => { started = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    runtime.setApi(async () => { started(); await gate; return {ok:true}; });
+    const first = runtime.context.pushEntityQueue(false);
+    await entered;
+    await runtime.context.window.vNextSync.restoreFromTrash(entity,id);
+    release(); await first;
+    assert.equal(runtime.db[store].get(id).deleted_at,null,`${entity}: old delete reply cannot re-tombstone`);
+    assert.ok([...runtime.db.sync_queue.values()].some(item => item.payload?.op === 'restore' && item.status === 'pending'));
+  }
+}
+
+async function testRestoreRequiresServerConfirmation() {
+  for (const entity of ['notebook','spread']) {
+    for (const outcome of ['no_such_route','not_found','restored','already_active']) {
+      const id = entity === 'notebook' ? 'nb' : 'sp';
+      const serverId = 'server-' + id;
+      const row = {id,server_id:serverId,deleted_at:null,revision:1,
+        ...(entity === 'spread' ? {notebook_id:'parent'} : {})};
+      const runtime = createRuntime({notebooks:entity === 'spread' ? [{id:'parent',server_id:'server-parent'}] : [row],
+        spreads:entity === 'spread' ? [row] : [],
+        sync_queue:[{id:1,entity,local_id:id,status:'pending',retry_count:0,payload:{op:'restore'}}]});
+      runtime.setApi(async () => {
+        if (outcome === 'no_such_route' || outcome === 'not_found')
+          throw Object.assign(new Error(outcome),{status:404});
+        return {[entity]:{id:serverId,deleted_at:null,revision:2},restored:outcome === 'restored'};
+      });
+      await runtime.context.pushEntityQueue(false);
+      const queued = runtime.db.sync_queue.get(1);
+      if (outcome === 'no_such_route') {
+        assert.equal(queued.status,'blocked'); assert.equal(queued.blocked_reason,'unsupported_endpoint');
+      } else if (outcome === 'not_found') {
+        assert.equal(queued.status,'blocked'); assert.equal(queued.blocked_reason,'entity_missing');
+        assert.match(queued.last_error,/отсутствует на сервере/);
+      } else {
+        assert.equal(queued.status,'done',`${entity}: confirmed ${outcome}`);
+      }
+    }
+  }
+}
+
 await testRestoreFromTrashRetiresPendingDelete();
 await testRestoreOpPushesRestoreEndpoint();
 await testRestoreOpWaitsForWorkerRollout();
@@ -1298,4 +1383,7 @@ await testNotebookDeleteIsPersistentOutbox();
 await testPermanentErrorsBlockedNotRetried();
 await testPhotoOversizeBlockedButBlobKept();
 await testPhotosWaitForSignInWithoutNetwork();
+await testConcurrentPushKeepsNewEdits();
+await testDeleteReplyCannotUndoLocalRestore();
+await testRestoreRequiresServerConfirmation();
 console.log('sync-safety: PASS (push/session isolation, backfill retry, cursor durability, orphan recovery, diagnostics, repairs 9-10/#367, outbox delete/restore, retry classification, auth-gated uploads)');
