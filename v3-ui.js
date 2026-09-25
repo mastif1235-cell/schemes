@@ -480,6 +480,34 @@
     toast('Порядок подтверждён сервером');
     if (route.screen === 'spreads' && route.notebookId === notebookId) render();
   });
+  // Dual Telegram storage toggle (device-local). Default ON: the original always goes through
+  // lossless sendDocument, and an auxiliary sendPhoto preview message is added next to it;
+  // OFF: only the document. The settings screen is rendered inside a closure we cannot wrap,
+  // so the toggle is injected when the user navigates to Settings (event-driven, no observers).
+  function injectTelegramPhotoToggle() {
+    const host = document.getElementById('screen');
+    if (!host || host.querySelector('#swTelegramPhoto') || !host.querySelector('#swTheme')) return;
+    const block = document.createElement('div');
+    block.innerHTML = `<div class="section-title">Telegram</div>
+      <div class="settings-row"><span>Создавать превью фото в Telegram<br><small>Вкл — рядом с файлом появляется фотография-превью (кнопка «Telegram» открывает её). Оригинал в любом случае хранится файлом без сжатия.</small></span>
+      <button class="switch ${settings.telegram_photo_preview !== false ? 'on' : ''}" id="swTelegramPhoto" aria-label="Превью фото в Telegram"></button></div>`;
+    host.appendChild(block);
+    block.querySelector('#swTelegramPhoto').onclick = async event => {
+      const enabled = settings.telegram_photo_preview === false; // default ON
+      settings.telegram_photo_preview = enabled;
+      event.currentTarget.classList.toggle('on', enabled);
+      await saveSettings();
+      toast(enabled
+        ? 'Для новых фото в Telegram будет добавляться превью-фотография'
+        : 'Новые фото будут отправляться только файлом без сжатия');
+    };
+  }
+  window.v363InjectTelegramPhotoToggle = injectTelegramPhotoToggle;
+  injectTelegramPhotoToggle();
+  document.addEventListener('click', event => {
+    if (!event.target.closest?.('.bottomnav')) return;
+    setTimeout(injectTelegramPhotoToggle, 150);
+  }, true);
 
   renderSettings = async function () {
     await baseRenderSettings();

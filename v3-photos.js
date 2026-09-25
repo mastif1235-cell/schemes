@@ -55,14 +55,41 @@
     return {pruned};
   };
 
-  function getTelegramPhotoLink(photo) {
-    const link = typeof photo?.telegram_link === 'string' ? photo.telegram_link.trim() : '';
-    if (!link) return null;
+  // Legacy rows synced before the server computed telegram_link can still be opened:
+  // storage_object_id encodes "<chatId>:<messageId>" (see the worker's encodeStorageObjectId).
+  function legacyTelegramLinkFromStorageObject(photo) {
+    const encoded = typeof photo?.storage_object_id === 'string' ? photo.storage_object_id.trim() : '';
+    if (!encoded) return null;
     try {
-      const parsed = new URL(link, location.href);
-      if (parsed.protocol === 'https:' && parsed.hostname === 't.me') return parsed.href;
-    } catch (error) { console.warn('Invalid Telegram photo link', error); }
-    return null;
+      const decoded = atob(encoded);
+      const separator = decoded.indexOf(':');
+      if (separator <= 0) return null;
+      const rawChat = decoded.slice(0, separator).replace(/^-100/, '');
+      const messageId = Number(decoded.slice(separator + 1));
+      if (!rawChat || !Number.isSafeInteger(messageId) || messageId <= 0) return null;
+      return `https://t.me/c/${rawChat}/${messageId}`;
+    } catch (error) { return null; }
+  }
+  window.v354LegacyTelegramLinkFromStorageObject = legacyTelegramLinkFromStorageObject;
+
+  function getTelegramPhotoLink(photo) {
+    // Dual storage: prefer the auxiliary PREVIEW message (sendPhoto — nice inline gallery);
+    // the canonical sendDocument link stays the fallback for legacy/document-only photos.
+    const previewLink = typeof photo?.telegram_preview_link === 'string' ? photo.telegram_preview_link.trim() : '';
+    if (previewLink) {
+      try {
+        const parsedPreview = new URL(previewLink, location.href);
+        if (parsedPreview.protocol === 'https:' && parsedPreview.hostname === 't.me') return parsedPreview.href;
+      } catch (error) { console.warn('Invalid Telegram photo preview link', error); }
+    }
+    const link = typeof photo?.telegram_link === 'string' ? photo.telegram_link.trim() : '';
+    if (link) {
+      try {
+        const parsed = new URL(link, location.href);
+        if (parsed.protocol === 'https:' && parsed.hostname === 't.me') return parsed.href;
+      } catch (error) { console.warn('Invalid Telegram photo link', error); }
+    }
+    return legacyTelegramLinkFromStorageObject(photo);
   }
   window.v350GetTelegramPhotoLink = getTelegramPhotoLink;
 
@@ -288,7 +315,9 @@
     };
     const close = () => {
       if (closed) return;
-      closed = true; clearTimeout(tapTimer); clearTimeout(hideTimer); revoke(); overlay.remove(); overlay.__resolveIndex(index);
+      closed = true; clearTimeout(tapTimer); clearTimeout(hideTimer);
+      document.removeEventListener('keydown', onKey);
+      revoke(); overlay.remove(); overlay.__resolveIndex(index);
     };
     async function draw() {
       revoke();
@@ -299,7 +328,8 @@
       if (resolved.blob) objectUrl = URL.createObjectURL(resolved.blob);
       overlay.innerHTML = `<div class="viewer-top"><button class="icon-btn" data-full-close aria-label="Закрыть">✕</button>
         <span class="num">№${esc(spread.number)} · ${index + 1}/${spreads.length}</span></div>
-        <div class="viewer-stage" data-full-stage>${objectUrl ? `<img data-full-image src="${objectUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}</div>`;
+        <div class="viewer-stage" data-full-stage>${objectUrl ? `<img data-full-image src="${objectUrl}" alt="Разворот ${esc(spread.number)}">` : '<div style="color:#aaa">Фото недоступно</div>'}</div>
+        <button class="v342-fullscreen-exit" data-full-collapse aria-label="Свернуть фото"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M9 4v5H4M15 20v-5h5M4 15h5v5M20 9h-5V4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>`;
       const stage = overlay.querySelector('[data-full-stage]');
       const image = overlay.querySelector('[data-full-image]');
       const gesture = {scale:1,x:0,y:0,pointers:new Map(),startScale:1,startDistance:0,startX:0,startY:0,lastTap:0};
@@ -336,9 +366,12 @@
         }
       });
       stage?.addEventListener('pointercancel', event => gesture.pointers.delete(event.pointerId));
+      overlay.querySelector('[data-full-collapse]').onclick=event=>{event.stopPropagation();close();};
       overlay.querySelector('[data-full-close]').onclick=event=>{event.stopPropagation();close();};
       showControlsBriefly();
     }
+    const onKey = event => { if (event.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
     await draw();
     return result;
   }
@@ -466,8 +499,9 @@
           ${spread.note_short ? `<div class="note" style="font-weight:600">${esc(spread.note_short)}</div>` : ''}
           ${spread.note_full ? `<div class="note">${esc(spread.note_full)}</div>` : ''}
           <section class="vnext-notes" data-team-notes></section>
+          ${(!telegramLink && photo && photoState?.state === 'synced') ? '<div class="v340-viewer-state">✈ Открыть в Telegram нельзя: у этой фотографии нет ссылки на сообщение (скопируйте фото повторно, если нужна ссылка)</div>' : ''}
           <div class="viewer-actions"><button data-action="replace">📷 Заменить</button>
-          <button data-action="telegram" ${telegramLink ? '' : 'disabled'}>✈ Telegram</button>
+          <button data-action="telegram" ${telegramLink ? '' : 'disabled'} ${telegramLink ? '' : 'title="Нет открываемой копии в Telegram"'}>✈ Telegram</button>
           <button data-action="delete" aria-label="Удалить разворот">🗑</button></div></div>`;
       renderNotes(overlay.querySelector('[data-team-notes]'),spread).catch(error => console.warn('Notes could not be displayed',error));
 
@@ -687,9 +721,9 @@
   };
 
   const extraStyle = document.createElement('style');
-  extraStyle.textContent = `.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img,.v342-photo-fullscreen img{will-change:transform;transform-origin:center}.v342-photo-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px;background:#171717}.v342-photo-nav button{min-height:44px;color:#fff;background:#ffffff18;border:1px solid #ffffff38}.v342-photo-fullscreen{position:fixed;inset:0;z-index:130;background:#000;overflow:hidden;padding:0}.v342-photo-fullscreen .viewer-stage{position:absolute;inset:0;display:grid;place-items:center;min-height:0;touch-action:none}.v342-photo-fullscreen .viewer-stage img{display:block;max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain}.v342-photo-fullscreen .viewer-top{position:absolute;z-index:2;left:0;right:0;top:0;display:flex;align-items:center;gap:12px;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;background:linear-gradient(#000b,transparent);opacity:0;pointer-events:none;transition:opacity .18s ease}.v342-photo-fullscreen.controls-visible .viewer-top{opacity:1;pointer-events:auto}`;
+  extraStyle.textContent = `.v342-fullscreen-exit{position:absolute;right:calc(12px + env(safe-area-inset-right,0px));bottom:calc(14px + env(safe-area-inset-bottom,0px));z-index:3;width:46px;height:46px;min-width:46px;min-height:46px;border-radius:50%;border:1px solid #ffffff59;background:rgba(0,0,0,.55);color:#fff;display:grid;place-items:center;padding:0}.v342-fullscreen-exit:active{background:rgba(0,0,0,.75)}.v340-zoom-controls{display:flex;justify-content:center;gap:8px;padding:8px;background:#171717;color:#fff}.v340-zoom-controls button{min-width:52px;background:#ffffff18;color:#fff;border:0}.v340-viewer-state{font-size:.78rem;color:#d6cdb8;margin-top:5px}.v340-conflict{margin:8px 12px}.v340-viewer img,.v342-photo-fullscreen img{will-change:transform;transform-origin:center}.v342-photo-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px;background:#171717}.v342-photo-nav button{min-height:44px;color:#fff;background:#ffffff18;border:1px solid #ffffff38}.v342-photo-fullscreen{position:fixed;inset:0;z-index:130;background:#000;overflow:hidden;padding:0}.v342-photo-fullscreen .viewer-stage{position:absolute;inset:0;display:grid;place-items:center;min-height:0;touch-action:none}.v342-photo-fullscreen .viewer-stage img{display:block;max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain}.v342-photo-fullscreen .viewer-top{position:absolute;z-index:2;left:0;right:0;top:0;display:flex;align-items:center;gap:12px;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;background:linear-gradient(#000b,transparent);opacity:0;pointer-events:none;transition:opacity .18s ease}.v342-photo-fullscreen.controls-visible .viewer-top{opacity:1;pointer-events:auto}`;
   document.head.appendChild(extraStyle);
   const teamStyle = document.createElement('style');
-  teamStyle.textContent = `.sheet-backdrop{z-index:120}.v340-viewer .viewer-top .icon-btn,.v342-photo-fullscreen .viewer-top .icon-btn{color:#fff;background:rgba(255,255,255,.18);border:1px solid #ffffff38;width:44px;height:44px;min-width:44px;min-height:44px;border-radius:50%;padding:0}.v340-viewer .viewer-actions{display:flex;gap:8px}.v340-viewer .viewer-actions button{min-height:44px;flex:1;padding:8px 10px}.vnext-notes{margin-top:12px;border-top:1px solid #ffffff38;padding-top:10px}.vnext-note{padding:10px 0;border-bottom:1px solid #ffffff28}.vnext-note p{white-space:pre-wrap;overflow-wrap:anywhere}.vnext-note-caption,.vnext-note small{font-size:.8rem;opacity:.8}.vnext-notes button{color:inherit;background:#ffffff18;border:1px solid #ffffff38}.vnext-note-composer{display:grid;grid-template-columns:1fr;gap:8px;width:100%}.vnext-note-composer>[data-note-compose]{display:block;width:100%;min-height:44px}.vnext-note-composer [data-note-editor]{display:grid;gap:8px;width:100%}.vnext-note-composer [data-note-editor][hidden]{display:none}.vnext-note-composer textarea{display:block;width:100%;min-height:112px;box-sizing:border-box;resize:vertical}.vnext-note-composer .btn-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.vnext-note-composer [data-note-add],.vnext-note-composer [data-note-cancel]{display:block;width:100%;min-height:44px}.v342-note-actions{display:flex;gap:6px;justify-content:flex-end}.v342-note-actions button{min-height:36px;padding:6px 10px;font-size:.86rem}`;
+  teamStyle.textContent = `.sheet-backdrop{z-index:120}.v340-viewer .viewer-top .icon-btn,.v342-photo-fullscreen .viewer-top .icon-btn{color:#fff;background:rgba(255,255,255,.18);border:1px solid #ffffff38;width:44px;height:44px;min-width:44px;min-height:44px;border-radius:50%;padding:0}.v340-viewer .viewer-actions{display:flex;gap:8px}.v340-viewer .viewer-actions button{min-height:44px;flex:1;padding:8px 10px}.vnext-notes{margin-top:12px;border-top:1px solid #ffffff38;padding-top:10px}.vnext-note{padding:10px 0;border-bottom:1px solid #ffffff28}.vnext-note p{white-space:pre-wrap;overflow-wrap:anywhere}.vnext-note-caption,.vnext-note small{font-size:.8rem;opacity:.8}.vnext-notes button{color:inherit;background:#ffffff18;border:1px solid #ffffff38}.vnext-note-composer{display:grid;grid-template-columns:1fr;gap:8px;width:100%}.vnext-note-composer>[data-note-compose]{display:block;width:100%;min-height:44px}.vnext-note-composer [data-note-editor]{display:grid;gap:8px;width:100%}.vnext-note-composer [data-note-editor][hidden]{display:none}.vnext-note-composer textarea{display:block;width:100%;min-height:112px;box-sizing:border-box;resize:vertical;background:#ffffff10;color:#EDE6D3;border:1px solid #ffffff42;border-radius:10px;padding:10px;caret-color:#E0A459}.vnext-note-composer textarea::placeholder{color:#B4AC93;opacity:.8}.vnext-note-composer textarea:focus-visible{outline:2px solid #E0A459;outline-offset:1px}.v340-viewer .vnext-notes [data-note-error]{color:#E08972;font-size:.85rem}.vnext-note-composer .btn-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.vnext-note-composer [data-note-add],.vnext-note-composer [data-note-cancel]{display:block;width:100%;min-height:44px}.v342-note-actions{display:flex;gap:6px;justify-content:flex-end}.v342-note-actions button{min-height:36px;padding:6px 10px;font-size:.86rem}`;
   document.head.appendChild(teamStyle);
 })();

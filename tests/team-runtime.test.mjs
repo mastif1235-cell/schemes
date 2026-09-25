@@ -613,48 +613,62 @@ try {
 
   // E: read state survives reload, and F: a NEW deleted event becomes unread again
   await page.reload();
-  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined');
-  const deletedReload = await page.evaluate(async () => {
-    const originalApi = api;
-    fullSync = async () => {};
-    let cursors = {notebooks:{'remote-nbX':900,'remote-nb':900}, spreads:{'srv-sp-gone':900,'remote-s1':900,'remote-s2':900}};
-    let unread = {notebooks:{},spreads:{},total:0};
-    api = async (path, options) => {
-      if (path === '/api/activity/read-cursors') return {cursors:structuredClone(cursors)};
-      if (path === '/api/activity/unread') return {unread:structuredClone(unread)};
-      if (path.includes('/activity?')) return {events:[],legacy_events:[]};
-      return originalApi(path, options);
+  // Boot-readiness: vNextSync/db being defined is NOT enough right after reload — loadSettings is
+  // async, and without auth openGlobalHistory routes to the local fallback overlay instead of the
+  // server one. Wait for the auth token so all four following assertions observe the true app
+  // state (this was also the hidden mode of the pre-existing E/F flake).
+  await page.waitForFunction(() => typeof window.vNextSync !== 'undefined' && typeof db !== 'undefined'
+    && typeof settings !== 'undefined' && !!settings.auth_token, null, {timeout:15000});
+  await page.evaluate(async () => {
+    window.__tApi = api;
+    window.__tState = {
+      cursors:{notebooks:{'remote-nbX':900,'remote-nb':900}, spreads:{'srv-sp-gone':900,'remote-s1':900,'remote-s2':900}},
+      unread:{notebooks:{},spreads:{},total:0}
     };
-    await window.v340ApplyUnread(unread);
+    fullSync = async () => {};
+    api = async (path, options) => {
+      if (path === '/api/activity/read-cursors') return {cursors:structuredClone(window.__tState.cursors)};
+      if (path === '/api/activity/unread') return {unread:structuredClone(window.__tState.unread)};
+      if (path.includes('/activity?')) return {events:[],legacy_events:[]};
+      return window.__tApi(path, options);
+    };
+    await window.v340ApplyUnread(window.__tState.unread);
     await window.v340OpenGlobalHistory();
-    const persisted = {
-      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
-      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
+  });
+  // 1) the SERVER history overlay exists (auth/overlays settled) — not the local fallback;
+  // 2) the badge reflects the zero-unread state after the applyUnread/refreshBadge round-trip.
+  await page.waitForFunction(() => !!document.querySelector('[data-server-history]'), null, {timeout:15000});
+  await page.waitForFunction(() => !document.querySelector('#v340HistoryButton .v340-history-badge'), null, {timeout:15000});
+  const persisted = await page.evaluate(() => ({
+    dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+    badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null}));
+  // F: a later event on the deleted notebook becomes unread again and pins on top (I)
+  await page.evaluate(async () => {
     document.querySelector('[data-history-close]')?.click();
-    // F: a later event on the deleted notebook becomes unread again and pins on top (I)
     const scope = window.vNextSync.scope();
     await put('activity_events', {scope, cache_id:scope+'|ev-nb-del-2', id:'ev-nb-del-2', seq:836,
       notebook_id:'remote-nbX', spread_id:null, action:'notebook.deleted', notebook_title:'Общий',
       actor_display_name:'Участник', created_at:'2026-09-24T13:00:00Z'});
-    cursors.notebooks['remote-nbX'] = 835;
-    unread = {notebooks:{'remote-nbX':{count:1,max_seq:836}},spreads:{},total:1};
-    await window.v340ApplyUnread(unread);
+    window.__tState.cursors.notebooks['remote-nbX'] = 835;
+    window.__tState.unread = {notebooks:{'remote-nbX':{count:1,max_seq:836}},spreads:{},total:1};
+    await window.v340ApplyUnread(window.__tState.unread);
     await window.v340OpenGlobalHistory();
-    const first = await (async () => {
-      for (let i = 0; i < 40; i++) {
-        const row = document.querySelector('[data-server-history] .v340-history-row');
-        if (row) return row;
-        await new Promise(r => setTimeout(r, 50));
-      }
-      return document.querySelector('[data-server-history] .v340-history-row');
-    })();
-    const fresh = {id:first?.dataset.eventId,
-      dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
-      badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null};
-    document.querySelector('[data-history-close]')?.click();
-    api = originalApi;
-    return {persisted, fresh};
   });
+  await page.waitForFunction(() =>
+    document.querySelector('[data-server-history] .v340-history-row')?.dataset.eventId === 'ev-nb-del-2',
+    null, {timeout:15000});
+  await page.waitForFunction(() =>
+    document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent === '1', null, {timeout:15000});
+  const fresh = await page.evaluate(() => ({
+    id:document.querySelector('[data-server-history] .v340-history-row')?.dataset.eventId,
+    dots:document.querySelectorAll('[data-server-history] .v340-history-unread-dot').length,
+    badge:document.querySelector('#v340HistoryButton .v340-history-badge')?.textContent || null}));
+  await page.evaluate(() => {
+    document.querySelector('[data-history-close]')?.click();
+    api = window.__tApi;
+    delete window.__tState;
+  });
+  const deletedReload = {persisted, fresh};
   assert.equal(deletedReload.persisted.dots, 0, 'E: read state survives reload');
   assert.equal(deletedReload.persisted.badge, null, 'E: badge stays clear after reload');
   assert.deepEqual(deletedReload.fresh, {id:'ev-nb-del-2', dots:1, badge:'1'},
@@ -813,6 +827,174 @@ try {
   assert.equal(readUx.failFlow.seenCallsDuringFail, 0, 'failed fetch never advances read cursors');
   assert.equal(readUx.failFlow.badgeKept, '1', 'badge survives a failed journal fetch');
   assert.ok(readUx.failFlow.stateText.includes('Не удалось'), 'failure is shown to the user');
+
+  // ---- v3.6.3 (1/4): fullscreen photo has a persistent one-tap collapse button (+ Esc) ----
+  const collapse = await page.evaluate(async () => {
+    document.querySelectorAll('.v340-viewer,.v342-photo-fullscreen').forEach(node => node.remove());
+    await window.v340OpenSpread(await get('spreads','s1'));
+    await new Promise(resolve => setTimeout(resolve, 200));
+    document.querySelector('.v340-viewer')?.querySelector('[data-image]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const full = document.querySelector('.v342-photo-fullscreen');
+    const button = full?.querySelector('[data-full-collapse]');
+    const style = button ? getComputedStyle(button) : null;
+    const rect = button ? button.getBoundingClientRect() : null;
+    const before = {
+      exists:!!button, label:button?.getAttribute('aria-label') || null,
+      num:full?.querySelector('.viewer-top .num')?.textContent || '',
+      big:!!(rect && rect.width >= 44 && rect.height >= 44),
+      positioned:style?.position === 'absolute', bottomRight:!!(rect && rect.right > 300 && rect.bottom > 700),
+      opaque:!!(style && style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')
+    };
+    const photoBefore = (await get('spreads','s1')).current_photo_id;
+    button?.click();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const afterTap = {
+      closed:!document.querySelector('.v342-photo-fullscreen'),
+      viewerBack:!!document.querySelector('.v340-viewer'),
+      num:document.querySelector('.v340-viewer .num')?.textContent || '',
+      photoKept:(await get('spreads','s1')).current_photo_id === photoBefore && photoBefore != null
+    };
+    // Esc on desktop does the same
+    document.querySelector('.v340-viewer')?.querySelector('[data-image]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const reopened = !!document.querySelector('.v342-photo-fullscreen');
+    document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}));
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const afterEsc = {closed:!document.querySelector('.v342-photo-fullscreen'), viewerBack:!!document.querySelector('.v340-viewer')};
+    document.querySelector('.v340-viewer')?.remove();
+    return {before, afterTap, reopened, afterEsc};
+  });
+  assert.equal(collapse.before.exists, true, 'fullscreen has a dedicated collapse button');
+  assert.equal(collapse.before.label, 'Свернуть фото', 'collapse button is labelled');
+  assert.equal(collapse.before.big, true, 'collapse button is a comfortable tap target');
+  assert.equal(collapse.before.positioned, true, 'collapse button floats over the photo');
+  assert.equal(collapse.before.bottomRight, true, 'collapse button sits bottom-right on the mobile viewport');
+  assert.equal(collapse.before.opaque, true, 'collapse button stays visible on any photo');
+  assert.ok(collapse.before.num.includes('№1'), 'fullscreen shows the opened spread');
+  assert.deepEqual(collapse.afterTap.closed, true, 'one tap closes the fullscreen');
+  assert.deepEqual(collapse.afterTap.viewerBack, true, 'the spread viewer stays open after collapse');
+  assert.ok(collapse.afterTap.num.includes('№1'), 'collapse returns to the same spread');
+  assert.equal(collapse.afterTap.photoKept, true, 'collapse keeps the selected photo');
+  assert.equal(collapse.reopened, true, 'fullscreen reopens for the Esc check');
+  assert.deepEqual(collapse.afterEsc, {closed:true, viewerBack:true}, 'Esc collapses the fullscreen to the same spread');
+
+  // ---- v3.6.3 (2/4): dark notes composer on the dark viewer; light theme sheets untouched ----
+  const themeUx = await page.evaluate(async () => {
+    settings.theme = 'dark'; document.body.dataset.theme = 'dark'; await saveSettings();
+    await window.v340OpenSpread(await get('spreads','s1'));
+    await new Promise(resolve => setTimeout(resolve, 200));
+    document.querySelector('.vnext-note-composer [data-note-compose]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const textarea = document.querySelector('.vnext-note-composer textarea');
+    const style = textarea ? getComputedStyle(textarea) : null;
+    const darkUi = {
+      exists:!!textarea, bg:style?.backgroundColor, color:style?.color,
+      border:style?.borderTopColor, placeholder:getComputedStyle(textarea, '::placeholder').color,
+      focusOutline:(() => { textarea?.focus(); return getComputedStyle(textarea).outlineColor; })()
+    };
+    settings.theme = 'light'; document.body.dataset.theme = 'light'; await saveSettings();
+    const lightComposerBg = getComputedStyle(textarea).backgroundColor;
+    document.querySelector('.v340-viewer [data-action="close"]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    // light theme sheets keep their light surface with themed fields
+    const {el, close} = openSheet('<div class="field"><label>t</label><textarea></textarea></div>');
+    const sheetBg = getComputedStyle(el).backgroundColor;
+    const fieldBg = getComputedStyle(el.querySelector('textarea')).backgroundColor;
+    close();
+    return {darkUi, lightComposerBg, sheetBg, fieldBg};
+  });
+  assert.equal(themeUx.darkUi.exists, true, 'notes composer exists');
+  assert.equal(themeUx.darkUi.bg, 'rgba(255, 255, 255, 0.063)', 'composer textarea is dark-on-dark, not white');
+  assert.equal(themeUx.darkUi.color, 'rgb(237, 230, 211)', 'composer text is light and readable');
+  assert.equal(themeUx.darkUi.placeholder, 'rgb(180, 172, 147)', 'composer placeholder has usable contrast');
+  assert.equal(themeUx.darkUi.focusOutline, 'rgb(224, 164, 89)', 'composer focus state is visible');
+  assert.equal(themeUx.lightComposerBg, 'rgba(255, 255, 255, 0.063)',
+    'the viewer is dark in light theme too, so the composer stays dark there (no white box)');
+  assert.equal(themeUx.sheetBg, 'rgb(237, 230, 211)', 'light theme sheet keeps its light paper surface');
+  assert.equal(themeUx.fieldBg, 'rgb(246, 241, 228)', 'light theme field keeps its light card background');
+
+  // ---- v3.6.3 (3/4): Telegram button across photo generations; missing metadata explains itself ----
+  const telegramView = await page.evaluate(async () => {
+    const encode = (chat, message) => btoa(chat + ':' + message);
+    const s2 = await get('spreads','s2');
+    await put('photos', {id:'ph-legacy', spread_id:'s2', version:1, is_current:true,
+      telegram_message_id:null, telegram_link:null, storage_object_id:encode('-100555777','321'), upload_status:'synced'});
+    await put('spreads', {...s2, current_photo_id:'ph-legacy'});
+    const s3 = await get('spreads','s3');
+    await put('photos', {id:'ph-none', spread_id:'s3', version:1, is_current:true, upload_status:'synced'});
+    await put('spreads', {...s3, current_photo_id:'ph-none'});
+    const open = async id => {
+      await window.v340OpenSpread(await get('spreads', id));
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const button = document.querySelector('[data-action="telegram"]');
+      const state = {
+        disabled:!!button?.disabled, title:button?.getAttribute('title') || null,
+        caption:[...document.querySelectorAll('.v340-viewer-state')].map(node => node.textContent).join(' ')
+      };
+      document.querySelector('.v340-viewer [data-action="close"]')?.click();
+      await new Promise(resolve => setTimeout(resolve, 80));
+      return state;
+    };
+    const legacy = await open('s2');
+    const none = await open('s3');
+    return {
+      legacy, none,
+      legacyLink:window.v350GetTelegramPhotoLink(await get('photos','ph-legacy')),
+      noneLink:window.v350GetTelegramPhotoLink(await get('photos','ph-none'))
+    };
+  });
+  assert.equal(telegramView.legacyLink, 'https://t.me/c/555777/321',
+    'A/G: legacy photo without telegram_message_id opens via storage_object_id fallback');
+  assert.equal(telegramView.legacy.disabled, false, 'legacy photo Telegram button is enabled again');
+  assert.equal(telegramView.noneLink, null, 'photo without any Telegram metadata has no link');
+  assert.equal(telegramView.none.disabled, true, 'metadata-less photo keeps the button disabled');
+  assert.ok(telegramView.none.caption.includes('Telegram'), 'metadata-less photo explains itself instead of silence');
+  assert.equal(telegramView.none.title, 'Нет открываемой копии в Telegram', 'disabled button carries an explanation');
+
+  // ---- v3.6.3d: dual storage — the button opens the PREVIEW message; dual row keeps document ids ----
+  const dualRows = await page.evaluate(async () => {
+    const encode = (chat, message) => btoa(chat + ':' + message);
+    await put('photos', {id:'ph-dual', spread_id:'s2', version:2, is_current:true, upload_status:'synced',
+      telegram_message_id:'600', telegram_file_id:'doc-file', telegram_link:'https://t.me/c/555777/600',
+      telegram_preview_link:'https://t.me/c/555777/910', preview_message_id:'910', preview_file_id:'view-file',
+      preview_pending:false, telegram_method:'document+photo',
+      storage_object_id:encode('-100555777','600')});
+    const dualLink = window.v350GetTelegramPhotoLink(await get('photos','ph-dual'));
+    const pendingLink = window.v350GetTelegramPhotoLink({upload_status:'synced',
+      telegram_link:'https://t.me/c/555777/600', telegram_preview_link:null, preview_pending:true, preview_message_id:null});
+    return {dualLink, pendingLink};
+  });
+  assert.equal(dualRows.dualLink, 'https://t.me/c/555777/910',
+    'dual-storage photo opens the preview (sendPhoto) message');
+  assert.equal(dualRows.pendingLink, 'https://t.me/c/555777/600',
+    'pending preview falls back to the canonical document message');
+
+  // ---- v3.6.3 (4/4): device-local preview toggle in settings (dual mode is the default) ----
+  const toggle = await page.evaluate(async () => {
+    delete settings.telegram_photo_preview; await saveSettings();
+    document.querySelector('.bottomnav [data-nav="settings"]')?.click();
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const sw = document.querySelector('#swTelegramPhoto');
+    const initiallyOn = sw && sw.classList.contains('on');
+    const label = sw ? sw.closest('.settings-row')?.textContent.replace(/\s+/g,' ').trim() : null;
+    sw?.click();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const stored = (await get('settings','app')).telegram_photo_preview;
+    const off = sw && !sw.classList.contains('on');
+    sw?.click();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const restored = (await get('settings','app')).telegram_photo_preview;
+    route = {screen:'notebooks'}; await render();
+    return {exists:!!sw, initiallyOn, stored, off, restored, label};
+  });
+  assert.equal(toggle.exists, true, 'settings expose the Telegram photo toggle');
+  assert.equal(toggle.initiallyOn, true, 'dual mode (document + preview) is the default');
+  assert.equal(toggle.stored, false, 'toggle can disable the preview for new uploads');
+  assert.equal(toggle.off, true, 'toggle reflects the disabled state');
+  assert.equal(toggle.restored, true, 'state persists across re-toggles');
+  assert.ok(/Создавать превью фото в Telegram/.test(toggle.label), 'toggle labelled as preview creation');
+  assert.ok(/без сжатия/.test(toggle.label), 'label promises the lossless document original regardless');
 
   assert.deepEqual(errors,[]);
   console.log('team-runtime: PASS (v2→v3/reopen, IDB rollback, shared notes, metadata, photo safety, reorder, history, fullscreen/viewer Back; Chromium mobile viewport)');
