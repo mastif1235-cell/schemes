@@ -432,8 +432,25 @@
   document.head.appendChild(teamStyle);
   // Unread badge must stay above the notebook cover image.
   const unreadStyle = document.createElement('style');
-  unreadStyle.textContent = '.v340-unread-badge{z-index:6!important;box-shadow:0 0 0 2px var(--card)}';
+  unreadStyle.textContent = '.v340-unread-badge{z-index:6!important;box-shadow:0 0 0 2px var(--card);cursor:pointer}';
   document.head.appendChild(unreadStyle);
+  // Tapping the notebook unread badge opens that notebook's shared history instead of silently
+  // clearing anything: the user sees the actual events (including deleted spreads) and the
+  // journal view marks read exactly what it managed to load and display. Capture phase so the
+  // card's own click handler (which would open the spreads screen) stays out of the way.
+  document.addEventListener('click', event => {
+    const badge = event.target.closest?.('.v340-unread-badge');
+    if (!badge) return;
+    const card = badge.closest('.notebook-card[data-notebook-id]');
+    if (!card) return;
+    event.preventDefault();
+    event.stopPropagation();
+    get('notebooks', card.dataset.notebookId).then(notebook => {
+      if (notebook && !notebook.deleted_at && typeof window.openNotebookHistory === 'function') {
+        window.openNotebookHistory(notebook);
+      }
+    }).catch(error => console.warn('Notebook history could not be opened', error));
+  }, true);
   // Single place that pushes the canonical unread state into the DOM (no full re-render).
   window.v340RefreshBadges = function () {
     for (const card of document.querySelectorAll('.notebook-card[data-notebook-server-id]')) {

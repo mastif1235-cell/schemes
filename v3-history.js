@@ -214,7 +214,8 @@
       const spreads = await getAll('spreads');
       host.replaceChildren();
       if (!events.length) { host.innerHTML = '<div class="empty-state">Общих событий пока нет.</div>'; return; }
-      for (const row of events.slice(0, 200)) {
+      const displayed = events.slice(0, 200);
+      for (const row of displayed) {
         const notebook = byServer.get(row.notebook_id) || null;
         const spread = spreads.find(item => item.server_id === row.spread_id);
         // Deleted notebook: show server-preserved title if known, else a neutral label —
@@ -223,7 +224,13 @@
         const spreadLabel = row.spread_number != null || spread
           ? ' · №' + esc(row.spread_number ?? spread?.number ?? '')
           : (row.spread_id ? ' · Удалённый разворот' : '');
-        const markNotebookId = !row.spread_id && (notebook?.server_id || (extras.has(row.notebook_id) ? row.notebook_id : null));
+        // "Read whole notebook" is the fallback action whenever the event's spread cannot be
+        // opened: notebook-level events (no spread) and events whose spread is deleted or left
+        // the local cache. An events-of-a-deleted-spread case can never be cleared by "Open",
+        // so without this button the notebook unread badge would be a dead end.
+        const openable = !!(spread && !spread.deleted_at);
+        const resolvedNotebookId = notebook?.server_id || (extras.has(row.notebook_id) ? row.notebook_id : null);
+        const markNotebookId = !openable && resolvedNotebookId ? resolvedNotebookId : null;
         const item = document.createElement('article');
         const unread = !!isUnread(row);
         item.className = 'v340-history-row' + (unread ? ' v340-history-unread' : '');
@@ -232,7 +239,7 @@
           <small> · ${esc(new Date(eventTime(row)).toLocaleString('ru-RU'))}</small>
           <div>${esc(notebookLabel)}${spreadLabel}</div>
           <div>${esc(actionLabel(row.action))}${spread && spread.deleted_at ? ' · Разворот удалён' : ''}</div></div>
-          ${spread && !spread.deleted_at ? '<button class="btn-secondary" data-open>Открыть</button>'
+          ${openable ? '<button class="btn-secondary" data-open>Открыть</button>'
             : (markNotebookId ? '<button class="btn-secondary" data-mark-notebook>Прочитать весь блокнот</button>' : '')}`;
         item.querySelector('[data-open]')?.addEventListener('click', async () => {
           close();
@@ -241,7 +248,12 @@
         item.querySelector('[data-mark-notebook]')?.addEventListener('click', async event => {
           event.target.disabled = true;
           try {
-            if (await markNotebookSeen(markNotebookId, true)) {
+            // Mark up to the newest DISPLAYED event of this notebook only: a server event that
+            // was never loaded/rendered here must stay unread instead of being silently cleared.
+            const displayedMaxSeq = Math.max(0, ...displayed
+              .filter(candidate => candidate.notebook_id === row.notebook_id)
+              .map(candidate => Number(candidate.seq) || 0));
+            if (await markNotebookSeen(markNotebookId, true, displayedMaxSeq || null)) {
               try { await refreshReadCursors(); } catch (error) { console.warn('History read cursors refresh failed', error); }
             } else toast('Не удалось отметить блокнот прочитанным. Повторите.');
             await draw();
@@ -283,10 +295,15 @@
     return count;
   }
 
-  async function markNotebookSeen(serverNotebookId, allSpreads = false) {
+  // seq bounds the cursor to what the client actually loaded and displayed; without it the
+  // server uses MAX(seq) at write time, which is reserved for the explicit "read everything now"
+  // action (mark-all). Monotone server-side either way, so a lower seq is a safe no-op.
+  async function markNotebookSeen(serverNotebookId, allSpreads = false, seq = null) {
     if (!window.vNextSync.enabled('activity_seen') || !serverNotebookId || !isOnline()) return false;
     try {
-      const data = await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:{all_spreads:allSpreads}});
+      const body = {all_spreads:allSpreads};
+      if (Number(seq) > 0) body.seq = Math.floor(Number(seq));
+      const data = await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:body});
       if (!data?.unread) throw new Error('Server did not confirm unread state');
       await window.v340ApplyUnread(data.unread);
       return true;
@@ -321,7 +338,7 @@
     el.querySelector('[data-local-history]').onclick = () => { close(); openHistory(notebook); };
     const host = el.querySelector('[data-team-history]'), more = el.querySelector('[data-more]');
     const state = el.querySelector('[data-team-state]');
-    let before = null, accessDenied = false;
+    let before = null, accessDenied = false, maxLoadedSeq = 0;
     const value = input => {
       if (typeof input === 'string') { try { return JSON.parse(input); } catch { return input; } }
       return input;
@@ -364,7 +381,13 @@
         before = data.next_before_seq;
         more.hidden = !data.has_more || before === null;
         state.textContent = 'Общая история участников. Старые записи показаны без деталей; загружаются последние 100 старых записей.';
-        await markNotebookSeen(notebook.server_id);
+        maxLoadedSeq = Math.max(maxLoadedSeq, ...(data.events || []).map(row => Number(row.seq) || 0));
+        // The notebook journal was successfully fetched and rendered: every loaded event —
+        // including events of DELETED spreads that can never be opened — has actually been
+        // shown to the user, so the whole notebook (all_spreads) is marked up to the newest
+        // LOADED seq. Events that arrive later keep seq > cursor and stay unread; a failed
+        // fetch never reaches this line, so the cursor cannot advance on error.
+        await markNotebookSeen(notebook.server_id, true, maxLoadedSeq || null);
       } catch (error) {
         console.warn('Team history load failed',error);
         accessDenied = error.status === 403 || error.status === 401;

@@ -866,4 +866,69 @@ assert.equal(coverage.find(row=>row.action==='notebook.deleted').count,1);
     assert.ok(row && row.preview_base64.length > 300000, 'preview stored as base64');
   } finally { globalThis.fetch = nativeFetch; }
 }
-console.log('backend: PASS (existing scenarios + 272-spread bidirectional delivery + OWNER fallback + server read-all + audit fixes F1/F2/F3/F8/F9)');
+{
+  // Production UX case (v3.6.2): USER B (Петя) deletes 3 notes and then spread №1 itself. All
+  // four events are spread-level, so the owner's badge can never be cleared by "opening the
+  // spread" — the spread is gone. Notebook-scoped read-all with an explicit seq must clear
+  // exactly what was seen, per user, without touching D1 by hand or any other user's state.
+  const fx = createFixture();
+  for (let i = 1; i <= 3; i++) {
+    const note = await api(fx.env, 'POST', '/api/spreads/s1/notes', 'token-2',
+      {id:'pd-note-'+i, client_ref:'phone-b:pd-create-'+i, body:'пометка '+i});
+    assert.equal(note.status, 201, 'Петя creates note ' + i);
+  }
+  // Owner baseline: everything so far is read, so only the deletion storm remains unread.
+  const primed = await api(fx.env, 'PUT', '/api/notebooks/n1/activity/seen', 'token-1', {all_spreads:true});
+  assert.equal(primed.status, 200);
+  assert.equal(primed.data.unread.total, 0, 'owner baseline is fully read');
+  for (let i = 1; i <= 3; i++) {
+    const deleted = await api(fx.env, 'DELETE', '/api/notes/pd-note-'+i, 'token-2',
+      {client_ref:'phone-b:pd-delete-'+i, revision:1});
+    assert.equal(deleted.status, 200, 'Петя deletes note ' + i);
+  }
+  assert.equal((await api(fx.env, 'DELETE', '/api/spreads/s1', 'token-2')).status, 200, 'Петя deletes the spread');
+  const before = (await api(fx.env, 'GET', '/api/activity/unread', 'token-1')).data.unread;
+  assert.equal(before.total, 4, 'global badge counts all four deletion events');
+  assert.equal(before.notebooks.n1.count, 4, 'notebook badge counts all four');
+  assert.equal(before.notebooks.n1.level, 0, 'no notebook-level events among them');
+  assert.equal(before.spreads.s1.count, 4, 'all four are spread-level events of the deleted spread');
+  const journal = await api(fx.env, 'GET', '/api/notebooks/n1/activity', 'token-1');
+  const deletions = (journal.data.events || []).filter(event => ['note.deleted','spread.deleted'].includes(event.action));
+  assert.equal(deletions.length, 4, 'journal shows all four deletion events');
+  assert.ok(deletions.every(event => event.actor.id === 'u2' && event.actor.display_name === 'Петя'),
+    'all four events are authored by Петя');
+  assert.ok(deletions.every(event => event.spread_id === 's1'),
+    'all four carry the deleted spread_id (spread-level cursors govern them)');
+  const seqs = deletions.map(event => event.seq).sort((a, b) => a - b);
+  assert.equal(seqs.length, 4);
+  // Explicit seq bounds the cursor to what the client actually displayed: newer events stay unread.
+  const partial = await api(fx.env, 'PUT', '/api/notebooks/n1/activity/seen', 'token-1',
+    {all_spreads:true, seq:seqs[1]});
+  assert.equal(partial.status, 200);
+  assert.equal(partial.data.unread.total, 2, 'explicit seq marks only up to itself');
+  assert.equal(partial.data.unread.spreads.s1.count, 2, 'the two newer events keep the badge alive');
+  assert.equal(partial.data.unread.notebooks.n1.max_seq, seqs[3], 'unread keeps the true newest seq');
+  // Explicit spread-level cursor works on a DELETED spread (tombstone row still exists).
+  const spreadSeen = await api(fx.env, 'PUT', '/api/spreads/s1/activity/seen', 'token-1', {seq:seqs[3]});
+  assert.equal(spreadSeen.status, 200, 'spread cursor can be set on a deleted spread');
+  assert.equal(spreadSeen.data.unread.total, 0, 'notebook + badge are fully cleared without touching D1');
+  const cursors = (await api(fx.env, 'GET', '/api/activity/read-cursors', 'token-1')).data.cursors;
+  assert.equal(cursors.spreads.s1, seqs[3], 'read-cursors exposes the deleted spread cursor');
+  // Multi-user isolation: nothing above advanced Петя's own read state.
+  const bUnread = (await api(fx.env, 'GET', '/api/activity/unread', 'token-2')).data.unread;
+  assert.equal(bUnread.total, 7, "Петя's own unread state is untouched by the owner's marks");
+  const bCursors = (await api(fx.env, 'GET', '/api/activity/read-cursors', 'token-2')).data.cursors;
+  assert.deepEqual(bCursors, {notebooks:{}, spreads:{}}, "Петя's cursors were never written");
+  // A fifth, newer event from Петя re-raises exactly one unread; the cleared spread stays clear.
+  const fifth = await api(fx.env, 'POST', '/api/notebooks/n1/spreads', 'token-2', {number:2, title:'Новый разворот'});
+  assert.equal(fifth.status, 200);
+  const afterFifth = (await api(fx.env, 'GET', '/api/activity/unread', 'token-1')).data.unread;
+  assert.equal(afterFifth.total, 1, 'one newer event raises exactly one unread');
+  assert.equal(afterFifth.spreads.s1, undefined, 'the cleared deleted spread stays clear');
+  assert.equal(afterFifth.spreads[fifth.data.spread.id].count, 1, 'only the new spread is unread');
+  // The deletion events were never deleted from storage: history is retained, only cursors moved.
+  assert.ok((await api(fx.env, 'GET', '/api/notebooks/n1/activity', 'token-1')).data.events
+    .filter(event => ['note.deleted','spread.deleted'].includes(event.action)).length === 4,
+    'activity_events history is retained after marking read');
+}
+console.log('backend: PASS (existing scenarios + 272-spread bidirectional delivery + OWNER fallback + server read-all + audit fixes F1/F2/F3/F8/F9 + deleted-spread read UX)');
