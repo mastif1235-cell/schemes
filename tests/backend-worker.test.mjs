@@ -636,10 +636,17 @@ for(const route of ['/api/notebooks/n1','/api/notebooks/n1/snapshot','/api/noteb
   assert.equal((await api(asym.env,'GET',route,'token-1')).status,200,'OWNER fallback '+route);
 }
 const beforeOwn=(await api(asym.env,'GET','/api/activity/unread','token-1')).data.unread.total;
+const memberCursorsBefore=(await api(asym.env,'GET','/api/activity/read-cursors','token-2')).data.cursors;
 const allSeen=await api(asym.env,'PUT','/api/notebooks/n1/activity/seen','token-2',{all_spreads:true});
 assert.equal(allSeen.status,200);assert.equal(allSeen.data.unread.total,0);
 assert.equal((await api(asym.env,'GET','/api/activity/unread','token-2')).data.unread.total,0,'server confirms read-all');
 assert.equal((await api(asym.env,'GET','/api/activity/unread','token-1')).data.unread.total,beforeOwn,'seen isolated');
+const memberCursorsAfter=(await api(asym.env,'GET','/api/activity/read-cursors','token-2')).data.cursors;
+const ownerCursors=(await api(asym.env,'GET','/api/activity/read-cursors','token-1')).data.cursors;
+assert.ok(Object.values(memberCursorsAfter.notebooks).some(Boolean),'read-all stores member notebook cursor');
+assert.ok(Object.values(memberCursorsAfter.spreads).some(Boolean),'read-all stores member spread cursor');
+assert.notDeepEqual(memberCursorsAfter,memberCursorsBefore,'read cursors advance after marking all');
+assert.notDeepEqual(memberCursorsAfter,ownerCursors,'one member read state does not mark another user read');
 assert.ok((await api(asym.env,'GET','/api/notebooks/n1/activity','token-2')).data.events.length>=2,'read history retained');
 {
 const mutations=createFixture();

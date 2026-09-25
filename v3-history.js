@@ -124,15 +124,23 @@
   }
 
   async function markAllSeen(notebooks) {
-    if (!isOnline()) { toast('Нет сети'); return; }
+    if (!isOnline()) { toast('Нет сети'); return false; }
     try {
       const state = await api('/api/activity/unread');
       await window.v340ApplyUnread(state.unread);
       const ids = new Set([...notebooks.map(row => row.server_id).filter(Boolean), ...Object.keys(state.unread.notebooks)]);
-      for (const id of ids) await markNotebookSeen(id, true);
+      for (const id of ids) {
+        if (!(await markNotebookSeen(id, true))) throw new Error('Read cursor was not saved for notebook ' + id);
+      }
       const fresh = await api('/api/activity/unread');
       await window.v340ApplyUnread(fresh.unread);
-    } catch (error) { console.warn('Mark all seen failed', error); toast('Не удалось отметить всё прочитанным. Повторите.'); }
+      if (Number(fresh.unread?.total || 0) !== 0) throw new Error('Server still reports unread events');
+      return true;
+    } catch (error) {
+      console.warn('Mark all seen failed', error);
+      toast('Не удалось отметить всё прочитанным. Повторите.');
+      return false;
+    }
   }
 
   // Opening one spread clears only that spread's unread for the current user.
@@ -165,6 +173,20 @@
 
   async function openServerHistory() {
     const scope = window.vNextSync.scope();
+    let readCursors = settings.activity_read_cursors?.scope === scope ? settings.activity_read_cursors.cursors : null;
+    async function refreshReadCursors() {
+      if (!isOnline()) return;
+      const data = await api('/api/activity/read-cursors');
+      if (!data?.cursors?.notebooks || !data?.cursors?.spreads) throw new Error('Read cursors unavailable');
+      if (window.vNextSync.scope() !== scope) return;
+      readCursors = data.cursors;
+      settings.activity_read_cursors = {scope, cursors:readCursors};
+      await saveSettings();
+    }
+    const isUnread = row => Number(row.seq) > 0 && readCursors
+      && Number(row.seq) > Number(row.spread_id
+        ? readCursors.spreads?.[row.spread_id] || 0
+        : readCursors.notebooks?.[row.notebook_id] || 0);
     const {el, close} = openSheet(`<div class="sheet-handle"></div><div class="v340-history-head"><h2>🕘 История</h2>
       <button class="icon-btn" data-history-close aria-label="Закрыть историю">✕</button></div>
       <button class="btn-ghost" data-mark-all>Отметить всё прочитанным</button>
@@ -176,8 +198,9 @@
     const byServer = new Map(notebooks.filter(row => row.server_id).map(row => [row.server_id, row]));
     async function draw() {
       const events = (await getAll('activity_events'))
-        .filter(row => row.scope === scope && !row.legacy)
-        .sort((a, b) => (Number(b.seq) || 0) - (Number(a.seq) || 0) || eventTime(b) - eventTime(a)
+        .filter(row => row.scope === scope && !row.legacy && byServer.has(row.notebook_id))
+        .sort((a, b) => Number(isUnread(b)) - Number(isUnread(a))
+          || (Number(b.seq) || 0) - (Number(a.seq) || 0) || eventTime(b) - eventTime(a)
           || String(b.id || '').localeCompare(String(a.id || '')));
       const spreads = await getAll('spreads');
       host.replaceChildren();
@@ -186,8 +209,10 @@
         const notebook = byServer.get(row.notebook_id) || null;
         const spread = spreads.find(item => item.server_id === row.spread_id);
         const item = document.createElement('article');
-        item.className = 'v340-history-row';
-        item.innerHTML = `<div><strong>${esc(row.actor?.display_name || row.actor_display_name || 'Участник')}</strong>
+        const unread = !!isUnread(row);
+        item.className = 'v340-history-row' + (unread ? ' v340-history-unread' : '');
+        item.dataset.eventId = row.id;
+        item.innerHTML = `<div>${unread ? '<span class="v340-history-unread-dot" aria-label="Непрочитано">●</span>' : ''}<strong>${esc(row.actor?.display_name || row.actor_display_name || 'Участник')}</strong>
           <small> · ${esc(new Date(eventTime(row)).toLocaleString('ru-RU'))}</small>
           <div>${esc(notebook?.title || row.notebook_title || '')}${row.spread_number || spread ? ' · №' + esc(row.spread_number ?? spread?.number ?? '') : ''}</div>
           <div>${esc(actionLabel(row.action))}${spread && spread.deleted_at ? ' · Разворот удалён' : ''}</div></div>
@@ -199,17 +224,30 @@
         });
         item.querySelector('[data-mark-notebook]')?.addEventListener('click', async event => {
           event.target.disabled = true;
-          await markNotebookSeen(notebook.server_id, true);
-          await draw();
+          try {
+            if (await markNotebookSeen(notebook.server_id, true)) {
+              try { await refreshReadCursors(); } catch (error) { console.warn('History read cursors refresh failed', error); }
+            } else toast('Не удалось отметить блокнот прочитанным. Повторите.');
+            await draw();
+          } finally {
+            event.target.disabled = false;
+          }
         });
         host.appendChild(item);
       }
     }
     el.querySelector('[data-mark-all]').onclick = async event => {
       event.target.disabled = true;
-      try { await markAllSeen(notebooks); toast('Отмечено прочитанным'); await draw(); }
+      try {
+        if (await markAllSeen(notebooks)) {
+          try { await refreshReadCursors(); } catch (error) { console.warn('History read cursors refresh failed', error); }
+          toast('Отмечено прочитанным');
+        }
+        await draw();
+      }
       finally { event.target.disabled = false; }
     };
+    try { await refreshReadCursors(); } catch (error) { console.warn('History read cursors refresh failed', error); }
     await draw();
     for (const notebook of notebooks) {
       try { await refreshNotebookActivity(notebook); } catch (error) { console.warn('History refresh failed', error); }
@@ -227,14 +265,8 @@
     if (!window.vNextSync.enabled('activity_seen') || !serverNotebookId || !isOnline()) return false;
     try {
       const data = await api(`/api/notebooks/${encodeURIComponent(serverNotebookId)}/activity/seen`, {method:'PUT', json:{all_spreads:allSpreads}});
-      if (data && data.unread) await window.v340ApplyUnread(data.unread);
-      else {
-        const map = {...(settings.unread_by_notebook || {})};
-        delete map[serverNotebookId];
-        settings.unread_by_notebook = map;
-        settings.unread_total = Object.values(map).reduce((sum, row) => sum + Number(row && row.count || 0), 0);
-        await saveSettings();
-      }
+      if (!data?.unread) throw new Error('Server did not confirm unread state');
+      await window.v340ApplyUnread(data.unread);
       return true;
     } catch (error) {
       console.warn('History seen cursor could not be stored', error);
@@ -345,6 +377,6 @@
   BlocknotV3.on('db-ready', refreshBadge);
 
   const style = document.createElement('style');
-  style.textContent = `#v340HistoryButton{position:relative;background:none;border:0;color:var(--text)}.v340-history-badge{position:absolute;right:0;top:0;min-width:18px;height:18px;padding:0 4px;border-radius:10px;background:var(--danger);color:#fff;font:700 10px/18px var(--font-sans)}.v340-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.v340-history-head h2{margin:0}.v340-history-head [data-history-close]{flex:0 0 44px}.v340-history-list{display:grid;gap:8px}.v340-history-row{padding:12px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px}.v340-history-row .btn-secondary{width:auto}`;
+  style.textContent = `#v340HistoryButton{position:relative;background:none;border:0;color:var(--text)}.v340-history-badge{position:absolute;right:0;top:0;min-width:18px;height:18px;padding:0 4px;border-radius:10px;background:var(--danger);color:#fff;font:700 10px/18px var(--font-sans)}.v340-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.v340-history-head h2{margin:0}.v340-history-head [data-history-close]{flex:0 0 44px}.v340-history-list{display:grid;gap:8px}.v340-history-row{padding:12px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px}.v340-history-row .btn-secondary{width:auto}.v340-history-unread-dot{color:var(--danger);font-size:16px;line-height:1;margin-right:7px}`;
   document.head.appendChild(style);
 })();
