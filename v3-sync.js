@@ -887,7 +887,11 @@
     for (const item of queue) {
       const photo = await get('photos', item.photo_id);
       const spread = photo ? await get('spreads', photo.spread_id) : null;
-      if (!photo || !spread || photo.upload_status === 'synced') {
+      // A photo whose original is synced but whose Telegram preview is retryable must stay in the
+      // queue: the worker completes the pending preview without ever re-sending the document.
+      const previewOnlyRetry = !!photo && photo.upload_status === 'synced' && !!photo.preview_pending
+        && !photo.preview_permanent && !photo.preview_stopped_at && settings.telegram_photo_preview !== false;
+      if (!photo || !spread || (photo.upload_status === 'synced' && !previewOnlyRetry)) {
         markDone(item);
         await put('sync_queue', item);
         continue;
@@ -905,6 +909,12 @@
       try {
         const data = await sendPhotoUpload(photo, spread);
         assertScope(requestScope);
+        // Dual storage: a successful response with a pending preview is NOT queue-done. The
+        // original is already safe; only sendPhoto stays retryable, bounded, and only while the
+        // preview error is retry-class (permanent errors park the item on the next pass).
+        const previewRetryable = !!data.preview_pending && !data.preview_permanent
+          && settings.telegram_photo_preview !== false;
+        const previewRetriesLeft = (item.retry_count || 0) < 5;
         await window.vNextAtomic('photos', photo.id, current => current ? {row:{...current,
           storage_object_id:data.storage_object_id,
           telegram_message_id:data.message_id,
@@ -915,12 +925,19 @@
           preview_message_id:data.preview_message_id || null,
           preview_file_id:data.preview_file_id || null,
           preview_pending:!!data.preview_pending,
+          preview_permanent:!!data.preview_permanent,
+          preview_stopped_at:previewRetryable && !previewRetriesLeft ? nowISO() : null,
           telegram_method:data.telegram_method || 'document',
           server_id:data.photo_id || current.server_id,
           scope:requestScope, upload_status:'synced'}} : {});
         if (data.spread_revision) {
           const latestSpread = await get('spreads', spread.id);
           if (latestSpread) await put('spreads', {...latestSpread, revision:Math.max(latestSpread.revision || 0, data.spread_revision)});
+        }
+        if (previewRetryable && previewRetriesLeft) {
+          markRetry(item, new Error('telegram preview pending'));
+          await put('sync_queue', item);
+          continue; // keep the local original blob: the next attempt needs the same bytes
         }
         markDone(item);
         await put('sync_queue', item);

@@ -311,6 +311,8 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
     assert.equal(uploaded.status, 200, 'preview failure does not fail the saved original');
     assert.equal(uploaded.data.telegram_method, 'document', 'only the document exists so far');
     assert.equal(uploaded.data.preview_pending, true, 'preview carries a retry-able pending state');
+    assert.equal(uploaded.data.preview_permanent, true,
+      'Telegram 4xx (PHOTO_INVALID_DIMENSIONS) classifies the preview error as permanent');
     assert.equal(uploaded.data.preview_message_id, null);
     assert.ok(uploaded.data.telegram_link, 'document link still present');
 
@@ -320,6 +322,7 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
     assert.equal(retry.data.photo_id, uploaded.data.photo_id);
     assert.equal(retry.data.preview_message_id, dualMocks.photoMessage, 'retry completed the preview');
     assert.equal(retry.data.preview_pending, false);
+    assert.equal(retry.data.preview_permanent, false, 'finished preview is neither pending nor permanent');
     assert.equal(retry.data.telegram_preview_link, `https://t.me/c/555777/${dualMocks.photoMessage}`);
     assert.equal(calls.filter(u => u.includes('/sendDocument')).length, 1,
       'the document was never re-sent');
@@ -381,6 +384,29 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
   } finally { globalThis.fetch = nativeFetch; }
 }
 
+{ // G2: TEMPORARY preview failure (Telegram 5xx) → pending, but NOT permanent → retry stays enabled.
+  const calls = [];
+  globalThis.fetch = async url => {
+    calls.push(String(url));
+    if (String(url).includes('/sendPhoto')) {
+      return Response.json({ok:false, error_code:500, description:'INTERNAL SERVER ERROR'}, {status:500});
+    }
+    return Response.json({ok:true, result:{message_id:749,
+      document:{file_id:'doc-file', file_unique_id:'u-t', file_size:5, mime_type:'image/jpeg'}}});
+  };
+  try {
+    const form = new FormData();
+    form.append('file', new Blob([originalBytes], {type:'image/jpeg'}), 'scan.jpg');
+    form.append('client_upload_id', 'dual-temp');
+    form.append('photo_preview', '1');
+    const uploaded = await api(env, 'POST', '/api/spreads/s1/photos', form);
+    assert.equal(uploaded.status, 200, 'original saved despite temporary preview failure');
+    assert.equal(uploaded.data.preview_pending, true);
+    assert.equal(uploaded.data.preview_permanent, false,
+      'Telegram 5xx keeps the preview retryable (not permanent)');
+  } finally { globalThis.fetch = nativeFetch; }
+}
+
 { // mime guard: preview requested for a non-photo mime → document only (Telegram would reject).
   const calls = [];
   globalThis.fetch = dualFetch(calls);
@@ -409,6 +435,10 @@ try {
   assert.equal(dualRow.telegram_preview_link, 'https://t.me/c/555777/910',
     'second phone receives the preview link through incremental sync');
   assert.equal(dualRow.preview_message_id, 910);
+  assert.equal(dualRow.preview_permanent, false, 'dual row is neither pending nor permanent after sync');
+  const tempRow = afterAll.data.changes.photos.find(row => row.client_upload_id === 'dual-temp');
+  assert.equal(tempRow.preview_pending, true, 'pending state syncs to every device');
+  assert.equal(tempRow.preview_permanent, false, 'retryable classification syncs too');
   const snapshotAll = await api(env, 'GET', '/api/notebooks/n1/snapshot');
   const dualSnapshotRow = snapshotAll.data.photos.find(row => row.client_upload_id === 'dual-1');
   assert.equal(dualSnapshotRow.telegram_preview_link, 'https://t.me/c/555777/910',

@@ -261,12 +261,15 @@ function mergePreviewIntoPhoto(mapped, extras) {
     mapped.preview_file_id = null;
     mapped.telegram_preview_link = null;
     mapped.preview_pending = true;
+    mapped.preview_permanent = !!preview.permanent;
   } else {
     mapped.preview_message_id = mapped.preview_message_id ?? null;
     mapped.preview_file_id = null;
     mapped.telegram_preview_link = null;
     mapped.preview_pending = false;
+    mapped.preview_permanent = false;
   }
+  if (preview && preview.message_id) mapped.preview_permanent = false;
   return mapped;
 }
 
@@ -496,7 +499,11 @@ async function telegramSendPhoto(env, blob, filename) {
       errorCode: data.error_code,
       description: data.description
     });
-    throw new HttpError(502, 'telegram_error', data.description);
+    const error = new HttpError(502, 'telegram_error', data.description);
+    // Telegram's own error code decides whether a preview retry is even worth attempting:
+    // 4xx (dimensions/mime/oversize rejected) can never succeed, while 429/5xx/network stay retryable.
+    error.tgErrorCode = Number(data.error_code) || null;
+    throw error;
   }
   return data.result;
 }
@@ -526,7 +533,9 @@ async function sendTelegramPreview(env, blob, spreadId, version) {
     const reason = previewError instanceof HttpError
       ? (previewError.detail || previewError.code)
       : (previewError?.message || previewError);
-    return { pending: true, error: String(reason).slice(0, 200) };
+    const permanent = previewError instanceof HttpError
+      && Number(previewError.tgErrorCode) >= 400 && Number(previewError.tgErrorCode) < 500;
+    return { pending: true, permanent, error: String(reason).slice(0, 200) };
   }
 }
 function telegramLink(chatId, messageId) {
@@ -1616,7 +1625,7 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
       file_size: mapped.file_size, telegram_link: mapped.telegram_link,
       telegram_preview_link: mapped.telegram_preview_link,
       preview_message_id: mapped.preview_message_id, preview_file_id: mapped.preview_file_id,
-      preview_pending: mapped.preview_pending,
+      preview_pending: mapped.preview_pending, preview_permanent: !!mapped.preview_permanent,
       telegram_method: extras?.preview?.message_id ? 'document+photo' : 'document',
       version: mapped.version, seq: mapped.seq, spread_revision: revision,
       photo: mapped,
