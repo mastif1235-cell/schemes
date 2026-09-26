@@ -339,6 +339,107 @@ try {
     await del('photos', 'phX');
   });
 
+  // ---------- E-dual: preview-pending keeps the upload retryable; retry completes the preview ----------
+  // Regression root cause (was a real design bug): markDone() ran right after any 2xx, so a
+  // preview pending/pending-class error parked the queue item forever — no mechanism ever
+  // re-attempted the sendPhoto. Now pending previews stay retryable (bounded), permanent ones park.
+  const phDualBodies = [];
+  let phDualMode = 'pending'; // handler switches between 'pending', 'done', 'permanent'
+  const phDualHandler = route => {
+    apiState.phDualAttempts = (apiState.phDualAttempts || 0) + 1;
+    phDualBodies.push(route.request().postData() || '');
+    const base = {
+      photo_id:'phDual-srv', storage_object_id:'c3RvcmFnZS1kZW1v', message_id:600, file_id:'doc-file',
+      file_unique_id:'doc-u', mime_type:'image/jpeg', file_size:120,
+      telegram_link:'https://t.me/c/555777/600', version:1, seq:9, spread_revision:3};
+    if (phDualMode === 'pending') {
+      return route.fulfill({status:200, contentType:'application/json', body:JSON.stringify({...base,
+        telegram_preview_link:null, preview_message_id:null, preview_file_id:null,
+        preview_pending:true, preview_permanent:false, telegram_method:'document'})});
+    }
+    if (phDualMode === 'permanent') {
+      return route.fulfill({status:200, contentType:'application/json', body:JSON.stringify({...base,
+        telegram_preview_link:null, preview_message_id:null, preview_file_id:null,
+        preview_pending:true, preview_permanent:true, telegram_method:'document'})});
+    }
+    return route.fulfill({status:200, contentType:'application/json', body:JSON.stringify({...base,
+      telegram_preview_link:'https://t.me/c/555777/603', preview_message_id:603, preview_file_id:'view-file',
+      preview_pending:false, preview_permanent:false, telegram_method:'document+photo'})});
+  };
+  await page.route(origin + '/api/spreads/srv-spA/photos', phDualHandler);
+  result = await page.evaluate(async () => {
+    settings.auth_token = 't';
+    delete settings.telegram_photo_preview; // a 3.6.2 user upgraded to 3.6.3+: the key does not exist
+    await saveSettings();
+    await put('photos', {id:'phDual', spread_id:'spA', version:1, is_current:true, upload_status:'local_pending', created_at:nowISO()});
+    await put('blobs', {id:'phDual_orig', blob:new Blob([new Uint8Array(120)])});
+    await put('blobs', {id:'phDual_thumb', blob:new Blob([new Uint8Array(12)])});
+    await put('sync_queue', {entity:'photo', photo_id:'phDual', status:'pending', retry_count:0});
+    await window.__syncUntil(async () => {
+      const item = (await getAll('sync_queue')).find(q => q.photo_id === 'phDual');
+      return item && item.status === 'failed'; // markRetry parks with a scheduled backoff timestamp
+    });
+    const item = (await getAll('sync_queue')).find(q => q.photo_id === 'phDual');
+    const photo = await get('photos','phDual');
+    return {status:item.status, next:!!item.next_attempt_at, photoStatus:photo.upload_status,
+      pending:photo.preview_pending, blob:!!(await get('blobs','phDual_orig'))};
+  });
+  assert.equal(result.status, 'failed',
+    'a pending preview keeps the queue RETRYABLE instead of silently marking done (root bug E)');
+  assert.equal(result.next, true, 'retry has a scheduled next attempt');
+  assert.equal(result.photoStatus, 'synced', 'the ORIGINAL is already counted as remote-safe');
+  assert.equal(result.pending, true, 'photo row records the pending preview');
+  assert.equal(result.blob, true, 'retry keeps the local original blob for the next attempt');
+  assert.ok((phDualBodies[0] || '').includes('name="photo_preview"'),
+    '3.6.2-upgrade user (toggle key absent) still sends photo_preview=1 — upgrade default is ON');
+  // The retry finishes the preview; the whole flow never re-uploads a second document.
+  phDualMode = 'done';
+  result = await page.evaluate(async () => {
+    await window.__syncUntil(async () => {
+      const item = (await getAll('sync_queue')).find(q => q.photo_id === 'phDual');
+      return item && item.status === 'done';
+    });
+    const item = (await getAll('sync_queue')).find(q => q.photo_id === 'phDual');
+    const photo = await get('photos','phDual');
+    return {status:item.status, preview:photo.preview_message_id, pending:photo.preview_pending,
+      method:photo.telegram_method, link:photo.telegram_preview_link};
+  });
+  assert.equal(result.status, 'done', 'queue completes once the preview lands');
+  assert.equal(result.preview, 603, 'preview was really re-attempted and finished');
+  assert.equal(result.pending, false);
+  assert.equal(result.method, 'document+photo');
+  assert.equal(result.link, 'https://t.me/c/555777/603', 'the button will open the preview message');
+  assert.ok(apiState.phDualAttempts >= 2, 'the retry actually went through the upload endpoint again');
+  // Permanent preview failures park the item — one attempt, no loop.
+  apiState.phDualAttempts = 0;
+  phDualMode = 'permanent';
+  result = await page.evaluate(async () => {
+    await put('photos', {id:'phPerm', spread_id:'spA', version:1, is_current:true, upload_status:'local_pending', created_at:nowISO()});
+    await put('blobs', {id:'phPerm_orig', blob:new Blob([new Uint8Array(120)])});
+    await put('sync_queue', {entity:'photo', photo_id:'phPerm', status:'pending', retry_count:0});
+    await window.__syncUntil(async () => {
+      const item = (await getAll('sync_queue')).find(q => q.photo_id === 'phPerm');
+      return item && item.status === 'done';
+    });
+    const item = (await getAll('sync_queue')).find(q => q.photo_id === 'phPerm');
+    const photo = await get('photos','phPerm');
+    return {status:item.status, permanent:photo.preview_permanent, pending:photo.pending, stopped:photo.preview_stopped_at || null,
+      photoStatus:photo.upload_status, pend:photo.preview_pending};
+  });
+  assert.equal(result.status, 'done', 'a permanent preview error does not loop the queue');
+  assert.equal(result.permanent, true, 'photo row records that the preview error is permanent');
+  assert.equal(result.pend, true, 'original is synced, preview merely absent');
+  assert.equal(apiState.phDualAttempts, 1, 'exactly one attempt for a permanent preview error');
+  await page.unroute(origin + '/api/spreads/srv-spA/photos', phDualHandler);
+  // Keep the shared fixture pristine for the later scenarios (esp. retention counters).
+  apiState.phDualAttempts = 0;
+  await page.evaluate(async () => {
+    for (const q of await getAll('sync_queue')) if (['phDual','phPerm'].includes(q.photo_id)) await del('sync_queue', q.id);
+    for (const id of ['phDual','phDual_thumb','phDual_orig','phPerm','phPerm_orig']) await del('blobs', id);
+    for (const id of ['phDual','phPerm']) await del('photos', id);
+    for (const id of ['phDual','phPerm']) await del('blobs', id + '_thumb');
+  });
+
   // ---------- F5: export never contains credentials ----------
   result = await page.evaluate(async () => {
     const originalCreate = URL.createObjectURL;

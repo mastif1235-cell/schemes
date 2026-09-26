@@ -111,5 +111,27 @@ assert.match(workerSource, /const doc = tgResult\.document;/,
   'the canonical file_id comes from the sendDocument document only');
 assert.doesNotMatch(workerSource, /INSERT INTO photos[\s\S]{0,700}previewExtras/,
   'the photos INSERT never uses preview identifiers');
+// Preview retry classification (root cause E: pending preview used to park the upload forever).
+assert.match(workerSource, /error\.tgErrorCode = Number\(data\.error_code\)/,
+  'worker keeps Telegram error codes for retry classification');
+assert.match(workerSource, /Number\(previewError\.tgErrorCode\) >= 400 && Number\(previewError\.tgErrorCode\) < 500/,
+  'Telegram 4xx marks the preview error as permanent, so clients do not retry forever');
+assert.match(workerSource, /preview_permanent: !!mapped\.preview_permanent/,
+  'upload responses expose the permanent classification');
+
+// Client contract: queue must not complete while the preview is pending, and upgrades default ON.
+const syncSource = fs.readFileSync(new URL('../v3-sync.js', import.meta.url), 'utf8');
+assert.match(syncSource, /if \(settings\.telegram_photo_preview !== false\) fd\.append\('photo_preview', '1'\)/,
+  'upgrade default: existing 3.6.2 settings (key absent) still request the preview');
+assert.match(syncSource, /!!photo\.preview_pending\n?\s*&& !photo\.preview_permanent && !photo\.preview_stopped_at/,
+  'a synced photo with a retryable pending preview stays in the upload queue');
+assert.match(syncSource, /!!data\.preview_pending && !data\.preview_permanent/,
+  'a pending preview keeps the queue retryable instead of marking it done (root bug E)');
+assert.match(syncSource, /markRetry\(item, new Error\('telegram preview pending'\)\)/,
+  'the retry schedules only the missing preview (worker never re-sends the document)');
+assert.match(syncSource, /continue; \/\/ keep the local original blob/,
+  'the preview retry keeps the local original blob needed to resend');
+assert.match(syncSource, /preview_stopped_at/,
+  'preview retries are bounded and parked after the retry budget');
 
 console.log('photo-telegram-link: PASS');
