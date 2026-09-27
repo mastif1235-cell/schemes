@@ -28,6 +28,20 @@ class FakeStatement {
       }
       return {success:true, results:[], meta:{changes}};
     }
+    if (/^INSERT INTO photos/.test(sql) && sql.includes("'upload_pending'")) {
+      const [id, spread_id, version, created_by, created_at, seq, client_upload_id] = p;
+      this.db.photos.push({id, spread_id, version, is_current:0, provider:'upload_pending',
+        created_by, created_at, seq, client_upload_id});
+      return {success:true, results:[], meta:{changes:1}};
+    }
+    if (/^UPDATE photos SET version=/.test(sql)) {
+      const [version, storage_object_id, telegram_message_id, telegram_file_id,
+        telegram_file_unique_id, mime_type, file_size, seq, id] = p;
+      const row = this.db.photos.find(photo => photo.id === id && photo.provider === 'upload_pending');
+      if (row) Object.assign(row, {version, is_current:1, provider:'telegram', storage_object_id,
+        telegram_message_id, telegram_file_id, telegram_file_unique_id, mime_type, file_size, seq});
+      return {success:true, results:[], meta:{changes:row ? 1 : 0}};
+    }
     if (/^INSERT INTO photos/.test(sql)) {
       const [id, spread_id, version, storage_object_id, telegram_message_id, telegram_file_id,
         telegram_file_unique_id, mime_type, file_size, created_by, created_at, seq, client_upload_id] = p;
@@ -42,7 +56,9 @@ class FakeStatement {
       if (spread) { spread.current_photo_id = photoId; spread.updated_at = updatedAt; spread.updated_by = updatedBy; spread.revision += 1; spread.seq = seq; }
       return {success:true, results:[], meta:{changes:spread ? 1 : 0}};
     }
-    if (/^INSERT INTO activity_events/.test(sql)) return {success:true, results:[], meta:{changes:1}};
+    if (/^INSERT (OR IGNORE )?INTO activity_events/.test(sql)) return {success:true, results:[], meta:{changes:1}};
+    if (/^INSERT INTO history/.test(sql)) return {success:true, results:[], meta:{changes:1}};
+    if (/^INSERT OR IGNORE INTO photo_previews/.test(sql)) return {success:true, results:[], meta:{changes:1}};
     if (/^INSERT INTO uploads/.test(sql)) {
       const [client_upload_id, photo_id, result_json, created_at] = p;
       if (this.db.uploads.some(row => row.client_upload_id === client_upload_id)) {
@@ -90,6 +106,7 @@ class FakeStatement {
     if (/SELECT revision FROM spreads WHERE id=\?/.test(sql)) return this.db.spreads.filter(row => row.id === p[0]).map(row => ({revision:row.revision}));
     if (/SELECT \* FROM spreads WHERE notebook_id=\?/.test(sql)) return this.db.spreads.filter(row => row.notebook_id === p[0]).map(row => ({...row}));
     if (/SELECT \* FROM photos WHERE id=\?/.test(sql)) return this.db.photos.filter(row => row.id === p[0]).map(row => ({...row}));
+    if (/SELECT spread_id FROM photos WHERE id=\?/.test(sql)) return this.db.photos.filter(row => row.id === p[0]).map(row => ({spread_id:row.spread_id}));
     if (/SELECT \* FROM photos WHERE spread_id IN/.test(sql) && !/^WITH candidates/.test(sql)) {
       const notebookId = p[0];
       const spreadIds = new Set(this.db.spreads.filter(row => row.notebook_id === notebookId).map(row => row.id));
@@ -342,11 +359,13 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
   } finally { globalThis.fetch = nativeFetch; }
 }
 
-{ // DUAL-5 (idempotency C): crash after sendDocument, before preview+insert → resume adopt doc.
+{ // DUAL-5: doc identifiers survived, but finalization did not; resume the FK-safe reservation.
   const calls = [];
   globalThis.fetch = dualFetch(calls);
   try {
-    env.__db.uploads.push({client_upload_id:'dual-5', photo_id:null, created_at:now(),
+    env.__db.photos.push({id:'reserved-dual-5', spread_id:'s1', version:-20, is_current:0,
+      provider:'upload_pending', created_by:'u1', created_at:now(), seq:20, client_upload_id:'dual-5'});
+    env.__db.uploads.push({client_upload_id:'dual-5', photo_id:'reserved-dual-5', created_at:now(),
       result_json: JSON.stringify({response:null, extras:{doc:{message_id:720, chat_id:'-100555777',
         file_id:'doc-file', file_unique_id:'u-c', mime_type:'image/jpeg', file_size:5}, preview:null}})});
     dualMocks.photoMessage = 703;
