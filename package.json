@@ -11,6 +11,7 @@
     "preview:team": "node tests/serve-team-preview.mjs",
     "build:rollback": "node tools/build-rollback.mjs",
     "test:rollback": "node tests/rollback-contract.test.mjs",
-    "test:audit-fixes": "node tests/audit-fixes.test.mjs"
+    "test:audit-fixes": "node tests/audit-fixes.test.mjs",
+    "test:e2e-dual": "node tests/e2e-dual-preview.test.mjs"
   }
 }
