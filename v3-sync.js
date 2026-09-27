@@ -876,7 +876,13 @@
     return await resp.json();
   }
 
-  pushPhotoQueue = async function (forceRetry, options = {}) {
+  // Single-flight guard: two OVERLAPPING drains (e.g. an in-flight auto sync plus a manual
+  // pushPhotoQueue) used to process the same queue item concurrently, which fired a second
+  // Worker request for the same client_upload_id and could burn an extra sendPhoto on a
+  // racing ledger claim. Drains are serialized: an overlapping caller waits for the in-flight
+  // pass and then runs its own full due-check, so no independent retry is ever lost.
+  let pushPhotoQueueTail = Promise.resolve();
+  async function pushPhotoQueueInner(forceRetry, options = {}) {
     if (!isAuthed()) return; // photos wait for sign-in locally; there is no unauthenticated upload
     const requestScope = scope();
     const onlyItemIds = options.onlyItemIds ? new Set(options.onlyItemIds.map(String)) : null;
@@ -961,6 +967,11 @@
         if (options.throwOnError) throw error;
       }
     }
+  }
+  pushPhotoQueue = function (forceRetry, options) {
+    const run = pushPhotoQueueTail.then(() => pushPhotoQueueInner(forceRetry, options));
+    pushPhotoQueueTail = run.then(() => {}, () => {}); // keep the chain alive past failures
+    return run;
   };
 
   applyChangeBatch = async function (changes) {
