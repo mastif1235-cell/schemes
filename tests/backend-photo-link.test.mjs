@@ -220,11 +220,12 @@ try {
 // ---- dual storage: 1 document (original) + 1 photo (preview) per new upload ----
 const dualMocks = {docMessage: 600, photoMessage: 910};
 const originalBytes = new TextEncoder().encode('ORIGINAL-IMAGE-BYTES-SHA');
-function dualFetch(calls, {previewFails = false} = {}) {
-  return async url => {
+function dualFetch(calls, {previewFails = false, onPhotoForm = null} = {}) {
+  return async (url, init) => {
     const target = String(url);
     calls.push(target);
     if (target.includes('/sendPhoto')) {
+      if (onPhotoForm) onPhotoForm(init?.body);
       if (previewFails) {
         return Response.json({ok:false, error_code:400, description:'PHOTO_INVALID_DIMENSIONS'}, {status:400});
       }
@@ -246,7 +247,12 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
 { // DUAL-1: fresh upload with photo_preview=1 → document first, preview second, both recorded.
   const calls = [];
-  globalThis.fetch = dualFetch(calls);
+  let photoForm = null;
+  globalThis.fetch = dualFetch(calls, {onPhotoForm: fd => {
+    photoForm = {chatId: fd?.get?.('chat_id'), hasPhotoField: !!(fd?.get?.('photo')),
+      photoSize: fd?.get?.('photo')?.size ?? null, hasDocumentField: !!(fd?.get?.('document')),
+      isFormData: typeof FormData !== 'undefined' && fd instanceof FormData};
+  }});
   try {
     dualMocks.docMessage = 600; dualMocks.photoMessage = 910;
     const form = new FormData();
@@ -269,6 +275,9 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
     assert.ok(docIndex >= 0 && photoIndex > docIndex, 'document is sent BEFORE the preview');
     assert.equal(calls.filter(u => u.includes('/sendDocument')).length, 1, 'exactly 1 document');
     assert.equal(calls.filter(u => u.includes('/sendPhoto')).length, 1, 'exactly 1 preview');
+    assert.deepEqual(photoForm, {chatId:'-100555777', hasPhotoField:true, photoSize:originalBytes.length,
+      hasDocumentField:false, isFormData:true},
+      'sendPhoto posts a real multipart body: chat_id, a photo field with bytes, no document field');
     const stored = env.__db.photos.find(row => row.id === uploaded.data.photo_id);
     assert.equal(stored.telegram_message_id, 600, 'photos row stores the document identifiers');
     assert.equal(stored.telegram_file_id, 'doc-file');
@@ -404,6 +413,47 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
     assert.equal(uploaded.data.preview_pending, true);
     assert.equal(uploaded.data.preview_permanent, false,
       'Telegram 5xx keeps the preview retryable (not permanent)');
+  } finally { globalThis.fetch = nativeFetch; }
+}
+
+{ // REGRESSION (v3.6.4 production root cause): deployments whose uploads.photo_id is NOT NULL
+  // must still get the full dual upload. Pre-fix, the crash-safe ledger was inserted with a NULL
+  // photo_id — that threw, the catch mistook it for a parallel duplicate, and the preview was
+  // silently skipped forever (exactly 1 Telegram message, app showed "synced").
+  const calls = [];
+  globalThis.fetch = dualFetch(calls);
+  try {
+    dualMocks.docMessage = 610; dualMocks.photoMessage = 950;
+    const basePrepare = env.DB.prepare.bind(env.DB);
+    const strictEnv = {...env, DB: {
+      prepare(sql) {
+        const st = basePrepare(sql);
+        if (/^INSERT INTO uploads/.test(String(sql))) {
+          const origRun = st.run.bind(st);
+          st.run = async () => {
+            if (st.params[1] == null) throw new Error('NOT NULL constraint failed: uploads.photo_id');
+            return origRun();
+          };
+        }
+        return st;
+      },
+      batch: env.DB.batch.bind(env.DB),
+    }};
+    const form = new FormData();
+    form.append('file', new Blob([originalBytes], {type:'image/jpeg'}), 'scan.jpg');
+    form.append('client_upload_id', 'dual-strict-nn');
+    form.append('photo_preview', '1');
+    const uploaded = await api(strictEnv, 'POST', '/api/spreads/s1/photos', form);
+    assert.equal(uploaded.status, 200);
+    assert.equal(uploaded.data.message_id, 610, 'document sent (original) under NOT NULL schema');
+    assert.equal(uploaded.data.preview_message_id, 950,
+      'preview is NOT silently skipped when uploads.photo_id enforces NOT NULL');
+    assert.equal(uploaded.data.telegram_method, 'document+photo');
+    assert.equal(calls.filter(u => u.includes('/sendDocument')).length, 1, 'exactly 1 document');
+    assert.equal(calls.filter(u => u.includes('/sendPhoto')).length, 1, 'exactly 1 preview');
+    const ledger = env.__db.uploads.find(row => row.client_upload_id === 'dual-strict-nn');
+    assert.ok(ledger && ledger.photo_id === uploaded.data.photo_id,
+      'ledger row exists with a non-null photo_id (crash-resume stays possible)');
   } finally { globalThis.fetch = nativeFetch; }
 }
 

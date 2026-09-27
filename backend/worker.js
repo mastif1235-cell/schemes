@@ -1631,6 +1631,11 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
       photo: mapped,
     };
   };
+  // The photo id is assigned BEFORE any Telegram/D1 work so the crash-safe ledger row never
+  // carries a NULL photo_id: deployments that enforce NOT NULL there would otherwise make that
+  // INSERT throw, and the catch below would silently take the "duplicate owns the ledger" path —
+  // skipping the preview forever with zero logging (this is the v3.6.4 production root cause).
+  let photoId = existingUpload?.photo_id || uuid();
   if (existingUpload && ledger) {
     // Dual-era ledger row: converge with an in-flight owner, then replay the finished result or
     // resume a missing preview. The DOCUMENT is never re-sent from here.
@@ -1672,6 +1677,7 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
     if (waited.parsed?.extras?.doc) {
       ledger = waited.parsed;
       adoptedDocExtras = waited.parsed.extras.doc;
+      if (waited.ledgerRow?.photo_id) photoId = waited.ledgerRow.photo_id;
       follower = true;
     }
     // Empty/legacy ledger without document identifiers: fall through to a fresh upload.
@@ -1708,13 +1714,20 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
       const initialExtras = { doc: docExtras, preview: null };
       try {
         await env.DB.prepare('INSERT INTO uploads (client_upload_id, photo_id, result_json, created_at) VALUES (?,?,?,?)')
-          .bind(clientUploadId, null, dualLedgerJson(initialExtras, null), nowISO()).run();
+          .bind(clientUploadId, photoId, dualLedgerJson(initialExtras, null), nowISO()).run();
         ledger = { extras: initialExtras, response: null };
         ledgerJson = dualLedgerJson(initialExtras, null);
       } catch (ledgerError) {
         // A parallel request with the same client_upload_id owns the ledger: adopt its document
         // and converge on its photos row instead of recording a duplicate (parallel D).
         const waited = await waitForDualLedger(env, clientUploadId);
+        if (!waited.ledgerRow) {
+          // NOT a parallel duplicate (no ledger row exists at all): the INSERT rejected for a
+          // schema reason (e.g. uploads.photo_id NOT NULL or a missing unique constraint). This
+          // must be loud — the upload may still succeed, but replay/crash-resume protection is off.
+          console.error('dual: uploads ledger insert failed; proceeding without idempotency ledger for',
+            clientUploadId, String(ledgerError instanceof Error ? ledgerError.message : ledgerError));
+        }
         if (waited.photoRow) {
           const latest = (await readLedger()) || waited.parsed;
           const spreadFresh = await env.DB.prepare('SELECT revision FROM spreads WHERE id=?').bind(p.id).first();
@@ -1725,6 +1738,7 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
           ledger = waited.parsed;
           ledgerJson = dualLedgerJson(ledger.extras, null);
           docExtras = waited.parsed.extras.doc;
+          if (waited.ledgerRow?.photo_id) photoId = waited.ledgerRow.photo_id;
           follower = true;
         }
       }
@@ -1792,7 +1806,6 @@ on('POST', '/api/spreads/:id/photos', async (request, env, p) => {
 
   const storageObjectId = encodeStorageObjectId(docExtras.chat_id || env.CHAT_ID, docExtras.message_id);
 
-  const photoId = uuid();
   const seq = await nextSeq(env);
   const now = nowISO();
 

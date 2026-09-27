@@ -2,3 +2,4 @@
 node_modules/
 rollback/
 .wrangler/
+node_modules
